@@ -9,7 +9,7 @@ Built and battle-tested on a 512 GB M3 Ultra pair while shipping public quants o
 `mlx_lm dwq` fine-tunes the quantization `scales`/`biases` of a quantized model ("student") against a higher-precision teacher's logits. It works great — until the student is large:
 
 1. **The teacher may not fit next to the student.** Two-phase fixes this: dump the teacher's top-k logits to disk once (teacher alone in memory), then train the student against the dump (student alone in memory — with targets on disk, mlx-lm never loads the teacher for training).
-2. **The student's own backward may not fit at all.** Training *every* layer's scales in one step materializes large per-layer intermediates for the quantized-matmul VJP simultaneously. A 193 GB / 745B-parameter MoE student dies in the first step on a 512 GB machine — at sequence length 1024, 512 *and* 256, with `--grad-checkpoint`, at batch size 1. Distributing doesn't rescue it (`Send` has no VJP in the pipeline path).
+2. **The student's own backward may not fit at all.** Training *every* layer's scales in one step materializes large per-layer intermediates for the quantized-matmul VJP simultaneously. A 242 GB / 745B-parameter MoE student dies in the first step on a 512 GB machine — at sequence length 1024, 512 *and* 256, with `--grad-checkpoint`, at batch size 1. Distributing doesn't rescue it (`Send` has no VJP in the pipeline path).
 
 **Layerwise rounds** fix (2): train at most K layers per round. Since `value_and_grad` only differentiates unfrozen parameters, backward memory is bounded by K instead of by the model. Rounds run deepest-first (best-conditioned gradients — shallow-first diverged in our runs), and every round is validated and rolled back if it didn't improve, so the procedure is monotone by construction.
 
@@ -69,7 +69,7 @@ Reports KL and top-1 flip per EN/code/ZH third (drop your own corpora in `data/`
 
 - **Gate every big load**: wait until `free+inactive > model + 60 GB` *and stable* — a "done" log line doesn't mean the previous process released its memory, and loads launched into a reclaim window get jetsam-killed silently.
 - **Never overlap a 100 GB-class load with heavy disk I/O** (uploads, mass writes): the load wedges with rss/avail frozen. Kill (-9, then verify with pgrep — zombies squat memory), let it reclaim, relaunch on a quiet box.
-- Learning rate transfers poorly across student sizes: 1e-5 was fine for an 87 GB student and diverged on a 193 GB one. Start at mlx-lm's default 1e-6; the per-round rollback makes over-stepping cheap.
+- Learning rate transfers poorly across student sizes: 1e-5 was fine for an 87 GB student and diverged on a 242 GB one. Start at mlx-lm's default 1e-6; the per-round rollback makes over-stepping cheap.
 - If your checkpoint carries extra layers your runtime remaps (e.g. an MTP head), strip them for training with a hardlinked variant and re-attach after. **Never edit a hardlinked file in place** — replace it (`os.replace`), or you rewrite the original through the shared inode.
 
 ## License
