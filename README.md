@@ -1,0 +1,77 @@
+# alis-dwq
+
+**DWQ for very large MLX models on Apple Silicon** — layerwise rounds + two-phase targets, so quantized models that are *hundreds of GB* can be distillation-tuned on a single Mac (or a pair) without OOM.
+
+Built and battle-tested on a 512 GB M3 Ultra pair while shipping public quants of GLM-5.2 (745B MoE) and Hy3 (295B MoE).
+
+## Why
+
+`mlx_lm dwq` fine-tunes the quantization `scales`/`biases` of a quantized model ("student") against a higher-precision teacher's logits. It works great — until the student is large:
+
+1. **The teacher may not fit next to the student.** Two-phase fixes this: dump the teacher's top-k logits to disk once (teacher alone in memory), then train the student against the dump (student alone in memory — with targets on disk, mlx-lm never loads the teacher for training).
+2. **The student's own backward may not fit at all.** Training *every* layer's scales in one step materializes large per-layer intermediates for the quantized-matmul VJP simultaneously. A 193 GB / 745B-parameter MoE student dies in the first step on a 512 GB machine — at sequence length 1024, 512 *and* 256, with `--grad-checkpoint`, at batch size 1. Distributing doesn't rescue it (`Send` has no VJP in the pipeline path).
+
+**Layerwise rounds** fix (2): train at most K layers per round. Since `value_and_grad` only differentiates unfrozen parameters, backward memory is bounded by K instead of by the model. Rounds run deepest-first (best-conditioned gradients — shallow-first diverged in our runs), and every round is validated and rolled back if it didn't improve, so the procedure is monotone by construction.
+
+Measured on the 745B case: **OOM at step 0 → stable training at ~334 GB peak** with K=8.
+
+## Install / use
+
+Works on **stock mlx-lm ≥ 0.31** (the layerwise trainer ships here as a patch module; an upstream PR adding `--layers-per-round` natively is open — once merged you can use either path).
+
+```bash
+git clone https://github.com/avlp12/alis-dwq && cd alis-dwq
+pip install mlx-lm  # >= 0.31
+```
+
+### 1. Build a calibration mix (optional but recommended)
+
+`dwq_data/train.jsonl` + `valid.jsonl`, one `{"text": ...}` per line. Language mix matters: low-bit damage concentrates in the model's non-English mass (we measured ZH slices 1.4–3.9× worse than EN on two different MoE families); a ~45% target-language mix is what recovered it. Without `ALIS_DWQ_DATA_DIR`, mlx-lm's default `--data-path` loader is used.
+
+### 2. Dump teacher targets (teacher's only appearance)
+
+```bash
+python -m alis_dwq.run \
+  --model <teacher> --targets-only --target-dir ./targets \
+  --num-samples 145 --max-seq-length 512 --batch-size 1 --seed 7
+```
+
+### 3. Train the student, layerwise
+
+```bash
+ALIS_DWQ_LAYERS_PER_ROUND=8 ALIS_DWQ_DATA_DIR=./dwq_data \
+python -m alis_dwq.run \
+  --model <student> --quantized-model <student> \
+  --target-dir ./targets --mlx-path <out> \
+  --num-samples 145 --max-seq-length 512 --batch-size 1 \
+  --grad-checkpoint --learning-rate 1e-6 --seed 7
+```
+
+(`--model` only supplies the tokenizer when targets exist — point it at the student; the teacher's 400 GB never move again.)
+
+### 4. Evaluate on language slices, not just overall
+
+```bash
+python -m alis_dwq.eval_kld --model <teacher> --save-ref ref.npz   # once
+python -m alis_dwq.eval_kld --model <out> --ref ref.npz            # per build
+```
+
+Reports KL and top-1 flip per EN/code/ZH third (drop your own corpora in `data/`). Overall averages hide exactly the damage you're trying to fix.
+
+## Results
+
+| Case | Student | Setup | Outcome |
+|---|---|---|---|
+| GLM-5.2 2.56 bpw | 745B MoE student (78 quant layers) | K=8, seq 512, lr 1e-6, 45% ZH mix | vs 4.5-bpw ref: overall KL **0.655→0.379 (−42%)**, ZH **0.987→0.562 (−43%)**, flips 24.4%→15.9%; peak 334 GB (full-layer training OOMs); 10/10 rounds accepted, ~5 h |
+| Hy3 T128 2.375 bpw | 87.6 GB / 295B MoE | full-layer DWQ (fits), 45% ZH mix | ZH-concentrated damage recovered enough to ship; see model card |
+
+## Hard-won operational notes
+
+- **Gate every big load**: wait until `free+inactive > model + 60 GB` *and stable* — a "done" log line doesn't mean the previous process released its memory, and loads launched into a reclaim window get jetsam-killed silently.
+- **Never overlap a 100 GB-class load with heavy disk I/O** (uploads, mass writes): the load wedges with rss/avail frozen. Kill (-9, then verify with pgrep — zombies squat memory), let it reclaim, relaunch on a quiet box.
+- Learning rate transfers poorly across student sizes: 1e-5 was fine for an 87 GB student and diverged on a 193 GB one. Start at mlx-lm's default 1e-6; the per-round rollback makes over-stepping cheap.
+- If your checkpoint carries extra layers your runtime remaps (e.g. an MTP head), strip them for training with a hardlinked variant and re-attach after. **Never edit a hardlinked file in place** — replace it (`os.replace`), or you rewrite the original through the shared inode.
+
+## License
+
+MIT
