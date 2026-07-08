@@ -36,3 +36,4 @@ Results (T=3072 vs the 4.5-bpw reference):
 
 Validation KL during training: 0.458 -> 0.322, all 10 rounds accepted.
 Upstream PR for the native flag: https://github.com/ml-explore/mlx-lm/pull/1499
+Shipped result: https://huggingface.co/avlp12/GLM-5.2-Alis-MLX-Dynamic-2.56bpw (main = DWQ weights; `pre-dwq` branch = original)

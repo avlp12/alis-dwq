@@ -17,7 +17,7 @@ Measured on the 745B case: **OOM at step 0 → stable training at ~334 GB peak**
 
 ## Install / use
 
-Works on **stock mlx-lm ≥ 0.31** (the layerwise trainer ships here as a patch module; an upstream PR adding `--layers-per-round` natively is open — once merged you can use either path).
+Works on **stock mlx-lm ≥ 0.31** (the layerwise trainer ships here as a patch module; upstream PR [ml-explore/mlx-lm#1499](https://github.com/ml-explore/mlx-lm/pull/1499) adds `--layers-per-round` natively — once merged you can use either path).
 
 ```bash
 git clone https://github.com/avlp12/alis-dwq && cd alis-dwq
@@ -62,7 +62,7 @@ Reports KL and top-1 flip per EN/code/ZH third (drop your own corpora in `data/`
 
 | Case | Student | Setup | Outcome |
 |---|---|---|---|
-| GLM-5.2 2.56 bpw | 745B MoE student (78 quant layers) | K=8, seq 512, lr 1e-6, 45% ZH mix | vs 4.5-bpw ref: overall KL **0.655→0.379 (−42%)**, ZH **0.987→0.562 (−43%)**, flips 24.4%→15.9%; peak 334 GB (full-layer training OOMs); 10/10 rounds accepted, ~5 h |
+| [GLM-5.2 2.56 bpw](https://huggingface.co/avlp12/GLM-5.2-Alis-MLX-Dynamic-2.56bpw) (shipped: `main` carries the DWQ weights, pre-DWQ at `pre-dwq`) | 745B MoE student (78 quant layers) | K=8, seq 512, lr 1e-6, 45% ZH mix | vs 4.5-bpw ref: overall KL **0.655→0.379 (−42%)**, ZH **0.987→0.562 (−43%)**, flips 24.4%→15.9%; peak 334 GB (full-layer training OOMs); 10/10 rounds accepted, ~5 h |
 | Hy3 T128 2.375 bpw | 87.6 GB / 295B MoE | full-layer DWQ (fits), 45% ZH mix | ZH-concentrated damage recovered enough to ship; see model card |
 
 ## Hard-won operational notes
@@ -71,6 +71,7 @@ Reports KL and top-1 flip per EN/code/ZH third (drop your own corpora in `data/`
 - **Never overlap a 100 GB-class load with heavy disk I/O** (uploads, mass writes): the load wedges with rss/avail frozen. Kill (-9, then verify with pgrep — zombies squat memory), let it reclaim, relaunch on a quiet box.
 - Learning rate transfers poorly across student sizes: 1e-5 was fine for an 87 GB student and diverged on a 242 GB one. Start at mlx-lm's default 1e-6; the per-round rollback makes over-stepping cheap.
 - If your checkpoint carries extra layers your runtime remaps (e.g. an MTP head), strip them for training with a hardlinked variant and re-attach after. **Never edit a hardlinked file in place** — replace it (`os.replace`), or you rewrite the original through the shared inode.
+- When re-attaching a shard, **name it `model-*.safetensors`**: mlx-lm's loader collects shards by that glob, not by the index — a shard named anything else silently never loads and you get "missing parameters" for exactly its keys.
 
 ## License
 
