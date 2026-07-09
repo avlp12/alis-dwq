@@ -69,6 +69,21 @@ python -m alis_dwq.run \
 
 (`--model` only supplies the tokenizer when targets exist — point it at the student; the teacher's 400 GB never move again.)
 
+### 0b. Measure expert traffic first (sizes the recipe)
+
+Expert-hybrid quants (e.g. [NVFP4 top-64 + NF3 tail on GLM-5.2](https://huggingface.co/madeby561/GLM-5.2-MXFP8-NVFP4-NF3-Hybrid)) work because routing traffic is heavily skewed. Measure that skew for your model before picking per-layer bits:
+
+```bash
+python -m alis_dwq.expert_traffic --model <model> --save traffic.npz --top 64
+python -m alis_dwq.expert_traffic --load traffic.npz --top 32   # re-analyze, no model load
+```
+
+Hooks `SwitchGLU`/`SwitchMLP` (architecture-agnostic), runs the same fixed EN/code/ZH slices as `eval_kld`, and reports per layer: top-N traffic share, experts needed for 90%/99% of mass, dead experts, JSD(EN, ZH), and the worst per-slice overlap of the top-N set. Uses for the numbers:
+
+- **top-N share high everywhere** → a salient/tail bit split is on the table; **low or uneven** → spend bits per-layer instead.
+- **low min-overlap / high JSD layers** → the salient set is language-dependent there; a static salient set chosen on EN traffic under-serves ZH (the per-expert version of the ZH damage the 45% mix corrects). Give those layers more bits, and make sure the calibration mix covers the language whose experts differ.
+- **dead experts** on the calibration slice get no DWQ gradient — if a layer has many, widen the mix before trusting a low-bit build of it.
+
 ### 4. Evaluate on language slices, not just overall
 
 ```bash
