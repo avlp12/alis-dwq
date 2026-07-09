@@ -36,6 +36,26 @@ python -m alis_dwq.run \
   --num-samples 145 --max-seq-length 512 --batch-size 1 --seed 7
 ```
 
+### 2b. Teacher too big for one box → distributed dump
+
+The dump is forward-only, so it pipelines across N Macs — each box loads only its layer range's shards:
+
+```bash
+mlx.launch --hosts <box1>,<box2> --backend ring \
+  --python <venv>/bin/python -m alis_dwq.run \
+  --model <local teacher dir> --targets-only --pipeline --target-dir ./targets \
+  --num-samples 145 --max-seq-length 512 --batch-size 1 --seed 7
+```
+
+Point `--model` at a **local** teacher dir on each box (an HF repo id makes every box re-download). Split by the pipeline's own layer assignment — it snaps to DSA "full"-layer boundaries so IndexShare never crosses a rank — and give each box its layers' shards **plus every globally-shared weight** (see below).
+
+Two gotchas cost us a full session on the first real distributed dump (790 GB 8-bit GLM-5.2 teacher across two 512 GB boxes; single-node teachers never hit this path). Both surface **identically** as `[METAL] Command buffer execution failed: GPU Timeout` on *one* rank even though the compute is fine — `eval_every`, wired-limit, and warmup are all red herrings. Diagnose by tracing per-layer (`mx.eval(h); print` after each layer, **both** ranks): you'll see one rank finish every layer while the other never enters its loop.
+
+- **Every box needs the embedding shard — not just the first-stage rank.** The pipeline forward runs `embed_tokens(x)` on *all* ranks (later ranks discard it and overwrite with the `recv`). A rank missing the embed weights hangs at the embedding; its peer then trips the watchdog waiting at the collective. Replicate `embed_tokens` to every box; `lm_head`/final-norm only need the last rank.
+- **`mx.eval` the pipeline's final `all_gather` before any GPU op consumes it.** The collective is on the CPU stream (no watchdog) — but the final norm/slice that reads it runs on the GPU, so the GPU command buffer *waits* on the collective while the slowest rank finishes its whole forward. On forward #1, which includes cold Metal kernel compilation on the deep rank, that wait blows past the macOS ~5 s GPU watchdog and kills the rank that arrived first. Fix in the `deepseek_v3`/`v32` pipeline path: `h = all_gather(h, stream=cpu); mx.eval(h); h = h[:n]`.
+
+**Keep `--batch-size 1` identical between the dump and the training run.** Targets are keyed by batch index, so a dump/train batch-size mismatch silently aligns teacher logits to the wrong samples. Batch 1 also keeps each command buffer small — batch 8 at seq 512 is 4096 tokens/layer and flirts with the same watchdog.
+
 ### 3. Train the student, layerwise
 
 ```bash
@@ -69,6 +89,7 @@ Reports KL and top-1 flip per EN/code/ZH third (drop your own corpora in `data/`
 
 - **Gate every big load**: wait until `free+inactive > model + 60 GB` *and stable* — a "done" log line doesn't mean the previous process released its memory, and loads launched into a reclaim window get jetsam-killed silently.
 - **Never overlap a 100 GB-class load with heavy disk I/O** (uploads, mass writes): the load wedges with rss/avail frozen. Kill (-9, then verify with pgrep — zombies squat memory), let it reclaim, relaunch on a quiet box.
+- **Getting the teacher shards onto each box (distributed dump):** Xet-backed HF repos don't parallelize with `aria2c` — the `resolve/main` redirect is a byte-range-signed CAS URL, so multi-connection splits `403`. Use `snapshot_download` with `HF_XET_HIGH_PERFORMANCE=1` and per-shard `allow_patterns` to hand each box only its half. Xet can also silently wedge mid-repo (shard count frozen, zero net-in) — wrap it in a watchdog that kills + resumes when progress stalls. If one box's uplink is slower, have the faster box pull its peer's remaining shards and ship them over the local (TB/LAN) link.
 - Learning rate transfers poorly across student sizes: 1e-5 was fine for an 87 GB student and diverged on a 242 GB one. Start at mlx-lm's default 1e-6; the per-round rollback makes over-stepping cheap.
 - If your checkpoint carries extra layers your runtime remaps (e.g. an MTP head), strip them for training with a hardlinked variant and re-attach after. **Never edit a hardlinked file in place** — replace it (`os.replace`), or you rewrite the original through the shared inode.
 - When re-attaching a shard, **name it `model-*.safetensors`**: mlx-lm's loader collects shards by that glob, not by the index — a shard named anything else silently never loads and you get "missing parameters" for exactly its keys.
