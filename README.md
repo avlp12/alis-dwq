@@ -42,10 +42,14 @@ The dump is forward-only, so it pipelines across N Macs — each box loads only 
 
 ```bash
 mlx.launch --hosts <box1>,<box2> --backend ring \
-  --python <venv>/bin/python -m alis_dwq.run \
+  --env ALIS_DWQ_DATA_DIR=<identical-path>/dwq_data \
+  --python <venv>/bin/python \
+  examples/distributed_dump_entry.py \
   --model <local teacher dir> --targets-only --pipeline --target-dir ./targets \
   --num-samples 145 --max-seq-length 512 --batch-size 1 --seed 7
 ```
+
+`mlx.launch` takes a **script file** it can verify on every host — `-m alis_dwq.run` does not work — hence the 3-line [`examples/distributed_dump_entry.py`](examples/distributed_dump_entry.py). The calibration jsonl must be **byte-identical on every host** (hash it): each rank loads its own copy, and the shared seed only aligns the permutation if the rows match.
 
 Point `--model` at a **local** teacher dir on each box (an HF repo id makes every box re-download). Split by the pipeline's own layer assignment — it snaps to DSA "full"-layer boundaries so IndexShare never crosses a rank — and give each box its layers' shards **plus every globally-shared weight** (see below).
 
@@ -84,6 +88,8 @@ Reports KL and top-1 flip per EN/code/ZH third (drop your own corpora in `data/`
 |---|---|---|---|
 | [GLM-5.2 2.56 bpw](https://huggingface.co/avlp12/GLM-5.2-Alis-MLX-Dynamic-2.56bpw) (shipped: `main` carries the DWQ weights, pre-DWQ at `pre-dwq`) | 745B MoE student (78 quant layers) | K=8, seq 512, lr 1e-6, 45% ZH mix | vs 4.5-bpw ref: overall KL **0.655→0.379 (−42%)**, ZH **0.987→0.562 (−43%)**, flips 24.4%→15.9%; peak 334 GB (full-layer training OOMs); 10/10 rounds accepted, ~5 h |
 | Hy3 T128 2.375 bpw | 87.6 GB / 295B MoE | full-layer DWQ (fits), 45% ZH mix | ZH-concentrated damage recovered enough to ship; see model card |
+| [GLM-5.2 3.5 bpw](https://huggingface.co/avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw), **8-bit teacher** (shipped: `main`; prior retune at `dwq-4.5teacher`) | 310 GB / 745B MoE | 790 GB teacher → **distributed 2-box dump** (§2b), then single-node K=6 | strided PPL wikitext **2.851→2.814 (−1.3%, significant)** over the 4.5 bpw-teacher retune; code within noise; loss 0.178→0.138 — see [examples/glm-5.2-8bit-teacher](examples/glm-5.2-8bit-teacher/README.md) |
+| GLM-5.2 2.56 bpw, 8-bit teacher (**not shipped** — negative result) | 227 GB / 745B MoE | same targets reused, K=8 | DWQ loss −35% but held-out PPL slightly *worse* (+1.3% wikitext) — the sweet-spot lesson above; `main` keeps the 4.5 bpw-teacher weights |
 
 ## Hard-won operational notes
 
@@ -91,7 +97,10 @@ Reports KL and top-1 flip per EN/code/ZH third (drop your own corpora in `data/`
 - **Never overlap a 100 GB-class load with heavy disk I/O** (uploads, mass writes): the load wedges with rss/avail frozen. Kill (-9, then verify with pgrep — zombies squat memory), let it reclaim, relaunch on a quiet box.
 - **Getting the teacher shards onto each box (distributed dump):** Xet-backed HF repos don't parallelize with `aria2c` — the `resolve/main` redirect is a byte-range-signed CAS URL, so multi-connection splits `403`. Use `snapshot_download` with `HF_XET_HIGH_PERFORMANCE=1` and per-shard `allow_patterns` to hand each box only its half. Xet can also silently wedge mid-repo (shard count frozen, zero net-in) — wrap it in a watchdog that kills + resumes when progress stalls. If one box's uplink is slower, have the faster box pull its peer's remaining shards and ship them over the local (TB/LAN) link.
 - Learning rate transfers poorly across student sizes: 1e-5 was fine for an 87 GB student and diverged on a 242 GB one. Start at mlx-lm's default 1e-6; the per-round rollback makes over-stepping cheap.
-- If your checkpoint carries extra layers your runtime remaps (e.g. an MTP head), strip them for training with a hardlinked variant and re-attach after. **Never edit a hardlinked file in place** — replace it (`os.replace`), or you rewrite the original through the shared inode.
+- If your checkpoint carries extra layers your runtime remaps (e.g. an MTP head), you have two working paths. (a) Strip them for training with a hardlinked variant and re-attach after — **never edit a hardlinked file in place**; replace it (`os.replace`), or you rewrite the original through the shared inode. (b) Train with them attached (the model's `sanitize` remaps them at load) — but then the *saved* checkpoint carries **module-named keys** (e.g. `mtp.layer.*`) instead of the checkpoint convention (`model.layers.<N>.*`), and strict loading breaks with "N parameters not in model". Fix by inverse-renaming those keys in the affected shards + index; **verify the inverse map by asserting the renamed keyset equals the original checkpoint's** before shipping, and write via temp-file + `os.replace` (see the lazy-mmap note above).
+- **Stock `mlx_lm.perplexity` / `mlx_lm.evaluate` never set the wired limit** — only generate/server do. On a 100 GB-class model that is a silent ~10× slowdown (throughput thrashing, not an error). Wrap them: `mx.set_wired_limit(mx.device_info()["max_recommended_working_set_size"])` after load, then call the module's `main()`. (This repo's `eval_kld` already does.) Custom eval scripts loading an MTP-bearing checkpoint also need `load_model(..., strict=False)` unless the runtime remaps the head.
+- **Choosing K (layers per round)**: backward memory scales with K, so pick the largest K that fits. Anchors from the 745B family on a 512 GB box: a 227 GB student at K=8 peaked ~307 GB; a 310 GB student at K=6 peaked ~389 GB. Start high, drop K on OOM — rounds get proportionally cheaper, total wall-clock barely moves.
+- **A REVERTED round near the end is the gate working, not a failure.** Both shipped GLM retunes ended with one late-round rollback (best already reached); treat consecutive reverts as the natural stopping signal.
 - When re-attaching a shard, **name it `model-*.safetensors`**: mlx-lm's loader collects shards by that glob, not by the index — a shard named anything else silently never loads and you get "missing parameters" for exactly its keys.
 - **`mx.load` is lazy (mmap) — never `save_safetensors` back to the path you loaded from.** The save truncates the file *before* the lazy view is read, so you write zeros over your own data. `mx.eval` the new arrays first, or write a temp file and `os.replace`. (We zeroed a whole target dump post-processing it this way — and the real fix was to not post-process at all: get the shape right in the forward, per §2b.)
 - **Verify a dump is non-zero and the right shape before you reclaim the teacher.** A distributed dump is your only local copy of the teacher's logits; the teacher weights are the cheap thing to reconstruct, the dump is not. After the corruption above we'd already deleted one box's teacher half — re-dumping meant re-pulling 400 GB. Keep the *peer* box's half until the targets pass a `min/max != 0` + shape check; and to free a box for the next stage, move the student to the peer over the local link (minutes) instead of deleting and re-pulling from HF (an hour).
