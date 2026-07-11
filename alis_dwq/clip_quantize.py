@@ -49,7 +49,8 @@ def _load_dir(d):
     return weights, shard_of
 
 
-def clip_requantize(w, group_size, bits, ratios, scale_dtype, chunk_elems=1 << 27):
+def clip_requantize(w, group_size, bits, ratios, scale_dtype, chunk_elems=1 << 27,
+                    max_err_slack=1.0):
     """Per-group clip search. Returns (wq, scales, biases, mse_drop, clipped_frac).
 
     Every candidate goes through mx.quantize/mx.dequantize itself, so no
@@ -73,7 +74,8 @@ def clip_requantize(w, group_size, bits, ratios, scale_dtype, chunk_elems=1 << 2
         best_sum = base_sum = 0.0
         clip_cnt = grp_cnt = 0.0
         for i in range(0, rows, step):
-            q, s, b, stats = _clip_chunk(w[i:i + step], group_size, bits, ratios, scale_dtype)
+            q, s, b, stats = _clip_chunk(w[i:i + step], group_size, bits, ratios, scale_dtype,
+                                         max_err_slack)
             qs.append(q); ss.append(s); bs.append(b)
             best_sum += stats[0]; base_sum += stats[1]
             clip_cnt += stats[2]; grp_cnt += stats[3]
@@ -81,12 +83,12 @@ def clip_requantize(w, group_size, bits, ratios, scale_dtype, chunk_elems=1 << 2
         mx.eval(q, s, b)
         drop = 1 - best_sum / max(base_sum, 1e-30)
         return q, s, b, float(drop), float(clip_cnt / max(grp_cnt, 1.0))
-    q, s, b, stats = _clip_chunk(w, group_size, bits, ratios, scale_dtype)
+    q, s, b, stats = _clip_chunk(w, group_size, bits, ratios, scale_dtype, max_err_slack)
     drop = 1 - stats[0] / max(stats[1], 1e-30)
     return q, s, b, float(drop), float(stats[2] / max(stats[3], 1.0))
 
 
-def _clip_chunk(w, group_size, bits, ratios, scale_dtype):
+def _clip_chunk(w, group_size, bits, ratios, scale_dtype, max_err_slack=1.0):
     import mlx.core as mx
     assert (group_size * bits) % 32 == 0
     w = w.astype(mx.float32)
@@ -96,18 +98,25 @@ def _clip_chunk(w, group_size, bits, ratios, scale_dtype):
     center = (wg.min(axis=-1, keepdims=True) + wg.max(axis=-1, keepdims=True)) / 2
     half = wg.max(axis=-1, keepdims=True) - center
 
-    best_err = base_err = best_q = best_s = best_b = None
+    best_err = base_err = base_maxe = best_q = best_s = best_b = None
     for r in ratios:  # ratios start with 1.0 (the unclipped baseline)
         wc = w if r >= 1.0 else mx.clip(wg, center - r * half, center + r * half).reshape(w.shape)
         q, s, b = mx.quantize(wc, group_size=group_size, bits=bits)
         dq = mx.dequantize(q, s, b, group_size=group_size, bits=bits).astype(mx.float32)
-        err = ((dq - w).reshape(*head, G, group_size) ** 2).sum(axis=-1)
+        diff = (dq - w).reshape(*head, G, group_size)
+        err = (diff ** 2).sum(axis=-1)
+        maxe = mx.abs(diff).max(axis=-1)
         s, b = s.astype(scale_dtype), b.astype(scale_dtype)
         if best_err is None:
             best_err, best_q, best_s, best_b = err, q.reshape(*head, G, -1), s, b
-            base_err = err
+            base_err, base_maxe = err, maxe
         else:
-            better = err < best_err
+            # accept a clipped grid only when it lowers the group MSE without
+            # blowing up the group's worst-case error: min-max affine anchors
+            # the extreme weights exactly, and saturating those "super
+            # weights" destroys the model even as the mean improves
+            # (measured: mean -24% / anchors x4 / wikitext 4.71 -> 51).
+            better = (err < best_err) & (maxe <= base_maxe * max_err_slack)
             best_err = mx.where(better, err, best_err)
             best_q = mx.where(better[..., None], q.reshape(*head, G, -1), best_q)
             best_s = mx.where(better, s, best_s)
@@ -132,6 +141,10 @@ def main():
     ap.add_argument("--out", required=True, help="output dir (must not be --model)")
     ap.add_argument("--ratios", default="1.0,0.9375,0.875,0.8125,0.75",
                     help="comma-separated clip ratios; 1.0 is always included")
+    ap.add_argument("--max-err-slack", type=float, default=1.0,
+                    help="accept a clipped grid only if the group's max abs "
+                         "error stays within this factor of the unclipped "
+                         "grid's (1.0 = strict Pareto; large = MSE-only)")
     ap.add_argument("--dequantize-source", action="store_true",
                     help="allow a quantized (affine) --source and dequantize it "
                          "on the fly (e.g. a Q8 dump standing in for bf16; "
@@ -238,11 +251,15 @@ def main():
                 if base + suf in student:
                     pending[shard_of[base + suf]][base + suf] = student[base + suf]
             return
-        q, s, b, drop, frac = clip_requantize(sw, gs, bits, ratios, sc.dtype)
+        q, s, b, drop, frac = clip_requantize(sw, gs, bits, ratios, sc.dtype,
+                                              max_err_slack=a.max_err_slack)
         assert q.shape == wq.shape and q.dtype == wq.dtype, base
         for suf, arr in ((".weight", q), (".scales", s), (".biases", b)):
             pending[shard_of[base + suf]][base + suf] = arr
         drops.append((drop, frac, base, bits))
+        # drop lazy-buffer references so processed shards actually free
+        for suf in (".weight", ".scales", ".biases"):
+            source.pop(base + suf, None)
 
     for fname in tqdm(sorted(by_shard), desc="shards"):
         for k in by_shard[fname]:
@@ -254,6 +271,9 @@ def main():
             else:
                 pending[fname][k] = student[k]
         mx.save_safetensors(str(out / fname), pending.pop(fname), metadata={"format": "mlx"})
+        for k in by_shard[fname]:
+            student.pop(k, None)
+        mx.clear_cache()
 
     for leftover, arrs in pending.items():  # safety net; unreachable in practice
         # (a base is processed at the FIRST shard holding any of its keys, so
