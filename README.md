@@ -43,6 +43,25 @@ Hooks `SwitchGLU`/`SwitchMLP` (architecture-agnostic), runs the same fixed EN/co
 
 `dwq_data/train.jsonl` + `valid.jsonl`, one `{"text": ...}` per line. Language mix matters: low-bit damage concentrates in the model's non-English mass (we measured ZH slices 1.4–3.9× worse than EN on two different MoE families); a ~45% target-language mix is what recovered it. Without `ALIS_DWQ_DATA_DIR`, mlx-lm's default `--data-path` loader is used.
 
+### 1b. Clip-search requantize the student (free KL, before any training)
+
+MLX's affine mode maps each group's exact min/max onto the grid ends, so one outlier stretches the whole group's grid. Borrowing the [four-over-six](https://humansand.ai/blog/nvfp4-rl.html) idea (narrow the range per block only when *measured* reconstruction error drops):
+
+```bash
+python -m alis_dwq.clip_quantize \
+  --source <unquantized MLX-layout dump> --model <student> --out <student-clip>
+```
+
+Tries a few clipped ranges per group and keeps the best by MSE (unclipped is always a candidate — a group can only match or improve). Per-tensor bits/group_size are inferred from shapes, so dynamic recipes pass through untouched. **Run it before DWQ, never after**: DWQ trains scales/biases with the packed codes frozen, and re-deciding the codes is exactly what clipping adds (it would also discard an existing DWQ, since everything is recomputed from `--source`).
+
+### Where to spend bits (measured, from the 4-bitter Lesson Fig. 18)
+
+1. **Shared experts first** — near-free (+0.2 GB on a DeepSeek-style model) and the steepest single quality gain; they run for every token.
+2. **Then the last ~15% of layers** (returns taper: 4% → 8% → 15%).
+3. **Don't bump the first layer** — ~1 GB for no measured gain; reclaim those bits for 1–2.
+
+Cross-check the split against your own `expert_traffic` numbers before committing a recipe.
+
 ### 2. Dump teacher targets (teacher's only appearance)
 
 ```bash
