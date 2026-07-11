@@ -141,6 +141,10 @@ def main():
     ap.add_argument("--out", required=True, help="output dir (must not be --model)")
     ap.add_argument("--ratios", default="1.0,0.9375,0.875,0.8125,0.75",
                     help="comma-separated clip ratios; 1.0 is always included")
+    ap.add_argument("--allow-lattice-source", action="store_true",
+                    help="override the low-bit-lattice source guard (nvfp4 or "
+                         "affine <8-bit sources cause correlated-rounding "
+                         "damage — see the E1 case study before using this)")
     ap.add_argument("--max-err-slack", type=float, default=1.0,
                     help="accept a clipped grid only if the group's max abs "
                          "error stays within this factor of the unclipped "
@@ -188,18 +192,29 @@ def main():
             else:
                 s_sc, s_bi = source[base + ".scales"], source.get(base + ".biases")
                 if s_bi is None:
-                    # nvfp4 source (packed 8/word, u8 scales, gs16, no biases)
-                    s_in = sw.shape[-1] * 8
-                    if (str(s_sc.dtype) == "mlx.core.uint8" and s_sc.shape[-1] * 16 == s_in
-                            and (wq.shape[-1] * 32) % s_in == 0
-                            and wq.shape[-1] * 32 // s_in in VALID_BITS
-                            and s_in % sc.shape[-1] == 0):
-                        if wq.shape[-1] * 32 // s_in >= 4:
-                            reason = "source precision (nvfp4~4b) does not exceed student — pass-through"
-                        else:
-                            sw = mx.dequantize(sw, s_sc, group_size=16, bits=4, mode="nvfp4")
+                    # nvfp4 source (packed 8/word, u8 scales, gs16, no biases).
+                    # GUARD: a dequantized low-bit lattice is NOT a valid stand-in
+                    # for the original weights — its values sit on a coarse grid,
+                    # and re-quantizing a lattice with a coarser affine grid
+                    # produces correlated (biased) rounding that kills the model
+                    # even when per-tensor MSE improves. Measured on a 745B MoE,
+                    # identical rules: nvfp4 source -> wikitext 51-12,769 (dead);
+                    # Q8 source -> 4.42-4.68 (alive). See the E1 case study.
+                    if not a.allow_lattice_source:
+                        reason = ("nvfp4 (low-bit lattice) source — refusing: grid "
+                                  "resonance (pass --allow-lattice-source to override)")
                     else:
-                        reason = "--source quantized in an unrecognized non-affine mode"
+                        s_in = sw.shape[-1] * 8
+                        if (str(s_sc.dtype) == "mlx.core.uint8" and s_sc.shape[-1] * 16 == s_in
+                                and (wq.shape[-1] * 32) % s_in == 0
+                                and wq.shape[-1] * 32 // s_in in VALID_BITS
+                                and s_in % sc.shape[-1] == 0):
+                            if wq.shape[-1] * 32 // s_in >= 4:
+                                reason = "source precision (nvfp4~4b) does not exceed student — pass-through"
+                            else:
+                                sw = mx.dequantize(sw, s_sc, group_size=16, bits=4, mode="nvfp4")
+                        else:
+                            reason = "--source quantized in an unrecognized non-affine mode"
                 else:
                     # infer the source's bits/gs from shapes; the candidate in_dim
                     # must ALSO validate on the student side (bits/gs both legal),
@@ -226,7 +241,8 @@ def main():
                     # keep only interpretations where the source would actually
                     # out-precise the student (the rest are pass-throughs anyway)
                     act = [(sb, sg) for sb, sg in cands
-                           if sb > wq.shape[-1] * 32 // (s_sc.shape[-1] * sg)]
+                           if sb > wq.shape[-1] * 32 // (s_sc.shape[-1] * sg)
+                           and (sb >= 8 or a.allow_lattice_source)]
                     if len(act) == 1:
                         s_bits, s_gs = act[0]
                         sw = mx.dequantize(sw, s_sc, s_bi, group_size=s_gs, bits=s_bits)
