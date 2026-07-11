@@ -99,6 +99,10 @@ def main():
     ap.add_argument("--out", required=True, help="output dir (must not be --model)")
     ap.add_argument("--ratios", default="1.0,0.9375,0.875,0.8125,0.75",
                     help="comma-separated clip ratios; 1.0 is always included")
+    ap.add_argument("--dequantize-source", action="store_true",
+                    help="allow a quantized (affine) --source and dequantize it "
+                         "on the fly (e.g. a Q8 dump standing in for bf16; "
+                         "provenance should be disclosed)")
     a = ap.parse_args()
 
     out = Path(a.out)
@@ -133,8 +137,43 @@ def main():
         elif sw is None:
             reason = "missing in --source"
         elif base + ".scales" in source:
-            reason = "--source is itself quantized (dequantize it first)"
-        elif sw.shape[:-1] != wq.shape[:-1]:
+            if not a.dequantize_source:
+                reason = "--source is itself quantized (dequantize it first, or pass --dequantize-source)"
+            else:
+                s_sc, s_bi = source[base + ".scales"], source.get(base + ".biases")
+                if s_bi is None:
+                    reason = "--source quantized in a non-affine mode"
+                else:
+                    # infer the source's bits/gs from shapes; the candidate in_dim
+                    # must ALSO validate on the student side (bits/gs both legal),
+                    # which disambiguates e.g. Q8/gs64 vs 4-bit/gs128 packings.
+                    cands = []
+                    for s_bits in VALID_BITS:
+                        if (sw.shape[-1] * 32) % s_bits:
+                            continue
+                        s_in = sw.shape[-1] * 32 // s_bits
+                        if s_sc.shape[-1] <= 0 or s_in % s_sc.shape[-1]:
+                            continue
+                        s_gs = s_in // s_sc.shape[-1]
+                        if s_gs not in (32, 64, 128) or (s_gs * s_bits) % 32:
+                            continue
+                        if (wq.shape[-1] * 32) % s_in:
+                            continue
+                        st_bits = wq.shape[-1] * 32 // s_in
+                        if st_bits not in VALID_BITS or s_in % sc.shape[-1]:
+                            continue
+                        st_gs = s_in // sc.shape[-1]
+                        if (st_gs * st_bits) % 32:
+                            continue
+                        cands.append((s_bits, s_gs))
+                    if len(cands) == 1:
+                        s_bits, s_gs = cands[0]
+                        sw = mx.dequantize(sw, s_sc, s_bi, group_size=s_gs, bits=s_bits)
+                    elif not cands:
+                        reason = "cannot infer source bits/group_size"
+                    else:
+                        reason = f"ambiguous source packing {cands} — refusing to guess"
+        if reason is None and sw.shape[:-1] != wq.shape[:-1]:
             reason = f"shape mismatch {tuple(sw.shape)} vs {tuple(wq.shape)}"
         if reason is None:
             in_dim = sw.shape[-1]
