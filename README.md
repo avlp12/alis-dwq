@@ -105,6 +105,7 @@ Reports KL and top-1 flip per EN/code/ZH third (drop your own corpora in `data/`
 | Hy3 T128 2.375 bpw | 87.6 GB / 295B MoE | full-layer DWQ (fits), 45% ZH mix | ZH-concentrated damage recovered enough to ship; see model card |
 | [GLM-5.2 3.5 bpw](https://huggingface.co/avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw), **8-bit teacher** (shipped: `main`; prior retune at `dwq-4.5teacher`) | 310 GB / 745B MoE | 790 GB teacher → **distributed 2-box dump** (§2b), then single-node K=6 | strided PPL wikitext **2.851→2.814 (−1.3%, significant)** over the 4.5 bpw-teacher retune; code within noise; loss 0.178→0.138 — see [examples/glm-5.2-8bit-teacher](examples/glm-5.2-8bit-teacher/README.md) |
 | GLM-5.2 2.56 bpw, 8-bit teacher (**not shipped** — negative result) | 227 GB / 745B MoE | same targets reused, K=8 | DWQ loss −35% but held-out PPL slightly *worse* (+1.3% wikitext) — the sweet-spot lesson above; `main` keeps the 4.5 bpw-teacher weights |
+| GLM-5.2 **E1 floor spike**: 2-bit/gs128 experts, 2.32 bpw, teacher **A/B** ([case study](examples/glm-5.2-e1-floor-spike/README.md)) | 215.8 GB / 745B MoE, from-Q8 | both arms from the same raw student, K=6 | 4.5-t arm won *every* held-out metric (wikitext 4.036 vs 4.087; −14.3% vs raw); 8-bit arm's valid dropped more yet lost — sweet-spot 3rd point. +7.0% wikitext vs the 2.56 build for −26.6 GB |
 
 ## Hard-won operational notes
 
@@ -142,7 +143,7 @@ Caveat on their headline numbers (2-bit MMLU 64% vs mlx-lm's 14%): the baseline 
 
 ## Floor notes: how low the MLX container goes (2026-07-10)
 
-Research and probe notes from scoping a sub-2.56-bpw GLM-5.2 build; the build itself (experts 2-bit/gs128 ≈ 215.2 GB / 2.316 bpw, DWQ A/B against 4.5-bpw and 8-bit teachers) is pre-registered and pending — numbers land here when it runs.
+Research and probe notes from scoping a sub-2.56-bpw GLM-5.2 build. The build ran on 2026-07-11: experts 2-bit/gs128 → 215.8 GB dec / **2.3225 bpw measured**, raw wikitext 4.711, after DWQ (the 4.5-bpw teacher won the A/B) **4.036** — full numbers in the [E1 floor-spike case study](examples/glm-5.2-e1-floor-spike/README.md).
 
 - **The MLX affine floor is 2-bit** (mlx 0.31.2 probe: supported bits `{2,3,4,5,6,8}`; `bits=1` raises). 2-bit/gs128 is the lowest effective rate: (128·2+32)/128 = **2.25 bpw**. Probed end-to-end at gs128 — `quantize`/`dequantize`/`quantized_matmul` *and* gradients w.r.t. `scales`/`biases` — so layerwise DWQ supports a mixed-group-size student out of the box.
 - **Ternary ("BitNet-style") inside MLX is strictly dominated.** Three levels are a subset of the 2-bit affine grid at identical storage, so ternary only pays in a genuinely sub-2-bit container (GGUF `IQ1_*`/`TQ*`), which MLX doesn't have. Conversion-by-training ([BitNet Distillation](https://arxiv.org/abs/2510.13998): SubLN + ~10 B-token continued pretraining + attention distillation) is demonstrated at 0.6–4 B and out of reach for 100 B+ models on Apple-Silicon boxes; pure-PTQ ternary literature so far tops out at 70 B dense with heavy cost ([TWLA](https://arxiv.org/abs/2606.13054): +44% wikitext at W1.58, needs llama.cpp ternary kernels; [PTQTP](https://arxiv.org/abs/2509.16989)'s "trit-planes" are ~4 bpw effective despite the name).
