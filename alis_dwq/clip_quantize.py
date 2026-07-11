@@ -142,7 +142,18 @@ def main():
             else:
                 s_sc, s_bi = source[base + ".scales"], source.get(base + ".biases")
                 if s_bi is None:
-                    reason = "--source quantized in a non-affine mode"
+                    # nvfp4 source (packed 8/word, u8 scales, gs16, no biases)
+                    s_in = sw.shape[-1] * 8
+                    if (str(s_sc.dtype) == "mlx.core.uint8" and s_sc.shape[-1] * 16 == s_in
+                            and (wq.shape[-1] * 32) % s_in == 0
+                            and wq.shape[-1] * 32 // s_in in VALID_BITS
+                            and s_in % sc.shape[-1] == 0):
+                        if wq.shape[-1] * 32 // s_in >= 4:
+                            reason = "source precision (nvfp4~4b) does not exceed student — pass-through"
+                        else:
+                            sw = mx.dequantize(sw, s_sc, group_size=16, bits=4, mode="nvfp4")
+                    else:
+                        reason = "--source quantized in an unrecognized non-affine mode"
                 else:
                     # infer the source's bits/gs from shapes; the candidate in_dim
                     # must ALSO validate on the student side (bits/gs both legal),
@@ -166,13 +177,19 @@ def main():
                         if (st_gs * st_bits) % 32:
                             continue
                         cands.append((s_bits, s_gs))
-                    if len(cands) == 1:
-                        s_bits, s_gs = cands[0]
+                    # keep only interpretations where the source would actually
+                    # out-precise the student (the rest are pass-throughs anyway)
+                    act = [(sb, sg) for sb, sg in cands
+                           if sb > wq.shape[-1] * 32 // (s_sc.shape[-1] * sg)]
+                    if len(act) == 1:
+                        s_bits, s_gs = act[0]
                         sw = mx.dequantize(sw, s_sc, s_bi, group_size=s_gs, bits=s_bits)
                     elif not cands:
                         reason = "cannot infer source bits/group_size"
+                    elif not act:
+                        reason = "source precision does not exceed student — pass-through"
                     else:
-                        reason = f"ambiguous source packing {cands} — refusing to guess"
+                        reason = f"ambiguous source packing {act} — refusing to guess"
         if reason is None and sw.shape[:-1] != wq.shape[:-1]:
             reason = f"shape mismatch {tuple(sw.shape)} vs {tuple(wq.shape)}"
         if reason is None:
