@@ -49,13 +49,44 @@ def _load_dir(d):
     return weights, shard_of
 
 
-def clip_requantize(w, group_size, bits, ratios, scale_dtype):
+def clip_requantize(w, group_size, bits, ratios, scale_dtype, chunk_elems=1 << 27):
     """Per-group clip search. Returns (wq, scales, biases, mse_drop, clipped_frac).
 
     Every candidate goes through mx.quantize/mx.dequantize itself, so no
     assumption is made about how MLX derives scales — candidates are judged
     purely by measured reconstruction error against the original weights.
+
+    Large tensors are processed in leading-axis chunks with an mx.eval per
+    chunk: one fused graph over a multi-GB expert stack times five candidates
+    exceeds the macOS ~5 s GPU watchdog (measured: hard kill at shard 15 of a
+    745B student). Per-group decisions are independent along the leading
+    axis, so chunking is exact.
     """
+    import mlx.core as mx
+    rows = int(w.shape[0])
+    per_row = 1
+    for d in w.shape[1:]:
+        per_row *= int(d)
+    step = max(1, int(chunk_elems // max(per_row, 1)))
+    if rows > step:
+        qs, ss, bs = [], [], []
+        best_sum = base_sum = 0.0
+        clip_cnt = grp_cnt = 0.0
+        for i in range(0, rows, step):
+            q, s, b, stats = _clip_chunk(w[i:i + step], group_size, bits, ratios, scale_dtype)
+            qs.append(q); ss.append(s); bs.append(b)
+            best_sum += stats[0]; base_sum += stats[1]
+            clip_cnt += stats[2]; grp_cnt += stats[3]
+        q = mx.concatenate(qs, axis=0); s = mx.concatenate(ss, axis=0); b = mx.concatenate(bs, axis=0)
+        mx.eval(q, s, b)
+        drop = 1 - best_sum / max(base_sum, 1e-30)
+        return q, s, b, float(drop), float(clip_cnt / max(grp_cnt, 1.0))
+    q, s, b, stats = _clip_chunk(w, group_size, bits, ratios, scale_dtype)
+    drop = 1 - stats[0] / max(stats[1], 1e-30)
+    return q, s, b, float(drop), float(stats[2] / max(stats[3], 1.0))
+
+
+def _clip_chunk(w, group_size, bits, ratios, scale_dtype):
     import mlx.core as mx
     assert (group_size * bits) % 32 == 0
     w = w.astype(mx.float32)
@@ -82,11 +113,13 @@ def clip_requantize(w, group_size, bits, ratios, scale_dtype):
             best_s = mx.where(better, s, best_s)
             best_b = mx.where(better, b, best_b)
     best_q = best_q.reshape(*head, -1)
-    tot_base = base_err.sum()
-    mse_drop = 1 - best_err.sum() / mx.maximum(tot_base, mx.array(1e-30))
-    clipped = (best_err < base_err).astype(mx.float32).mean()
-    mx.eval(best_q, best_s, best_b, mse_drop, clipped)
-    return best_q, best_s, best_b, float(mse_drop.item()), float(clipped.item())
+    best_sum = best_err.sum()
+    base_sum = base_err.sum()
+    clip_cnt = (best_err < base_err).astype(mx.float32).sum()
+    grp_cnt = mx.array(float(best_err.size))
+    mx.eval(best_q, best_s, best_b, best_sum, base_sum, clip_cnt)
+    return best_q, best_s, best_b, (float(best_sum.item()), float(base_sum.item()),
+                                    float(clip_cnt.item()), float(grp_cnt.item()))
 
 
 def main():
