@@ -31,6 +31,15 @@ from mlx_lm.tuner.losses import kl_div_loss
 from mlx_lm.tuner.trainer import grad_checkpoint, iterate_batches
 
 _LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
+# router/gate modules producing expert logits ("mlp.gate", "mlp.router"); the
+# $ anchor excludes projection weights like "gate_proj" / "switch_mlp.gate_proj"
+_ROUTER_RE = re.compile(r"(?:^|\.)(?:gate|router)$")
+
+
+def _is_router(name, m):
+    return (_ROUTER_RE.search(name) is not None
+            and getattr(m, "weight", None) is not None
+            and not _is_quantized(m))
 
 
 def _is_quantized(m):
@@ -48,8 +57,9 @@ def layerwise_dwq_quantize(
     temperature: float = 2.0, **_ignored,
 ):
     K = int(os.environ.get("ALIS_DWQ_LAYERS_PER_ROUND", "8"))
+    train_routers = os.environ.get("ALIS_DWQ_TRAIN_ROUTERS", "") == "1"
 
-    quant_layers, has_extras = set(), [False]
+    quant_layers, has_extras, router_names = set(), [False], []
 
     def scan(name, m):
         if _is_quantized(m):
@@ -58,12 +68,28 @@ def layerwise_dwq_quantize(
                 quant_layers.add(int(mm.group(1)))
             else:
                 has_extras[0] = True
+        elif train_routers and _is_router(name, m) and _LAYER_RE.search(name):
+            router_names.append(name)
 
     model.apply_to_modules(scan)
     ordered = sorted(quant_layers, reverse=True)  # deepest first
     rounds = [ordered[i:i + K] for i in range(0, len(ordered), K)]
     print(f"[alis-dwq] {len(ordered)} quant layers -> {len(rounds)} rounds of {K}"
           f" (extras with round 1: {has_extras[0]})", file=sys.stderr)
+    if train_routers:
+        print(f"[alis-dwq][EXPERIMENTAL] ALIS_DWQ_TRAIN_ROUTERS=1: {len(router_names)} "
+              "router gate modules will train alongside scales/biases (router-KD "
+              "for quantization, after 0xSero's REAP recovery). Per-round rollback "
+              "still applies. Unset the env var (or pin branch "
+              "backup/v0.1-pre-router-kd) for the previous scales/biases-only "
+              "behavior.", file=sys.stderr)
+        if router_names:
+            print(f"[alis-dwq] router modules: {router_names[0]} ... {router_names[-1]}",
+                  file=sys.stderr)
+        else:
+            print("[alis-dwq][WARN] no router modules matched (pattern "
+                  "'(gate|router)$' with a weight param) — flag has no effect",
+                  file=sys.stderr)
 
     model.train()
     if gradient_checkpoint:
@@ -107,11 +133,16 @@ def layerwise_dwq_quantize(
         sub, first = set(subset), r == 0
 
         def unfreeze(name, m):
-            if not _is_quantized(m):
-                return
-            mm = _LAYER_RE.search(name)
-            if (mm and int(mm.group(1)) in sub) or (mm is None and first and has_extras[0]):
-                m.unfreeze(keys=["scales", "biases"], recurse=False)
+            if _is_quantized(m):
+                mm = _LAYER_RE.search(name)
+                if (mm and int(mm.group(1)) in sub) or (mm is None and first and has_extras[0]):
+                    m.unfreeze(keys=["scales", "biases"], recurse=False)
+            elif train_routers and _is_router(name, m):
+                mm = _LAYER_RE.search(name)
+                if mm and int(mm.group(1)) in sub:
+                    # only "weight": e_score_correction_bias etc. act through
+                    # top-k selection, which gradients cannot see
+                    m.unfreeze(keys=["weight"], recurse=False)
 
         model.apply_to_modules(unfreeze)
         snapshot = tree_map(lambda v: v, model.trainable_parameters())
