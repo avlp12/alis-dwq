@@ -39,6 +39,8 @@ Hooks `SwitchGLU`/`SwitchMLP` (architecture-agnostic), runs the same fixed EN/co
 - **low min-overlap / high JSD layers** → the salient set is language-dependent there; a static salient set chosen on EN traffic under-serves ZH (the per-expert version of the ZH damage the 45% mix corrects). Give those layers more bits, and make sure the calibration mix covers the language whose experts differ.
 - **dead experts** on the calibration slice get no DWQ gradient — if a layer has many, widen the mix before trusting a low-bit build of it.
 
+Add `--norms` (experimental) to also accumulate each selected expert's output L2 norm — a [REAP](https://arxiv.org/abs/2510.13999)-saliency proxy (their criterion is `gate × ‖out‖`; the gate factor is applied outside `SwitchGLU` and isn't captured). The report then flags **busy-but-weak** experts (selected often, contributing little): REAP's prune candidates, or bit-cut candidates for a hybrid recipe.
+
 ### 1. Build a calibration mix (optional but recommended)
 
 `dwq_data/train.jsonl` + `valid.jsonl`, one `{"text": ...}` per line. Language mix matters: low-bit damage concentrates in the model's non-English mass (we measured ZH slices 1.4–3.9× worse than EN on two different MoE families); a ~45% target-language mix is what recovered it. Without `ALIS_DWQ_DATA_DIR`, mlx-lm's default `--data-path` loader is used.
@@ -113,6 +115,8 @@ python -m alis_dwq.run \
 
 (`--model` only supplies the tokenizer when targets exist — point it at the student; the teacher's 400 GB never move again.)
 
+**Experimental — router-KD:** add `ALIS_DWQ_TRAIN_ROUTERS=1` to also train each round's router gate weights (matched by `(gate|router)$`, e.g. `MoEGate.weight`) alongside scales/biases. Rationale: quantized experts change outputs, so the original routing is no longer optimal — [0xSero's REAP 504B](https://huggingface.co/0xSero/GLM-5.2-504B) recovered a 34%-expert prune to eval parity by distilling *only* the gates (0.016% of params); quantization damage has the same routing-shift component. Routers are tiny, so memory cost is nil, and the per-round rollback still gates every change. Judge on held-out PPL/KL as usual — routing changes which experts fire, so training loss alone can mislead (see the sweet-spot note below).
+
 ### 4. Evaluate on language slices, not just overall
 
 ```bash
@@ -121,6 +125,8 @@ python -m alis_dwq.eval_kld --model <out> --ref ref.npz            # per build
 ```
 
 Reports KL and top-1 flip per EN/code/ZH third (drop your own corpora in `data/`). Overall averages hide exactly the damage you're trying to fix.
+
+**Experimental — degeneration probe:** add `--loop-probe 256` to greedy-generate 256 tokens per slice and report distinct-4gram ratio + tail-cycle detection. Motivation: REAP's 504B held *eval parity* while its loop rate doubled (3.6%→7.2%, z≈5) — aggregate scores hide behavioral degeneration the same way they hide slice damage. Cheap to run on every build; treat a new `LOOPED` on a previously clean slice as a ship blocker until investigated.
 
 ## Results
 
@@ -175,6 +181,18 @@ Research and probe notes from scoping a sub-2.56-bpw GLM-5.2 build. The build ra
 - **The MLX affine floor is 2-bit** (mlx 0.31.2 probe: supported bits `{2,3,4,5,6,8}`; `bits=1` raises). 2-bit/gs128 is the lowest effective rate: (128·2+32)/128 = **2.25 bpw**. Probed end-to-end at gs128 — `quantize`/`dequantize`/`quantized_matmul` *and* gradients w.r.t. `scales`/`biases` — so layerwise DWQ supports a mixed-group-size student out of the box.
 - **Ternary ("BitNet-style") inside MLX is strictly dominated.** Three levels are a subset of the 2-bit affine grid at identical storage, so ternary only pays in a genuinely sub-2-bit container (GGUF `IQ1_*`/`TQ*`), which MLX doesn't have. Conversion-by-training ([BitNet Distillation](https://arxiv.org/abs/2510.13998): SubLN + ~10 B-token continued pretraining + attention distillation) is demonstrated at 0.6–4 B and out of reach for 100 B+ models on Apple-Silicon boxes; pure-PTQ ternary literature so far tops out at 70 B dense with heavy cost ([TWLA](https://arxiv.org/abs/2606.13054): +44% wikitext at W1.58, needs llama.cpp ternary kernels; [PTQTP](https://arxiv.org/abs/2509.16989)'s "trit-planes" are ~4 bpw effective despite the name).
 - **The practical floor converges across stacks.** [Unsloth's GLM-5.2 dynamic "1-bit"](https://unsloth.ai/docs/models/glm-5.2) (UD-IQ1_S GGUF) ships at **223 GB ≈ 2.4 bpw effective** for the same 745 B model — the size class a sensitivity-graded MLX 2.56-bpw build already occupies — while the same team's R1-671B went to 131 GB (1.56 bpw). The floor is model-dependent, and no one ships GLM-5.2 under ~220 GB today; below that line the fight is quality-per-byte (recipe + error-compensation passes + DWQ), not container size.
+
+## Experimental features & rollback (v0.1 baseline)
+
+Three additions landed 2026-07-12, motivated by REAP / router-KD (0xSero GLM-5.2-504B). **All are opt-in and default-off — the default pipeline is byte-identical to the pre-change baseline**, preserved as branch [`backup/v0.1-pre-router-kd`](https://github.com/avlp12/alis-dwq/tree/backup/v0.1-pre-router-kd) (commit `27863a7`). Pin that branch if you need the exact prior behavior. Every experimental path announces itself with an `[EXPERIMENTAL]` banner on stderr, so any session/model log shows at a glance whether a build used them:
+
+| Flag | Tool | What it adds | Off = |
+|---|---|---|---|
+| `ALIS_DWQ_TRAIN_ROUTERS=1` | DWQ (§3) | router gates train with scales/biases (router-KD) | scales/biases only |
+| `--norms` | `expert_traffic` (§0) | expert output-norm saliency (REAP proxy), busy-but-weak report | frequency only |
+| `--loop-probe N` | `eval_kld` (§4) | greedy degeneration probe per slice | KL/flip only |
+
+None of the three carries our own on-device measurements yet — validate each on held-out PPL/KL before making it part of a shipping recipe.
 
 ## License
 
