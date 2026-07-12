@@ -39,6 +39,8 @@ Hooks `SwitchGLU`/`SwitchMLP` (architecture-agnostic), runs the same fixed EN/co
 - **low min-overlap / high JSD layers** → the salient set is language-dependent there; a static salient set chosen on EN traffic under-serves ZH (the per-expert version of the ZH damage the 45% mix corrects). Give those layers more bits, and make sure the calibration mix covers the language whose experts differ.
 - **dead experts** on the calibration slice get no DWQ gradient — if a layer has many, widen the mix before trusting a low-bit build of it.
 
+Measured reference point (GLM-5.2 745B, EN/code/ZH mix, 2026-07-12): routing is **flat** — top-64/256 experts carry only 39–57% of frequency (45–72% of `--norms` mass), n90≈170–207 of 256, dead≈0, busy-but-weak = 0. Salient/tail bit-splits and REAP-style pruning are contraindicated on this family; and JSD(EN,ZH) reaches 0.4 mid-stack with 44–61% min-overlap — the language-dependent-experts effect the 45%-ZH calibration mix exists to cover.
+
 Add `--norms` (experimental) to also accumulate each selected expert's output L2 norm — a [REAP](https://arxiv.org/abs/2510.13999)-saliency proxy (their criterion is `gate × ‖out‖`; the gate factor is applied outside `SwitchGLU` and isn't captured). The report then flags **busy-but-weak** experts (selected often, contributing little): REAP's prune candidates, or bit-cut candidates for a hybrid recipe.
 
 ### 1. Build a calibration mix (optional but recommended)
