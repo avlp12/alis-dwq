@@ -47,6 +47,12 @@ Add `--norms` (experimental) to also accumulate each selected expert's output L2
 
 `dwq_data/train.jsonl` + `valid.jsonl`, one `{"text": ...}` per line. Language mix matters: low-bit damage concentrates in the model's non-English mass (we measured ZH slices 1.4–3.9× worse than EN on two different MoE families); a ~45% target-language mix is what recovered it. Without `ALIS_DWQ_DATA_DIR`, mlx-lm's default `--data-path` loader is used.
 
+**Experimental — synthetic mix with coverage stopping:** [Recover-LoRA](https://arxiv.org/abs/2606.04238) showed 10k *synthetic* samples match curated data for distillation recovery, and [NVIDIA's QAD](https://arxiv.org/abs/2601.20088) showed teacher logits transfer across domains — while our flat-routing measurement (§0) says 145 samples can't reach every expert. `python -m alis_dwq.gen_calib --model <teacher> --out dwq_data --mix EN=0.3,code=0.25,ZH=0.45` self-generates the jsonl, watches expert coverage through the routing hooks, stops when coverage plateaus, and drops degenerate generations via the loop detector.
+
+### 1a. Scan code entropy (student-only, minutes — decides whether 1b is worth the disk)
+
+`python -m alis_dwq.code_entropy --model <student> --save entropy.npz` recovers every tensor's code histogram (through `mx.dequantize`, no source needed) and reports **effective vs nominal bits**: a group whose min-max grid got stretched by one outlier keeps most weights in 1–2 interior codes — nominal 2 bits, effective 1.x. Low-utilization tensors are exactly where `clip_quantize` pays off, so run this before hauling a multi-hundred-GB source onto the box; per-layer effective-bpw also feeds bit reallocation, and anchor-mass tracks the super-weight sites. (Lens borrowed from [lossless BF16 compression](https://github.com/brianbell-x/weight-compression): measure the information the bits actually carry.)
+
 ### 1b. Clip-search requantize the student (free KL, before any training)
 
 MLX's affine mode maps each group's exact min/max onto the grid ends, so one outlier stretches the whole group's grid. Borrowing the [four-over-six](https://humansand.ai/blog/nvfp4-rl.html) idea (narrow the range per block only when *measured* reconstruction error drops):
@@ -116,6 +122,10 @@ python -m alis_dwq.run \
 ```
 
 (`--model` only supplies the tokenizer when targets exist — point it at the student; the teacher's 400 GB never move again.)
+
+**Experimental — LoRA error compensators:** `ALIS_DWQ_LORA_RANK=8` wraps every quantized module in a LoRA adapter ([Recover-LoRA](https://arxiv.org/abs/2606.04238) recovered 80–95% of 2-bit damage; [MiLo](https://arxiv.org/abs/2504.02658) is the MoE variant) and trains adapters alongside scales/biases under the same rounds/rollback. This adds the degree of freedom scales/biases (a per-group linear remap) fundamentally lack — the main lever left for the ~2.3 bpw floor builds, and it may reopen sharper teachers for low-bit students (the sweet-spot failure was a student-capacity limit). Adapters are saved to `ALIS_DWQ_ADAPTER_DIR` (default `alis_adapters/`) in mlx-lm's `--adapter-path` format; **the saved checkpoint stays stock** — wrappers are removed before mlx-lm writes it. Never fuse adapters into a quantized base (fusing requantizes = re-rounds the codes).
+
+**Experimental — CKA drift monitor:** `ALIS_DWQ_CKA_MONITOR=1` reports per-round layerwise CKA between accepted states on a fixed valid batch (diagnostic only, ~2 extra forwards/round). Rationale: [CKA-QAD](https://arxiv.org/abs/2606.05682) showed KL-only distillation can degrade internal geometry *while outputs match* — the same valid-vs-held-out inversion we measured twice (8-bit-teacher 2.56 bpw arm; router-KD arm). A round that valid-KL accepts but that craters one layer's CKA is the signature to investigate before shipping.
 
 **Experimental — router-KD:** add `ALIS_DWQ_TRAIN_ROUTERS=1` to also train each round's router gate weights (matched by `(gate|router)$`, e.g. `MoEGate.weight`) alongside scales/biases. Rationale: quantized experts change outputs, so the original routing is no longer optimal — [0xSero's REAP 504B](https://huggingface.co/0xSero/GLM-5.2-504B) recovered a 34%-expert prune to eval parity by distilling *only* the gates (0.016% of params); quantization damage has the same routing-shift component. Routers are tiny, so memory cost is nil, and the per-round rollback still gates every change. Judge on held-out PPL/KL as usual — routing changes which experts fire, so training loss alone can mislead (see the sweet-spot note below).
 
@@ -200,8 +210,14 @@ Three additions landed 2026-07-12, motivated by REAP / router-KD (0xSero GLM-5.2
 | `ALIS_DWQ_TRAIN_ROUTERS=1` | DWQ (§3) | router gates train with scales/biases (router-KD) | scales/biases only |
 | `--norms` | `expert_traffic` (§0) | expert output-norm saliency (REAP proxy), busy-but-weak report | frequency only |
 | `--loop-probe N` | `eval_kld` (§4) | greedy degeneration probe per slice | KL/flip only |
+| `ALIS_DWQ_LORA_RANK=r` | DWQ (§3) | LoRA error compensators train with scales/biases; adapters saved separately | scales/biases only |
+| `ALIS_DWQ_CKA_MONITOR=1` | DWQ (§3) | per-round layerwise CKA drift report (diagnostic) | no report |
+| *(new tool)* | `code_entropy` (§1a) | effective-bpw / clip pre-scan from the student alone | — |
+| *(new tool)* | `gen_calib` (§1) | synthetic calibration mix with expert-coverage stopping | curated jsonl |
 
 First on-device validation (2026-07-13, GLM-5.2 3-bit-expert student, 8-bit teacher, K=6): **router-KD is harmless but did not help** — same-teacher valid loss edged the baseline (0.1357 vs 0.1365) yet held-out wikitext lost by a hair (2.7820 vs 2.7774, well inside the CIs). The valid-vs-held-out inversion pattern strikes again; the baseline shipped. `--norms` and `--loop-probe` are validated in production use (see the E1 case study and the measured-reference note in §0).
+
+The 2026-07-13 batch (LoRA compensators, CKA monitor, `code_entropy`, `gen_calib`) carries no on-device measurements yet — validate on held-out PPL/KL before putting any of it in a shipping recipe. The LoRA adapter save/load round-trip in particular must be verified against `mlx_lm.load(..., adapter_path=...)` on-device before trusting a long run to it, and the CKA monitor exists precisely because the inversion above keeps recurring — use them together.
 
 ## License
 
