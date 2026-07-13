@@ -143,6 +143,7 @@ Reports KL and top-1 flip per EN/code/ZH third (drop your own corpora in `data/`
 
 ## Hard-won operational notes
 
+- **Gate disk as well as RAM between sequential arms.** Two ~330 GB DWQ outputs back-to-back filled the volume to 100% and the second arm died at shard-write time ("Unable to write N bytes") — after 6 h of training layerwise cannot resume, so the whole arm re-ran. Check free space >= output size + margin before every arm, not just at campaign start.
 - **Gate every big load**: wait until `free+inactive > model + 60 GB` *and stable* — a "done" log line doesn't mean the previous process released its memory, and loads launched into a reclaim window get jetsam-killed silently.
 - **Never overlap a 100 GB-class load with heavy disk I/O** (uploads, mass writes): the load wedges with rss/avail frozen. Kill (-9, then verify with pgrep — zombies squat memory), let it reclaim, relaunch on a quiet box.
 - **Getting the teacher shards onto each box (distributed dump):** Xet-backed HF repos don't parallelize with `aria2c` — the `resolve/main` redirect is a byte-range-signed CAS URL, so multi-connection splits `403`. Use `snapshot_download` with `HF_XET_HIGH_PERFORMANCE=1` and per-shard `allow_patterns` to hand each box only its half. Xet can also silently wedge mid-repo (shard count frozen, zero net-in) — wrap it in a watchdog that kills + resumes when progress stalls. If one box's uplink is slower, have the faster box pull its peer's remaining shards and ship them over the local (TB/LAN) link.
@@ -198,7 +199,7 @@ Three additions landed 2026-07-12, motivated by REAP / router-KD (0xSero GLM-5.2
 | `--norms` | `expert_traffic` (§0) | expert output-norm saliency (REAP proxy), busy-but-weak report | frequency only |
 | `--loop-probe N` | `eval_kld` (§4) | greedy degeneration probe per slice | KL/flip only |
 
-None of the three carries our own on-device measurements yet — validate each on held-out PPL/KL before making it part of a shipping recipe.
+First on-device validation (2026-07-13, GLM-5.2 3-bit-expert student, 8-bit teacher, K=6): **router-KD is harmless but did not help** — same-teacher valid loss edged the baseline (0.1357 vs 0.1365) yet held-out wikitext lost by a hair (2.7820 vs 2.7774, well inside the CIs). The valid-vs-held-out inversion pattern strikes again; the baseline shipped. `--norms` and `--loop-probe` are validated in production use (see the E1 case study and the measured-reference note in §0).
 
 ## License
 
