@@ -76,10 +76,25 @@ def loop_probe(model, tokenizer, n_gen, n_prompt=64):
         print(f"[loop] {name:>4}: distinct4={distinct:.3f}  {state}")
 
 
-def logprobs(model, ids, chunk=1024):
-    """Chunked forward with KV cache (harness rule #3: prefill <= 2048/chunk)."""
+def logprobs(model, ids, chunk=1024, kv_bits=0, kv_group_size=64):
+    """Chunked forward with KV cache (harness rule #3: prefill <= 2048/chunk).
+    kv_bits > 0 quantizes the cache (layers whose cache type lacks
+    to_quantized — e.g. DSA/recurrent states — stay full precision)."""
     from mlx_lm.models.cache import make_prompt_cache
     cache = make_prompt_cache(model)
+    if kv_bits:
+        kept = 0
+        conv = []
+        for c in cache:
+            if hasattr(c, "to_quantized"):
+                conv.append(c.to_quantized(group_size=kv_group_size, bits=kv_bits))
+            else:
+                conv.append(c)
+                kept += 1
+        cache = conv
+        if kept:
+            print(f"[kv  ] {kept}/{len(cache)} layer caches have no quantized "
+                  "form — left at full precision (probe is a lower bound)")
     outs = []
     for i in range(0, int(ids.size), chunk):
         logits = model(ids[None, i:i + chunk], cache=cache)[0].astype(mx.float32)
@@ -87,6 +102,31 @@ def logprobs(model, ids, chunk=1024):
         mx.eval(lp)
         outs.append(lp)
     return mx.concatenate(outs, axis=0)
+
+
+def kv_probe(model, ids, lp_fp16, bits, group_size, n):
+    """Self-KL induced by a quantized KV cache vs the model's own FP16-KV
+    baseline (the Bonsai-27B tolerance measurement: low-bit-weight models
+    absorbed 4-bit KV 12-95x better than FP16/Q4-weight builds — if DWQ'd
+    students inherit that, long-context memory drops ~4x for free)."""
+    print(f"[eval][EXPERIMENTAL] --kv-probe {bits}: self-KL vs own FP16-KV "
+          "baseline (per slice). Omit the flag for v0.1 behavior.")
+    lp_q = logprobs(model, ids, kv_bits=bits, kv_group_size=group_size)
+    T = min(lp_fp16.shape[0], lp_q.shape[0])
+    a, b = lp_fp16[:T], lp_q[:T]
+    kl = (mx.exp(a) * (a - b)).sum(axis=-1)
+    flip = (mx.argmax(a, axis=-1) != mx.argmax(b, axis=-1))
+    mx.eval(kl, flip)
+    klv = kl.tolist()
+    third = n // 3
+    for name, s, e in [("EN", 0, third), ("code", third, 2 * third), ("ZH", 2 * third, T)]:
+        seg = klv[s:e]
+        if seg:
+            fl = flip[s:e]
+            print(f"[kv  ] {name:>4}: selfKL={sum(seg)/len(seg):.5f}  "
+                  f"flip={float(fl.sum())/len(seg):.4f}")
+    print(f"[kv  ] all : selfKL={sum(klv[:T])/T:.5f}  "
+          f"flip={float(flip.sum())/T:.4f}  (kv {bits}-bit gs{group_size})")
 
 
 def main():
@@ -98,6 +138,10 @@ def main():
     ap.add_argument("--loop-probe", type=int, default=0, metavar="N_GEN",
                     help="greedy-generate N tokens per slice and report "
                          "repetition/loop metrics (0 = off, v0.1 behavior)")
+    ap.add_argument("--kv-probe", type=int, default=0, metavar="BITS",
+                    help="also measure self-KL with a BITS-bit quantized KV "
+                         "cache vs this model's own FP16-KV run (0 = off)")
+    ap.add_argument("--kv-group-size", type=int, default=64)
     a = ap.parse_args()
 
     model, tok = load(a.model)
@@ -108,6 +152,8 @@ def main():
         loop_probe(model, tok, a.loop_probe)
     ids = get_tokens(tok, a.n)
     lp = logprobs(model, ids)
+    if a.kv_probe > 0:
+        kv_probe(model, ids, lp, a.kv_probe, a.kv_group_size, a.n)
 
     if a.save_ref:
         np.savez(a.save_ref,
