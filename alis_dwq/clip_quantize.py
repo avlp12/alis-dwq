@@ -32,7 +32,31 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 
+import numpy as np
+
 VALID_BITS = (2, 3, 4, 5, 6, 8)
+_FFN_FAMILIES = (("gate_proj", "up_proj", "down_proj"), ("fc1", "fc2"))
+
+
+def snake_perm(mag, group_size):
+    """Outlier-scattering permutation: new[..., j] = old[..., perm[..., j]].
+
+    Channels sorted by magnitude are dealt round-robin across the
+    n/group_size quantization groups, so each group receives an even share
+    of outliers instead of one outlier stretching one group's whole grid
+    (the PeRQ-style permutation result: calibrated permutations recover most
+    of the full-rotation benefit — and unlike rotations, a permutation is
+    value-preserving, so the E1 super-weight/anchor protection is intact)."""
+    n = mag.shape[-1]
+    G = n // group_size
+    assert G * group_size == n
+    order = np.argsort(-np.asarray(mag), axis=-1)
+    ranks = np.arange(n)
+    target = (ranks % G) * group_size + ranks // G
+    perm = np.empty_like(order)
+    np.put_along_axis(perm, np.broadcast_to(target, order.shape).copy(),
+                      order, axis=-1)
+    return perm
 
 
 def _load_dir(d):
@@ -131,6 +155,75 @@ def _clip_chunk(w, group_size, bits, ratios, scale_dtype, max_err_slack=1.0):
                                     float(clip_cnt.item()), float(grp_cnt.item()))
 
 
+def _plan_ffn_perms(student, source, bases, sc_of, mx):
+    """Per-block outlier-scattering permutations of the FFN hidden axis.
+
+    The FFN hidden dimension is residual-free: permuting gate/up OUTPUT
+    channels (axis -2, not a quantization axis) together with down INPUT
+    channels (axis -1, the group axis) yields a mathematically identical
+    model whose down_proj groups no longer concentrate outliers. Expert
+    stacks permute per-expert (the permutation closes inside each expert).
+
+    Only blocks where EVERY member is a student-quantized triple with an
+    unquantized float source (and no runtime bias on the ffn axis) are
+    permuted — anything else would leave the block inconsistent."""
+    parents = defaultdict(set)
+    for b in bases:
+        parent, leaf = b.rsplit(".", 1)
+        parents[parent].add(leaf)
+
+    plans, blocks = {}, 0
+    for parent, leaves in sorted(parents.items()):
+        fam = next((f for f in _FFN_FAMILIES if set(f) <= leaves), None)
+        if fam is None:
+            continue
+        down = f"{parent}.{fam[-1]}"
+        ups = [f"{parent}.{l}" for l in fam[:-1]]
+        members = ups + [down]
+        ok = all(m + ".weight" in source and m + ".scales" not in source
+                 for m in members)
+        ok = ok and not any(m + ".bias" in student or m + ".bias" in source
+                            for m in members)
+        sd = source.get(down + ".weight")
+        if ok:
+            ffn = int(sd.shape[-1])
+            sc = sc_of(down)
+            gs = ffn // int(sc.shape[-1])
+            ok = gs * int(sc.shape[-1]) == ffn and \
+                all(int(source[u + ".weight"].shape[-2]) == ffn for u in ups)
+        if not ok:
+            print(f"[clip] --permute-ffn: skipping block {parent} "
+                  "(member missing/quantized-source/bias/axis mismatch)",
+                  file=sys.stderr)
+            continue
+        rows = int(sd.shape[0]) if len(sd.shape) == 3 else 1
+        mags = []
+        for i in range(0, rows, 8):  # bound the fp32 abs-max working set
+            chunk = sd[i:i + 8] if len(sd.shape) == 3 else sd
+            m = mx.abs(chunk.astype(mx.float32)).max(axis=-2)
+            mx.eval(m)
+            mags.append(np.array(m, copy=True))
+            if len(sd.shape) != 3:
+                break
+        mag = np.concatenate(mags, axis=0) if len(sd.shape) == 3 else mags[0]
+        perm = snake_perm(mag, gs)
+        pm = mx.array(perm.astype(np.uint32))
+        for u in ups:
+            plans[u] = (pm, -2, parent)
+        plans[down] = (pm, -1, parent)
+        blocks += 1
+    print(f"[clip] --permute-ffn: {blocks} blocks planned", file=sys.stderr)
+    return plans
+
+
+def _apply_perm(sw, perm, axis, mx):
+    if len(sw.shape) == 2:  # dense block: perm is 1-D
+        idx = perm[None, :] if axis == -1 else perm[:, None]
+    else:  # expert stack: perm is (E, ffn), broadcast over the third axis
+        idx = perm[:, None, :] if axis == -1 else perm[:, :, None]
+    return mx.take_along_axis(sw, idx.astype(mx.uint32), axis=axis)
+
+
 def main():
     import mlx.core as mx
     from tqdm import tqdm
@@ -153,6 +246,10 @@ def main():
                     help="allow a quantized (affine) --source and dequantize it "
                          "on the fly (e.g. a Q8 dump standing in for bf16; "
                          "provenance should be disclosed)")
+    ap.add_argument("--permute-ffn", action="store_true",
+                    help="outlier-scattering permutation of each FFN hidden "
+                         "axis before quantization (value-preserving, zero "
+                         "runtime cost; float sources only)")
     a = ap.parse_args()
 
     out = Path(a.out)
@@ -176,6 +273,20 @@ def main():
 
     pending = defaultdict(dict)  # shard name -> {key: array}
     done, skipped, drops = set(), [], []
+
+    perms = {}
+    if a.permute_ffn:
+        print("[clip][EXPERIMENTAL] --permute-ffn: dealing each block's FFN "
+              "hidden channels round-robin by magnitude across down_proj's "
+              "groups (PeRQ-style; value-preserving, so anchors survive). "
+              "Gate on held-out PPL and code_entropy before/after. Omit the "
+              "flag for the previous behavior.", file=sys.stderr)
+        perms = _plan_ffn_perms(student, source, bases,
+                                lambda b: student[b + ".scales"], mx)
+        if perms:  # provenance/audit copy: one perm per block, keyed by parent
+            down_perms = {par: np.asarray(pm) for pm, ax, par in perms.values()
+                          if ax == -1}
+            np.savez(out / "ffn_perms.npz", **down_perms)
 
     def process(base):
         wq, sc = student[base + ".weight"], student[base + ".scales"]
@@ -262,11 +373,21 @@ def main():
                     or wq.shape[-1] * 32 != bits * in_dim:
                 reason = f"cannot infer bits/group_size (in={in_dim})"
         if reason is not None:
+            if base in perms:
+                # a permuted block must be rewritten whole — a passthrough
+                # member would silently de-align it from its permuted peers
+                raise SystemExit(f"[clip] --permute-ffn: {base} hit a skip "
+                                 f"({reason}) after its block was planned — "
+                                 "aborting to avoid an inconsistent block; "
+                                 "rerun without --permute-ffn or fix the source")
             skipped.append((base, reason))
             for suf in (".weight", ".scales", ".biases"):
                 if base + suf in student:
                     pending[shard_of[base + suf]][base + suf] = student[base + suf]
             return
+        if base in perms:
+            pm, axis, _par = perms[base]
+            sw = _apply_perm(sw, pm, axis, mx)
         q, s, b, drop, frac = clip_requantize(sw, gs, bits, ratios, sc.dtype,
                                               max_err_slack=a.max_err_slack)
         assert q.shape == wq.shape and q.dtype == wq.dtype, base
