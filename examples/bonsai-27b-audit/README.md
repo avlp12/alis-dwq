@@ -38,8 +38,21 @@ Public analogs to diff against: PT²-LLM, PTQTP, TWLA, BitNet-Distillation.
 
 ## Tier 2 — method forensics (needs Bonsai + original weights side by side)
 
-For each matched tensor, dequantize Bonsai to `W_b` and compare with the
-original `W_o`:
+The instrument ships here and its discrimination is validated on synthetic
+ground truth (analytic TWN projection / toy GPTQ-style column compensation /
+rotated-basis ternarization → three distinct verdicts):
+
+```bash
+python -m alis_dwq.weight_forensics \
+  --original <Qwen3.6-27B-mlx> --transformed <Ternary-Bonsai-27B-mlx> \
+  --pattern "mlp" --max-tensors 40
+```
+
+Per tensor it reports: best-k projection agreement, head-vs-tail column
+drift (compensation fingerprint), singular-spectra vs elementwise weight
+correlation (rotation test), shipped-vs-closed-form scale ratio, and
+4th-level usage (nonzero usage falsifies a plain "ternary" label). The
+tests, spelled out:
 
 1. **Projection test.** Compute the closed-form ternary projection of the
    original (TWN-style: support `|w| > Δ`, `s = mean|w|` over support; sweep
@@ -85,7 +98,16 @@ piece (projection, layerwise rounds, rollback, gates) already exists here.
 
 ## Status
 
-- [ ] Tier 1 run pending (any Apple Silicon box, ~an hour).
-- [ ] Tier 2 pending (needs both weight sets on disk, ~70 GB total).
+- [x] Toolchain validated on **real mlx** (0.32 Linux CPU backend,
+  2026-07-14): `code_entropy` (incl. `--per-expert`), `clip_quantize`
+  (incl. `--permute-ffn` and the anchor guard) ran end-to-end on synthetic
+  quantized models; `weight_forensics` separates its three method classes
+  on synthetic ground truth (projection agree 1.000 / compensation drift
+  −0.044 / rotation spectra-corr 0.999 with w-corr −0.02).
+- [ ] Tier 1 on the actual Bonsai pack pending — the remote container's
+  proxy blocks Hugging Face, so weight downloads need a normal box (any
+  Apple Silicon, ~an hour; the MLX CPU backend also works on Linux for
+  `code_entropy`/`weight_forensics`, just not for fast forwards).
+- [ ] Tier 2 pending (both weight sets on disk, ~70 GB total).
 - Compiled 2026-07-14 from the whitepaper, Bonsai-demo repo, and public
   reporting; the OBS-lineage prior is a hypothesis to test, not a finding.

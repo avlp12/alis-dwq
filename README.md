@@ -233,6 +233,7 @@ Three additions landed 2026-07-12, motivated by REAP / router-KD (0xSero GLM-5.2
 | *(new tool)* | `gen_calib` (§1) | synthetic calibration mix with expert-coverage stopping (`--chat-template`: serve-distribution calibration) | curated jsonl |
 | `--permute-ffn` | `clip_quantize` (§1b) | outlier-scattering FFN-hidden permutation before requantization | min-max grouping as-is |
 | `--kv-probe BITS` | `eval_kld` (§4) | self-KL of a quantized KV cache vs own FP16-KV run | no KV probe |
+| *(new tool)* | `weight_forensics` | method-class fingerprints of a transformed model vs its original (Bonsai audit Tier 2) | — |
 
 First on-device validation (2026-07-13, GLM-5.2 3-bit-expert student, 8-bit teacher, K=6): **router-KD is harmless but did not help** — same-teacher valid loss edged the baseline (0.1357 vs 0.1365) yet held-out wikitext lost by a hair (2.7820 vs 2.7774, well inside the CIs). The valid-vs-held-out inversion pattern strikes again; the baseline shipped. `--norms` and `--loop-probe` are validated in production use (see the E1 case study and the measured-reference note in §0).
 
