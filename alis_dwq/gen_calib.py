@@ -53,9 +53,13 @@ def plateaued(history, patience=3, eps=0.005):
 
 
 def coverage(hooked, min_tokens):
-    """Mean over layers of the fraction of experts seen >= min_tokens times."""
+    """(mean fraction of experts seen >= min_tokens, median routed tokens per
+    expert, p10). The percentiles matter more than the alive-fraction:
+    min_tokens says an expert is *reachable*, not *trained* — the working
+    753B reference is ~23k routed tokens per expert (NF3-hybrid's per-expert
+    GPTQ Hessians)."""
     import mlx.core as mx
-    fracs = []
+    fracs, all_counts = [], []
     for _, _, m in hooked:
         c = m._alis_counts
         if c is None:
@@ -64,7 +68,12 @@ def coverage(hooked, min_tokens):
         mx.eval(c)
         cv = np.array(c, copy=True)
         fracs.append(float((cv >= min_tokens).mean()))
-    return float(np.mean(fracs)) if fracs else float("nan")
+        all_counts.append(cv)
+    if not fracs:
+        return float("nan"), 0.0, 0.0
+    cat = np.concatenate(all_counts) if all_counts else np.zeros(1)
+    return (float(np.mean(fracs)), float(np.median(cat)),
+            float(np.percentile(cat, 10)))
 
 
 def main():
@@ -141,13 +150,18 @@ def main():
             rows.append({"text": prompt + text})
             made += 1
         if hooked:
-            hist.append(coverage(hooked, a.min_tokens))
+            frac, med, p10 = coverage(hooked, a.min_tokens)
+            hist.append(frac)
             print(f"[gen] {len(rows)} samples, expert coverage "
-                  f"(>= {a.min_tokens} tokens): {hist[-1]*100:.1f}%"
-                  f"  (dropped {dropped} degenerate)", file=sys.stderr)
+                  f"(>= {a.min_tokens} tokens): {frac*100:.1f}%  "
+                  f"routed tokens/expert median {med:.0f} / p10 {p10:.0f} "
+                  f"(753B working reference ~23k)  "
+                  f"(dropped {dropped} degenerate)", file=sys.stderr)
             if plateaued(hist, a.patience):
                 print(f"[gen] coverage plateaued for {a.patience} batches — "
-                      "stopping early", file=sys.stderr)
+                      "stopping early (note: plateau means reachability "
+                      "saturated, not that tokens/expert is sufficient)",
+                      file=sys.stderr)
                 break
 
     n_valid = max(1, int(len(rows) * a.valid_frac))

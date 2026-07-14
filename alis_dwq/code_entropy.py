@@ -67,8 +67,14 @@ def infer_qparams(wq_shape, sc_shape, base, qcfg):
     return sorted(cands, key=lambda c: (c[1] != 64, -c[1]))[0]
 
 
-def scan(model_dir, chunk_elems=1 << 27):
-    """Recover codes tensor-by-tensor; returns the arrays analyze() needs."""
+def scan(model_dir, chunk_elems=1 << 27, per_expert=False):
+    """Recover codes tensor-by-tensor; returns the arrays analyze() needs.
+
+    per_expert additionally accumulates a code histogram per expert (axis 0
+    of 3D expert stacks, bits <= 4) — the student-only proxy for per-expert
+    quantization damage, the selection criterion the NF3-hybrid's v3.6 swap
+    validated on flat-routing GLM-5.2 (frequency saliency -> measured damage:
+    -16% KLD). Low expert code entropy = stretched grid = high damage."""
     import mlx.core as mx
     from .clip_quantize import _load_dir
 
@@ -80,6 +86,7 @@ def scan(model_dir, chunk_elems=1 << 27):
 
     names, bits_l, gs_l, nparams, hists, grp_lo, layer_ids, ambig = \
         [], [], [], [], [], [], [], []
+    pe_names, pe_layer_ids, pe_bits, pe_hists = [], [], [], []
     bases = sorted(k[: -len(".scales")] for k in weights if k.endswith(".scales"))
     for base in bases:
         wq, sc = weights[base + ".weight"], weights[base + ".scales"]
@@ -101,6 +108,8 @@ def scan(model_dir, chunk_elems=1 << 27):
 
         hist = mx.zeros((nlev,), dtype=mx.float32)
         lo_groups = tot_groups = 0.0
+        want_pe = per_expert and len(wq.shape) == 3 and bits <= 4
+        pe_chunks = []
         for i in range(0, rows, step):
             dq = mx.dequantize(weights[base + ".weight"][i:i + step],
                                sc[i:i + step], bi[i:i + step],
@@ -120,6 +129,11 @@ def scan(model_dir, chunk_elems=1 << 27):
                 h = -(p * mx.log2(mx.maximum(p, 1e-12))).sum(axis=-1)
                 lo_groups += float((h < bits / 2).astype(mx.float32).sum().item())
                 tot_groups += float(h.size)
+            if want_pe:  # chunks split on axis 0, so experts never straddle
+                pe = mx.stack([(q == k).reshape(q.shape[0], -1).sum(axis=-1)
+                               for k in range(nlev)], axis=-1)
+                mx.eval(pe)
+                pe_chunks.append(np.array(pe, copy=True).astype(np.int64))
             mx.eval(hist)
         hv = np.zeros(MAX_LEVELS, dtype=np.int64)
         hv[:nlev] = np.array(hist, copy=True).astype(np.int64)
@@ -131,16 +145,34 @@ def scan(model_dir, chunk_elems=1 << 27):
         grp_lo.append(lo_groups / tot_groups if tot_groups else np.nan)
         mm = _LAYER_RE.search(base)
         layer_ids.append(int(mm.group(1)) if mm else -1)
+        if want_pe and pe_chunks:
+            peh = np.concatenate(pe_chunks, axis=0)  # (E, nlev)
+            pad = np.zeros((peh.shape[0], 16), dtype=np.int64)
+            pad[:, :nlev] = peh
+            pe_names.append(base)
+            pe_layer_ids.append(int(mm.group(1)) if mm else -1)
+            pe_bits.append(bits)
+            pe_hists.append(pad)
         ambig.append(got is not None and
                      len([1 for g in GROUP_SIZES
                           if sc.shape[-1] * g and (wq.shape[-1] * 32) % (sc.shape[-1] * g) == 0
                           and (wq.shape[-1] * 32) // (sc.shape[-1] * g) in VALID_BITS]) > 1)
     if not names:
         raise SystemExit("[entropy] no affine-quantized tensors found")
-    return (np.array(names), np.array(bits_l, dtype=np.int64),
+    core = (np.array(names), np.array(bits_l, dtype=np.int64),
             np.array(gs_l, dtype=np.int64), np.array(nparams, dtype=np.int64),
             np.stack(hists), np.array(grp_lo), np.array(layer_ids, dtype=np.int64),
             np.array(ambig))
+    pe = None
+    if pe_hists:
+        widths = {h.shape[0] for h in pe_hists}
+        if len(widths) == 1:
+            pe = (np.array(pe_names), np.array(pe_layer_ids, dtype=np.int64),
+                  np.array(pe_bits, dtype=np.int64), np.stack(pe_hists))
+        else:
+            print(f"[entropy] mixed expert counts {sorted(widths)} — "
+                  "per-expert stats skipped", file=sys.stderr)
+    return core, pe
 
 
 # ------------------------------------------------------------------ analysis
@@ -191,28 +223,71 @@ def analyze(names, bits, gs, nparams, hists, grp_lo, layer_ids, ambig, top=15):
     return ent, util, ext
 
 
+def analyze_per_expert(pe_names, pe_layer_ids, pe_bits, pe_hists, top=10):
+    """Per-expert code entropy as a quantization-damage proxy (the criterion
+    the NF3-hybrid v3.6 swap validated; frequency saliency is contraindicated
+    on flat-routing families — see README §0)."""
+    P, E, _ = pe_hists.shape
+    util = np.zeros((P, E))
+    for t in range(P):
+        for e in range(E):
+            util[t, e] = _entropy(pe_hists[t, e]) / pe_bits[t]
+    print(f"[entropy][per-expert] {P} expert stacks x {E} experts "
+          "(damage proxy: low utilization = stretched grid = high error):")
+    for t in range(P):
+        u = util[t]
+        print(f"[entropy][per-expert] L{pe_layer_ids[t]:>3} "
+              f"{str(pe_names[t]).split('layers.')[-1]:<40} "
+              f"util min={u.min()*100:5.1f}% med={np.median(u)*100:5.1f}% "
+              f"weak(<50%)={int((u < 0.5).sum()):>3}")
+    flat = [(util[t, e], t, e) for t in range(P) for e in range(E)]
+    worst = sorted(flat)[:top]
+    print(f"[entropy][per-expert] {top} most-damaged experts "
+          "(bit-promotion / gen_calib-targeting candidates):")
+    for u, t, e in worst:
+        print(f"[entropy][per-expert]   {u*100:5.1f}%  L{pe_layer_ids[t]} "
+              f"expert {e}  ({pe_names[t]})")
+    return util
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", help="quantized student dir (needs mlx)")
     ap.add_argument("--load", help="re-analyze a saved .npz (numpy-only)")
     ap.add_argument("--save", help="write scan results to this .npz")
     ap.add_argument("--top", type=int, default=15)
+    ap.add_argument("--per-expert", action="store_true",
+                    help="per-expert code histograms on 3D expert stacks "
+                         "(bits <= 4) — student-only damage-proxy saliency")
     a = ap.parse_args()
     if bool(a.model) == bool(a.load):
         ap.error("pass exactly one of --model / --load")
 
+    pe = None
     if a.load:
         z = np.load(a.load)
         args = (z["names"], z["bits"], z["gs"], z["nparams"], z["hists"],
                 z["grp_lo"], z["layer_ids"], z["ambig"])
+        if "pe_hists" in z.files:
+            pe = (z["pe_names"], z["pe_layer_ids"], z["pe_bits"], z["pe_hists"])
     else:
-        args = scan(a.model)
+        if a.per_expert:
+            print("[entropy][EXPERIMENTAL] --per-expert: damage-proxy saliency "
+                  "per expert (NF3-hybrid v3.6 criterion). Omit for the "
+                  "per-tensor-only report.", file=sys.stderr)
+        args, pe = scan(a.model, per_expert=a.per_expert)
         if a.save:
             keys = ("names", "bits", "gs", "nparams", "hists", "grp_lo",
                     "layer_ids", "ambig")
-            np.savez(a.save, **dict(zip(keys, args)))
+            extra = {}
+            if pe is not None:
+                extra = dict(zip(("pe_names", "pe_layer_ids", "pe_bits",
+                                  "pe_hists"), pe))
+            np.savez(a.save, **dict(zip(keys, args)), **extra)
             print(f"[entropy] saved {a.save}", file=sys.stderr)
     analyze(*args, top=a.top)
+    if pe is not None:
+        analyze_per_expert(*pe, top=a.top)
 
 
 if __name__ == "__main__":
