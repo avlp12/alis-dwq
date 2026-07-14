@@ -99,6 +99,11 @@ def main():
     ap.add_argument("--patience", type=int, default=3)
     ap.add_argument("--valid-frac", type=float, default=0.1)
     ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--chat-template", action="store_true",
+                    help="wrap generation in the tokenizer's chat template "
+                         "(seed text as the user turn). Unsloth Dynamic 2.0: "
+                         "raw-text calibration is ineffective for instruct "
+                         "models — calibrate in the distribution you serve")
     a = ap.parse_args()
 
     print("[gen][EXPERIMENTAL] synthetic calibration generation (Recover-LoRA / "
@@ -106,6 +111,13 @@ def main():
           "jsonl instead for the v0.1 workflow.", file=sys.stderr)
 
     model, tok = load(a.model)
+    if a.chat_template:
+        if getattr(tok, "chat_template", None) is None:
+            raise SystemExit("[gen] --chat-template: tokenizer has no chat template")
+        print("[gen][EXPERIMENTAL] --chat-template: samples are full templated "
+              "turns (user = corpus seed, assistant = generation incl. any "
+              "thinking block) — matches the serving token distribution.",
+              file=sys.stderr)
     mx.eval(model.parameters())
     info = getattr(mx, "device_info", None) or mx.metal.device_info
     mx.set_wired_limit(info()["max_recommended_working_set_size"])
@@ -136,6 +148,10 @@ def main():
             k = str(rng.choice(names, p=probs))
             prompt_ids = chunks[k][int(rng.integers(len(chunks[k])))]
             prompt = tok.decode(prompt_ids)
+            if a.chat_template:
+                prompt = tok.apply_chat_template(
+                    [{"role": "user", "content": prompt}],
+                    tokenize=False, add_generation_prompt=True)
             text = generate(model, tok, prompt=prompt, max_tokens=a.max_tokens,
                             sampler=sampler)
             toks = tok.encode(text)
