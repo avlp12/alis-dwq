@@ -59,6 +59,12 @@ Two hygiene rules from [Unsloth Dynamic 2.0](https://unsloth.ai/docs/basics/unsl
 
 Add `--per-expert` (experimental) to break expert stacks out along axis 0 (bits ≤ 4): per-expert code entropy is the student-only proxy for **per-expert quantization damage** — the selection criterion the NF3-hybrid v3.6 validated after frequency saliency failed on this family (see §0). Outputs the most-damaged (tensor, expert) list: bit-promotion targets, or routing targets for `gen_calib`.
 
+Measured reference (GLM-5.2 E1r 2.3 bpw, 2026-07-15). Two facts the aggregate report hides:
+
+- **Expert damage lives in `down_proj`, and in the early layers' tail.** 93 of 19,200 down_proj experts sit under 70% utilization (gate/up: zero; MLA embed_q/unembed_out stacks: 93% healthy); medians are flat across depth (82.6%) but the extreme tail is all L3–L6 (worst: L3 expert 2 at 45.9%). The bit-spending prior "late layers matter" does not describe where 2-bit *grid damage* concentrates — consistent with the early-layer CKA/routing note in §3.
+- **Container constraint on the "bit-promotion" use:** MLX packs an expert stack as one tensor with uniform bits, so per-expert promotion is not shippable in-place — the actionable lever for the damaged list is `gen_calib` routing targets (give those experts calibration signal), or an unpack-style layout change (cf. the MiniMax shared-expert note below).
+- **Clip's mechanism, verified on the real artifact:** the same E1 student before vs after anchor-guarded clip-search: effective code payload **1.649 → 1.705 b/w, and all 225 of 225 expert tensors improved** — the utilization gain that decoded to the measured −6.1% raw wikitext PPL (part 2 of the E1 case study). Low code entropy predicting clip payoff is now a measured, not hypothesized, relationship on a 745B artifact.
+
 ### 1b. Clip-search requantize the student (free KL, before any training)
 
 MLX's affine mode maps each group's exact min/max onto the grid ends, so one outlier stretches the whole group's grid. Borrowing the [four-over-six](https://humansand.ai/blog/nvfp4-rl.html) idea (narrow the range per block only when *measured* reconstruction error drops):
