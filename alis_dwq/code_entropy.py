@@ -171,13 +171,15 @@ def scan(model_dir, chunk_elems=1 << 27, per_expert=False):
             np.array(ambig))
     pe = None
     if pe_hists:
-        widths = {h.shape[0] for h in pe_hists}
-        if len(widths) == 1:
-            pe = (np.array(pe_names), np.array(pe_layer_ids, dtype=np.int64),
-                  np.array(pe_bits, dtype=np.int64), np.stack(pe_hists))
-        else:
-            print(f"[entropy] mixed expert counts {sorted(widths)} — "
-                  "per-expert stats skipped", file=sys.stderr)
+        # real dynamic recipes mix stack widths (e.g. GLM-5.2: 256-expert
+        # SwitchMLP banks next to 64-head MLA embed_q/unembed_out stacks) —
+        # pad to the widest and keep the true width per tensor, instead of
+        # dropping the whole report as the first on-device run did
+        E = max(h.shape[0] for h in pe_hists)
+        counts = np.array([h.shape[0] for h in pe_hists], dtype=np.int64)
+        padded = [np.pad(h, ((0, E - h.shape[0]), (0, 0))) for h in pe_hists]
+        pe = (np.array(pe_names), np.array(pe_layer_ids, dtype=np.int64),
+              np.array(pe_bits, dtype=np.int64), np.stack(padded), counts)
     return core, pe
 
 
@@ -229,24 +231,29 @@ def analyze(names, bits, gs, nparams, hists, grp_lo, layer_ids, ambig, top=15):
     return ent, util, ext
 
 
-def analyze_per_expert(pe_names, pe_layer_ids, pe_bits, pe_hists, top=10):
+def analyze_per_expert(pe_names, pe_layer_ids, pe_bits, pe_hists, pe_counts=None,
+                       top=10):
     """Per-expert code entropy as a quantization-damage proxy (the criterion
     the NF3-hybrid v3.6 swap validated; frequency saliency is contraindicated
-    on flat-routing families — see README §0)."""
+    on flat-routing families — see README §0). pe_counts carries each stack's
+    true width when widths are mixed (rows are padded to the widest)."""
     P, E, _ = pe_hists.shape
+    if pe_counts is None:
+        pe_counts = np.full(P, E, dtype=np.int64)
     util = np.zeros((P, E))
     for t in range(P):
-        for e in range(E):
+        for e in range(int(pe_counts[t])):
             util[t, e] = _entropy(pe_hists[t, e]) / pe_bits[t]
-    print(f"[entropy][per-expert] {P} expert stacks x {E} experts "
+    print(f"[entropy][per-expert] {P} expert stacks, widths "
+          f"{sorted(set(pe_counts.tolist()))} "
           "(damage proxy: low utilization = stretched grid = high error):")
     for t in range(P):
-        u = util[t]
+        u = util[t, :pe_counts[t]]
         print(f"[entropy][per-expert] L{pe_layer_ids[t]:>3} "
               f"{str(pe_names[t]).split('layers.')[-1]:<40} "
               f"util min={u.min()*100:5.1f}% med={np.median(u)*100:5.1f}% "
               f"weak(<50%)={int((u < 0.5).sum()):>3}")
-    flat = [(util[t, e], t, e) for t in range(P) for e in range(E)]
+    flat = [(util[t, e], t, e) for t in range(P) for e in range(int(pe_counts[t]))]
     worst = sorted(flat)[:top]
     print(f"[entropy][per-expert] {top} most-damaged experts "
           "(bit-promotion / gen_calib-targeting candidates):")
@@ -275,7 +282,8 @@ def main():
         args = (z["names"], z["bits"], z["gs"], z["nparams"], z["hists"],
                 z["grp_lo"], z["layer_ids"], z["ambig"])
         if "pe_hists" in z.files:
-            pe = (z["pe_names"], z["pe_layer_ids"], z["pe_bits"], z["pe_hists"])
+            pe = (z["pe_names"], z["pe_layer_ids"], z["pe_bits"], z["pe_hists"],
+                  z["pe_counts"] if "pe_counts" in z.files else None)
     else:
         if a.per_expert:
             print("[entropy][EXPERIMENTAL] --per-expert: damage-proxy saliency "
@@ -288,7 +296,7 @@ def main():
             extra = {}
             if pe is not None:
                 extra = dict(zip(("pe_names", "pe_layer_ids", "pe_bits",
-                                  "pe_hists"), pe))
+                                  "pe_hists", "pe_counts"), pe))
             np.savez(a.save, **dict(zip(keys, args)), **extra)
             print(f"[entropy] saved {a.save}", file=sys.stderr)
     analyze(*args, top=a.top)
