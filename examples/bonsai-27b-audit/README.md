@@ -1,5 +1,9 @@
 # Bonsai 27B: audit + method reverse-engineering protocol
 
+> **Published write-ups of this audit**: [English](POST.md) ·
+> [한국어 상세판](POST_KO.md) · [한국어 쉬운 판](POST_KO_EASY.md)
+
+
 PrismML ships binary/ternary Qwen3.6-27B ([whitepaper](https://github.com/PrismML-Eng/Bonsai-demo/blob/main/bonsai-27b-whitepaper.pdf))
 claiming 94.6% FP16 retention at 1.71 bpw — post-training, end-to-end
 (embeddings through LM head), method proprietary. Both the **output**
