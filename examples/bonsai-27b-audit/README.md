@@ -96,6 +96,83 @@ projection step where clip_quantize's requantize sits), gated by eval_kld +
 the degeneration probes. That is a research arc, not a weekend — but every
 piece (projection, layerwise rounds, rollback, gates) already exists here.
 
+## Tier 1 results (measured 2026-07-15, M3 Ultra 512 GB, stock mlx-lm 0.31.3 / mlx 0.31.2 Metal)
+
+Pack: `prism-ml/Ternary-Bonsai-27B-mlx-2bit` (8.49 GB, 2-bit/gs128 affine,
+26.9 B language params scanned; vision tower is HQQ and not affine —
+excluded). Reference: `Qwen/Qwen3.6-27B` bf16 (53.8 GB), loaded by stock
+`mlx_lm`. The pack **runs on stock mlx-lm** — the custom kernels are a speed
+path, not a format requirement.
+
+**Code histograms — the "ternary" label is true.**
+
+- 4th-level usage: **exactly 0 across all 498 tensors** (no `code 3`
+  anywhere). No high-precision escape hatches in the language weights.
+- Global level fractions: **35.2% −1 / 29.7% 0 / 35.1% +1** — near the
+  max-entropy point for 3 levels. Effective **1.58 b/w of the nominal 2.00
+  (79% — the ternary ceiling log₂3/2 = 79.2%)**, uniform across all 64
+  layers; per-tensor entropy min 1.551 / median 1.585 (max 1.585).
+- Zero fraction is *tight*: median 0.299, std 0.013 across tensors —
+  a fixed-threshold-like criterion, not per-group-optimized support
+  (which would spread wider). `linear_attn.in_proj_a/b` are the outliers
+  (0.234–0.341) and also the lowest-utilization tensors (77.5–78.5%).
+- Low-entropy groups: **0.0% everywhere** — no stretched-grid pathology at
+  all, i.e. nothing for `clip_quantize` to fix; the grids are already
+  min-MSE-ish over 3 levels. (Tool note: this scan exposed and fixed a
+  float32 histogram-saturation bug in `code_entropy` — counts froze at 2²⁴
+  per bin and briefly cosplayed as an exact-⅓ top-k fingerprint. int64
+  accumulation now; re-measured numbers above.)
+
+**First token-level KL/flip vs FP16** (3,072-token EN/code/ZH slice,
+KL(ref‖cand), T=3072):
+
+| slice | KL | top-1 flip |
+|---|---|---|
+| EN | 0.580 | 21.0% |
+| code | 1.324 | 22.8% |
+| ZH | 1.325 | **45.6%** |
+| overall | **1.077 ± 0.040** | 29.8% |
+
+The non-English damage concentration we measured on two MoE families holds
+on this dense hybrid too: ZH flips nearly half its tokens while the
+benchmark-facing EN slice looks mildest. The whitepaper's benchmark-only
+evidence (temp-asymmetric, judge-scored) would not show this.
+
+**Degeneration probe (greedy 256 from 64-token raw-text prompts): Bonsai
+loops on every slice; FP16 is clean on the identical probe.**
+
+| | EN | code | ZH |
+|---|---|---|---|
+| FP16 distinct-4gram / cycle | 0.632 / none | 0.941 / none | 0.996 / none |
+| Bonsai distinct-4gram / cycle | **0.134 / len-13** | **0.411 / len-2** | **0.079 / len-18** |
+
+That is the REAP signature (eval parity, loop rate up) in an extreme form —
+consistent with their own IQ2_XXS AIME-collapse observation that long-form
+behavior dies before short-form metrics notice. Caveat: raw-text greedy
+continuation is out-of-distribution for an instruct-tuned base; but the
+FP16 control on the same probe is what isolates the quantization as the
+cause. Their published 80.49/15-benchmark average was sampled at their
+serving temperature through chat templates — both can be true.
+
+**KV-tolerance: reproduced, 56×.** Self-KL of a 4-bit/gs64 KV cache vs each
+model's own FP16-KV run (16 of 64 layer caches quantizable on this hybrid —
+linear-attention states stay FP16, so both rows are lower bounds):
+
+| | EN | code | ZH | overall | flip |
+|---|---|---|---|---|---|
+| FP16 weights | 0.0458 | 0.4148 | 0.0261 | 0.1622 | 5.1% |
+| Bonsai ternary | 0.0030 | 0.0029 | 0.0028 | **0.0029** | 2.2% |
+
+**56× lower self-KL on the ternary build** — inside PrismML's claimed
+12–95× band, reproduced on an independent harness. The transferable
+hypothesis (discretization-shaped models absorb cache noise) survives its
+first outside test; running the same probe on our own DWQ'd students is
+§3b of the validation backlog. One mechanism caveat before quoting the
+number: a model this loop-prone has low-entropy output distributions, and
+peaked outputs are cheap to reproduce under cache noise — tolerance and
+degeneration may share a cause. The Tier 2 activation-kurtosis capture
+(test 6) is the discriminator.
+
 ## Status
 
 - [x] Toolchain validated on **real mlx** (0.32 Linux CPU backend,
@@ -104,10 +181,9 @@ piece (projection, layerwise rounds, rollback, gates) already exists here.
   quantized models; `weight_forensics` separates its three method classes
   on synthetic ground truth (projection agree 1.000 / compensation drift
   −0.044 / rotation spectra-corr 0.999 with w-corr −0.02).
-- [ ] Tier 1 on the actual Bonsai pack pending — the remote container's
-  proxy blocks Hugging Face, so weight downloads need a normal box (any
-  Apple Silicon, ~an hour; the MLX CPU backend also works on Linux for
-  `code_entropy`/`weight_forensics`, just not for fast forwards).
+- [x] Tier 1 on the actual Bonsai pack (2026-07-15, above): ternary label
+  verified; KL/flip vs FP16 measured; loop-probe LOOPED ×3 vs clean FP16
+  control; KV-tolerance reproduced at 56×.
 - [ ] Tier 2 pending (both weight sets on disk, ~70 GB total).
 - Compiled 2026-07-14 from the whitepaper, Bonsai-demo repo, and public
   reporting; the OBS-lineage prior is a hypothesis to test, not a finding.
