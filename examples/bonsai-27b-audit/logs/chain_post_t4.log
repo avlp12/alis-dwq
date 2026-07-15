@@ -1,0 +1,13 @@
+[post] === arm N ppl re-run (final 255-target scorer) ===
+[ppl-w512] /Users/gesicht/alis-dwq/data/wikitext.txt: ppl=11.1902  (56 windows, 14280 scored tokens)
+[ppl-w512] /Users/gesicht/alis-dwq/data/code.txt: ppl=3.2290  (50 windows, 12750 scored tokens)
+[ppl-w512] /Users/gesicht/alis-dwq/data/zh.txt: ppl=17.1218  (55 windows, 14025 scored tokens)
+[post] === Bonsai ternary pack, same protocol ===
+[ppl-w512] /Users/gesicht/alis-dwq/data/wikitext.txt: ppl=11.3102  (56 windows, 14280 scored tokens)
+[ppl-w512] /Users/gesicht/alis-dwq/data/code.txt: ppl=2.8168  (50 windows, 12750 scored tokens)
+[ppl-w512] /Users/gesicht/alis-dwq/data/zh.txt: ppl=26.8540  (55 windows, 14025 scored tokens)
+[post] === FP16 original, same protocol ===
+[ppl-w512] /Users/gesicht/alis-dwq/data/wikitext.txt: ppl=6.3395  (56 windows, 14280 scored tokens)
+[ppl-w512] /Users/gesicht/alis-dwq/data/code.txt: ppl=2.2162  (50 windows, 12750 scored tokens)
+[ppl-w512] /Users/gesicht/alis-dwq/data/zh.txt: ppl=8.7802  (55 windows, 14025 scored tokens)
+[post] POST_T4_COMPLETE Wed Jul 15 11:06:00 KST 2026

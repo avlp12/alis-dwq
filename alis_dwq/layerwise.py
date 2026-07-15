@@ -33,6 +33,8 @@ import mlx_lm.quant.dwq as D
 from mlx_lm.tuner.losses import kl_div_loss
 from mlx_lm.tuner.trainer import grad_checkpoint, iterate_batches
 
+from . import losses
+
 _LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
 # router/gate modules producing expert logits ("mlp.gate", "mlp.router"); the
 # $ anchor excludes projection weights like "gate_proj" / "switch_mlp.gate_proj"
@@ -160,6 +162,10 @@ def layerwise_dwq_quantize(
     train_routers = os.environ.get("ALIS_DWQ_TRAIN_ROUTERS", "") == "1"
     lora_rank = int(os.environ.get("ALIS_DWQ_LORA_RANK", "0") or 0)
     cka_mon = os.environ.get("ALIS_DWQ_CKA_MONITOR", "") == "1"
+    loss_kind, loss_topk = losses.parse(os.environ.get("ALIS_DWQ_LOSS", "kl"))
+    if loss_kind != "kl" or loss_topk:
+        losses.banner(loss_kind, loss_topk)
+    need_labels = loss_kind == "cakld"
 
     lora_cfg = None
     if lora_rank > 0:
@@ -219,16 +225,22 @@ def layerwise_dwq_quantize(
 
     scale = 1 / temperature
 
-    def loss_fn(params, x, targets, lengths):
+    def loss_fn(params, x, targets, lengths, labels=None):
         model.update(tree_map(lambda v: v.astype(dtype), params))
         logits = model(x)
+        ids = None
         if isinstance(targets, tuple):
             targets, ids = targets
             logits = mx.take_along_axis(logits, ids, axis=-1)
-        losses = kl_div_loss(scale * logits, scale * targets)
+        if loss_kind == "kl" and loss_topk is None:  # stock path, untouched
+            per_tok = kl_div_loss(scale * logits, scale * targets)
+        else:
+            per_tok = losses.per_token_loss(loss_kind, loss_topk, logits,
+                                            targets, scale, labels=labels,
+                                            ids=ids)
         mask = mx.arange(1, 1 + targets.shape[1]) < lengths[:, 1:]
         ntoks = mask.sum()
-        return (mask * losses).sum() / ntoks, ntoks
+        return (mask * per_tok).sum() / ntoks, ntoks
 
     def validate(tag):
         v_loss, v_tok = 0.0, 0
@@ -236,10 +248,11 @@ def layerwise_dwq_quantize(
         for i, (batch, lengths) in enumerate(
             iterate_batches(valid_data, batch_size, max_seq_length, seed=seed)
         ):
+            labels = batch[:, 1:] if need_labels else None
             batch = batch[:, :-1]
             targets = target_fn(batch, i, split="valid")
             mx.eval(targets)
-            loss, ntoks = loss_fn(params, batch, targets, lengths)
+            loss, ntoks = loss_fn(params, batch, targets, lengths, labels)
             mx.eval(loss, ntoks)
             v_tok += ntoks.item()
             v_loss += loss.item() * ntoks.item()
@@ -285,8 +298,9 @@ def layerwise_dwq_quantize(
         params = tree_map(lambda v: v.astype(mx.float32), model.trainable_parameters())
         ropt = optimizers.Adam(learning_rate=opt.learning_rate, bias_correction=True)
 
-        def step(inputs, targets, lengths, params):
-            (loss, ntoks), grads = mx.value_and_grad(loss_fn)(params, inputs, targets, lengths)
+        def step(inputs, targets, lengths, params, labels=None):
+            (loss, ntoks), grads = mx.value_and_grad(loss_fn)(
+                params, inputs, targets, lengths, labels)
             return loss, ntoks, ropt.apply_gradients(grads, params)
 
         total, tok = 0.0, 0
@@ -297,10 +311,11 @@ def layerwise_dwq_quantize(
                 desc=f"round {r + 1}/{len(rounds)} L{subset[-1]}-{subset[0]}",
             )
         ):
+            labels = batch[:, 1:] if need_labels else None
             batch = batch[:, :-1]
             targets = target_fn(batch, it, split="train")
             mx.eval(targets)
-            loss, ntoks, params = step(batch, targets, lengths, params)
+            loss, ntoks, params = step(batch, targets, lengths, params, labels)
             mx.eval(loss, params)
             tok += ntoks.item()
             total += loss.item() * ntoks.item()

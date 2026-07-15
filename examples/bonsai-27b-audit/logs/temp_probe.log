@@ -1,0 +1,35 @@
+=== Bonsai ternary, temp-matched (T=1.0 k=20 p=0.95 x5) ===
+[eval][EXPERIMENTAL] --loop-probe: degeneration probe, T=1.0 top_k=20 top_p=0.95 x5 samples (256 tokens from a 64-token prompt per slice). Omit the flag (or pin branch backup/v0.1-pre-router-kd) for the previous KL/flip-only behavior.
+[loop]   EN#0: distinct4=0.889  cycle=none
+[loop]   EN#1: distinct4=0.265  cycle=none
+[loop]   EN#2: distinct4=0.727  cycle=none
+[loop]   EN#3: distinct4=0.941  cycle=none
+[loop]   EN#4: distinct4=0.794  cycle=none
+[loop] code#0: distinct4=0.945  cycle=none
+[loop] code#1: distinct4=0.858  cycle=none
+[loop] code#2: distinct4=0.917  cycle=none
+[loop] code#3: distinct4=0.897  cycle=none
+[loop] code#4: distinct4=0.589  cycle=none
+[loop]   ZH#0: distinct4=0.913  cycle=none
+[loop]   ZH#1: distinct4=0.913  cycle=none
+[loop]   ZH#2: distinct4=0.984  cycle=none
+[loop]   ZH#3: distinct4=0.992  cycle=none
+[loop]   ZH#4: distinct4=0.957  cycle=none
+=== FP16 control, same distribution ===
+[eval][EXPERIMENTAL] --loop-probe: degeneration probe, T=1.0 top_k=20 top_p=0.95 x5 samples (256 tokens from a 64-token prompt per slice). Omit the flag (or pin branch backup/v0.1-pre-router-kd) for the previous KL/flip-only behavior.
+[loop]   EN#0: distinct4=0.901  cycle=none
+[loop]   EN#1: distinct4=0.858  cycle=none
+[loop]   EN#2: distinct4=0.881  cycle=none
+[loop]   EN#3: distinct4=0.901  cycle=none
+[loop]   EN#4: distinct4=0.660  cycle=none
+[loop] code#0: distinct4=0.672  cycle=none
+[loop] code#1: distinct4=0.885  cycle=none
+[loop] code#2: distinct4=0.806  cycle=none
+[loop] code#3: distinct4=0.862  cycle=none
+[loop] code#4: distinct4=0.814  cycle=none
+[loop]   ZH#0: distinct4=0.988  cycle=none
+[loop]   ZH#1: distinct4=0.976  cycle=none
+[loop]   ZH#2: distinct4=0.988  cycle=none
+[loop]   ZH#3: distinct4=0.972  cycle=none
+[loop]   ZH#4: distinct4=0.964  cycle=none
+TEMP_PROBE_DONE

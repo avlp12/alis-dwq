@@ -46,22 +46,45 @@ def loop_stats(toks, max_period=32, tail=96):
     return distinct, 0
 
 
-def greedy_continue(model, ids, n_gen):
-    """Greedy-decode n_gen tokens after prompt ids (deterministic probe)."""
+def _sample(logits, temp, top_k, top_p):
+    """Temperature sampling with optional top-k/top-p (temp 0 = greedy)."""
+    if temp <= 0:
+        return mx.argmax(logits, axis=-1)
+    logits = (logits / temp).astype(mx.float32)
+    if top_k and top_k > 0:
+        thresh = mx.sort(logits, axis=-1)[..., -top_k:-top_k + 1]
+        logits = mx.where(logits < thresh, -mx.array(np.inf), logits)
+    if top_p < 1.0:
+        srt = mx.sort(logits, axis=-1)[..., ::-1]
+        probs = mx.softmax(srt, axis=-1)
+        cum = mx.cumsum(probs, axis=-1)
+        # nucleus: keep tokens whose preceding cumulative mass < top_p;
+        # threshold = smallest kept logit (max is always kept)
+        thresh = mx.min(mx.where(cum - probs < top_p, srt, srt[..., :1]),
+                        axis=-1, keepdims=True)
+        logits = mx.where(logits < thresh, -mx.array(np.inf), logits)
+    return mx.random.categorical(logits)
+
+
+def gen_continue(model, ids, n_gen, temp=0.0, top_k=0, top_p=1.0):
+    """Decode n_gen tokens after prompt ids (greedy when temp=0)."""
     from mlx_lm.models.cache import make_prompt_cache
     cache = make_prompt_cache(model)
     logits = model(ids[None], cache=cache)
-    tok = mx.argmax(logits[:, -1:], axis=-1)
+    tok = _sample(logits[:, -1], temp, top_k, top_p)[None]
     out = []
     for _ in range(n_gen):
         out.append(int(tok.item()))
         logits = model(tok, cache=cache)
-        tok = mx.argmax(logits[:, -1:], axis=-1)
+        tok = _sample(logits[:, -1], temp, top_k, top_p)[None]
     return out
 
 
-def loop_probe(model, tokenizer, n_gen, n_prompt=64):
-    print(f"[eval][EXPERIMENTAL] --loop-probe: greedy degeneration probe "
+def loop_probe(model, tokenizer, n_gen, n_prompt=64, temp=0.0, top_k=0,
+               top_p=1.0, samples=1):
+    mode = ("greedy" if temp <= 0 else
+            f"T={temp} top_k={top_k} top_p={top_p} x{samples} samples")
+    print(f"[eval][EXPERIMENTAL] --loop-probe: degeneration probe, {mode} "
           f"({n_gen} tokens from a {n_prompt}-token prompt per slice). Omit "
           "the flag (or pin branch backup/v0.1-pre-router-kd) for the "
           "previous KL/flip-only behavior.")
@@ -70,10 +93,13 @@ def loop_probe(model, tokenizer, n_gen, n_prompt=64):
         if not path.exists():
             continue
         ids = mx.array(tokenizer.encode(path.read_text())[:n_prompt])
-        toks = greedy_continue(model, ids, n_gen)
-        distinct, period = loop_stats(toks)
-        state = f"cycle=len{period} LOOPED" if period else "cycle=none"
-        print(f"[loop] {name:>4}: distinct4={distinct:.3f}  {state}")
+        for s in range(max(1, samples)):
+            mx.random.seed(1000 + s)
+            toks = gen_continue(model, ids, n_gen, temp, top_k, top_p)
+            distinct, period = loop_stats(toks)
+            state = f"cycle=len{period} LOOPED" if period else "cycle=none"
+            tag = f"{name}#{s}" if samples > 1 else name
+            print(f"[loop] {tag:>6}: distinct4={distinct:.3f}  {state}")
 
 
 def logprobs(model, ids, chunk=1024, kv_bits=0, kv_group_size=64):
@@ -136,8 +162,16 @@ def main():
     ap.add_argument("--ref")
     ap.add_argument("--n", type=int, default=3072)
     ap.add_argument("--loop-probe", type=int, default=0, metavar="N_GEN",
-                    help="greedy-generate N tokens per slice and report "
+                    help="generate N tokens per slice and report "
                          "repetition/loop metrics (0 = off, v0.1 behavior)")
+    ap.add_argument("--loop-temp", type=float, default=0.0,
+                    help="loop-probe sampling temperature (0 = greedy); the "
+                         "temperature-matched control for 'it only loops "
+                         "under greedy' rebuttals")
+    ap.add_argument("--loop-top-k", type=int, default=0)
+    ap.add_argument("--loop-top-p", type=float, default=1.0)
+    ap.add_argument("--loop-samples", type=int, default=1,
+                    help="samples per slice when loop-temp > 0 (seeded)")
     ap.add_argument("--kv-probe", type=int, default=0, metavar="BITS",
                     help="also measure self-KL with a BITS-bit quantized KV "
                          "cache vs this model's own FP16-KV run (0 = off)")
@@ -149,7 +183,9 @@ def main():
     set_wired()
     print(f"[mem ] load {mx.get_active_memory()/1e9:.1f}GB / peak {mx.get_peak_memory()/1e9:.1f}GB")
     if a.loop_probe > 0:
-        loop_probe(model, tok, a.loop_probe)
+        loop_probe(model, tok, a.loop_probe, temp=a.loop_temp,
+                   top_k=a.loop_top_k, top_p=a.loop_top_p,
+                   samples=a.loop_samples)
     ids = get_tokens(tok, a.n)
     lp = logprobs(model, ids)
     if a.kv_probe > 0:

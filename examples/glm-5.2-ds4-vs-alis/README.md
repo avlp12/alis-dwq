@@ -59,9 +59,48 @@ be read as recipe-vs-recipe, not format-vs-format. And size is not equal
 practical floor claim needs revising; if E1 wins ZH by the usual margin, the
 DWQ-recovery story extends to cross-stack comparisons.
 
+## Results (measured 2026-07-15, single M3 Ultra 512 GB)
+
+Protocol steps 1–2 ran as written: corpus files hashed on both sides
+(1b00a74f / ccdb70ea / 82db86d9), `llama-perplexity -c 512` (llama.cpp
+b9960, Metal, `-ngl 999`) vs `alis_dwq.ppl_windows --window 512` (verified
+mirror of llama.cpp's chunk scoring: 255 targets/window, chunk[0]=BOS).
+**Window counts matched exactly per slice (54 / 45 / 61)** — the two
+harnesses tokenized the identical bytes identically, so the numbers are
+directly comparable.
+
+| 512-window PPL | ds4 `GLM-5.2-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K` (211 GB dec / 196.6 GiB) | Alis **E1r-s11-DWQ-A45** (215.8 GB dec / 201.0 GiB) |
+|---|---|---|
+| wikitext | **4.0102 ± 0.0742** | 4.0772 |
+| code | 2.4755 ± 0.0437 | **2.3749** |
+| ZH | **4.5852 ± 0.0847** | 4.6662 |
+
+Reading (against the llama.cpp-reported per-window SE): wikitext and ZH
+differ by less than one standard error each — **statistical ties**. Code
+differs by ~2.3 SE in E1r's favor (**−4.1%**), the only clearly resolved
+slice. At near-identical deployed size (196.6 vs 201.0 GiB), the
+**codebook-format + imatrix stack and the uniform-affine + clip + DWQ stack
+land on the same quality shelf**, with the trained side ahead on code.
+
+Notes for fairness and follow-ups:
+
+- ds4's build is ~2.1 bpw effective vs E1r's 2.32 — slightly fewer bits/
+  weight in a non-uniform format vs slightly more bits in a uniform one;
+  equal-byte outcomes, different philosophies. The affine container's
+  handicap (no codebook) appears fully compensated by clip + DWQ.
+- E1r additionally carries a clean degeneration probe (greedy, all slices)
+  from its ship gates; the equivalent probe was not run on the GGUF here
+  (step 4 remains open).
+- Step 3 (teacher-forced agreement vs a common Q8 reference) was skipped:
+  the 748 GB Q8 teacher does not fit a single 512 GB box, and re-staging
+  the 2-box pipeline for one metric wasn't warranted.
+
 ## Status
 
-- [ ] Protocol run pending (needs the llama.cpp/pulsar box + an M3 Ultra).
-- Paper comparison above compiled 2026-07-14; ds4 q2 composition per the
-  DwarfStar docs (IQ-class up/gate + Q2_K down; dense/control Q8) — verify
-  against the actual GGUF header before publishing numbers.
+- [x] PPL protocol run 2026-07-15 (steps 1, 2, 5): matched-window PPL —
+  EN/ZH statistical ties, E1r −4.1% on code; table above.
+- [ ] Step 4 (degeneration probe on the GGUF side) open.
+- [ ] Step 3 (common-teacher forced agreement) skipped — needs a >512 GB
+  host or the 2-box pipeline.
+- Paper comparison compiled 2026-07-14; ds4 q2 composition per the
+  DwarfStar docs (IQ-class up/gate + Q2_K down; dense/control Q8).

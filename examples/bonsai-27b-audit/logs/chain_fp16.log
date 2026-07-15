@@ -1,0 +1,26 @@
+[chain] qwen download done Wed Jul 15 09:53:41 KST 2026
+[chain] mem gate passed (386.395 GiB free+inactive)
+mx.metal.device_info is deprecated and will be removed in a future version. Use mx.device_info instead.
+[wire] wired limit set to 498.2 GB
+[mem ] load 53.8GB / peak 53.8GB
+[eval][EXPERIMENTAL] --loop-probe: greedy degeneration probe (256 tokens from a 64-token prompt per slice). Omit the flag (or pin branch backup/v0.1-pre-router-kd) for the previous KL/flip-only behavior.
+[loop]   EN: distinct4=0.632  cycle=none
+[loop] code: distinct4=0.941  cycle=none
+[loop]   ZH: distinct4=0.996  cycle=none
+[eval][EXPERIMENTAL] --kv-probe 4: self-KL vs own FP16-KV baseline (per slice). Omit the flag for v0.1 behavior.
+[kv  ] 48/64 layer caches have no quantized form — left at full precision (probe is a lower bound)
+[kv  ]   EN: selfKL=0.04581  flip=0.0254
+[kv  ] code: selfKL=0.41475  flip=0.0693
+[kv  ]   ZH: selfKL=0.02612  flip=0.0596
+[kv  ] all : selfKL=0.16223  flip=0.0514  (kv 4-bit gs64)
+[save-ref] /Users/gesicht/bonsai_audit/ref_fp16_qwen36.npz  T=3072 V=248320
+[chain] fp16 ref eval done Wed Jul 15 09:55:24 KST 2026
+mx.metal.device_info is deprecated and will be removed in a future version. Use mx.device_info instead.
+[wire] wired limit set to 498.2 GB
+[mem ] load 7.6GB / peak 7.6GB
+[KLD ]   EN: KL=0.58024  flip=0.2100
+[KLD ] code: KL=1.32447  flip=0.2275
+[KLD ]   ZH: KL=1.32495  flip=0.4561
+[KLD ] /Users/gesicht/bonsai_audit/Ternary-Bonsai-27B-mlx-2bit
+       KL(ref||cand)=1.07656±0.04014  top1_flip=0.2979  T=3072
+[chain] CHAIN_COMPLETE Wed Jul 15 09:55:36 KST 2026
