@@ -106,7 +106,11 @@ def scan(model_dir, chunk_elems=1 << 27, per_expert=False):
             per_row *= int(d)
         step = max(1, int(chunk_elems // max(per_row * (32 // bits), 1)))
 
-        hist = mx.zeros((nlev,), dtype=mx.float32)
+        # int64 accumulation on the host: a float32 GPU histogram silently
+        # saturates at 2^24 per bin (increments beyond 16,777,216 are lost),
+        # which clamped every >~50M-param tensor to a fake uniform histogram
+        # on the first real-model run (Bonsai 27B, 2026-07-15)
+        hist = np.zeros(nlev, dtype=np.int64)
         lo_groups = tot_groups = 0.0
         want_pe = per_expert and len(wq.shape) == 3 and bits <= 4
         pe_chunks = []
@@ -121,7 +125,10 @@ def scan(model_dir, chunk_elems=1 << 27, per_expert=False):
             s = mx.where(mx.abs(s) < 1e-30, mx.ones_like(s), s)
             q = mx.clip(mx.round((dq.reshape(*head, G, gs) - b) / s), 0, nlev - 1)
             flat = q.reshape(-1).astype(mx.uint32)
-            hist = hist.at[flat].add(mx.ones(flat.shape, dtype=mx.float32))
+            ch = mx.zeros((nlev,), dtype=mx.int32)
+            ch = ch.at[flat].add(mx.ones(flat.shape, dtype=mx.int32))
+            mx.eval(ch)
+            hist += np.array(ch, copy=True).astype(np.int64)
             # per-group entropy (cheap at low bits, where it matters)
             if bits <= 4:
                 gh = mx.stack([(q == k).sum(axis=-1) for k in range(nlev)], axis=-1)
@@ -134,9 +141,8 @@ def scan(model_dir, chunk_elems=1 << 27, per_expert=False):
                                for k in range(nlev)], axis=-1)
                 mx.eval(pe)
                 pe_chunks.append(np.array(pe, copy=True).astype(np.int64))
-            mx.eval(hist)
         hv = np.zeros(MAX_LEVELS, dtype=np.int64)
-        hv[:nlev] = np.array(hist, copy=True).astype(np.int64)
+        hv[:nlev] = hist
         names.append(base)
         bits_l.append(bits)
         gs_l.append(gs)
