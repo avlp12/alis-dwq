@@ -1,0 +1,85 @@
+[entropy] saved /Users/gesicht/bonsai_audit/bonsai_entropy.npz
+[entropy] 498 tensors; code payload: nominal 2.00 b/w, effective 1.58 b/w (79% utilized)
+[entropy] 498 tensors had shape-ambiguous bits/gs (config.json used/fallback) — treat their rows with care
+[entropy] extras: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 34.9%
+[entropy]     L0: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.7%
+[entropy]     L1: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.4%
+[entropy]     L2: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.4%
+[entropy]     L3: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.4%
+[entropy]     L4: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.3%
+[entropy]     L5: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.3%
+[entropy]     L6: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.3%
+[entropy]     L7: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.3%
+[entropy]     L8: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.3%
+[entropy]     L9: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.3%
+[entropy]    L10: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.4%
+[entropy]    L11: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.4%
+[entropy]    L12: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.4%
+[entropy]    L13: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.4%
+[entropy]    L14: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.4%
+[entropy]    L15: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.4%
+[entropy]    L16: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.4%
+[entropy]    L17: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.3%
+[entropy]    L18: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.3%
+[entropy]    L19: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.2%
+[entropy]    L20: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.2%
+[entropy]    L21: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.2%
+[entropy]    L22: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.1%
+[entropy]    L23: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.2%
+[entropy]    L24: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.1%
+[entropy]    L25: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.1%
+[entropy]    L26: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.0%
+[entropy]    L27: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.0%
+[entropy]    L28: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.0%
+[entropy]    L29: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.0%
+[entropy]    L30: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.0%
+[entropy]    L31: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.1%
+[entropy]    L32: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.0%
+[entropy]    L33: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.0%
+[entropy]    L34: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.0%
+[entropy]    L35: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.1%
+[entropy]    L36: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.1%
+[entropy]    L37: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.1%
+[entropy]    L38: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.1%
+[entropy]    L39: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.2%
+[entropy]    L40: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.1%
+[entropy]    L41: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.1%
+[entropy]    L42: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.0%
+[entropy]    L43: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.1%
+[entropy]    L44: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.0%
+[entropy]    L45: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.1%
+[entropy]    L46: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.1%
+[entropy]    L47: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.2%
+[entropy]    L48: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.2%
+[entropy]    L49: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.2%
+[entropy]    L50: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.3%
+[entropy]    L51: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.4%
+[entropy]    L52: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.3%
+[entropy]    L53: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.3%
+[entropy]    L54: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.3%
+[entropy]    L55: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.3%
+[entropy]    L56: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.3%
+[entropy]    L57: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.3%
+[entropy]    L58: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.3%
+[entropy]    L59: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.3%
+[entropy]    L60: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.2%
+[entropy]    L61: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.1%
+[entropy]    L62: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.2%
+[entropy]    L63: eff 1.58/2.00 b/w  low-H groups  0.0%  anchor mass 35.1%
+[entropy] 15 lowest-utilization tensors (clip_quantize / bit-reallocation candidates first):
+[entropy]    77.5%  2b/gs128  H=1.55  anchors=38.2%  language_model.model.layers.0.linear_attn.in_proj_a
+[entropy]    78.1%  2b/gs128  H=1.56  anchors=37.5%  language_model.model.layers.52.linear_attn.in_proj_a
+[entropy]    78.2%  2b/gs128  H=1.56  anchors=37.7%  language_model.model.layers.48.linear_attn.in_proj_a
+[entropy]    78.2%  2b/gs128  H=1.56  anchors=37.4%  language_model.model.layers.50.linear_attn.in_proj_a
+[entropy]    78.2%  2b/gs128  H=1.56  anchors=37.3%  language_model.model.layers.42.linear_attn.in_proj_a
+[entropy]    78.2%  2b/gs128  H=1.56  anchors=37.2%  language_model.model.layers.26.linear_attn.in_proj_a
+[entropy]    78.4%  2b/gs128  H=1.57  anchors=37.2%  language_model.model.layers.44.linear_attn.in_proj_a
+[entropy]    78.4%  2b/gs128  H=1.57  anchors=37.0%  language_model.model.layers.41.linear_attn.in_proj_a
+[entropy]    78.4%  2b/gs128  H=1.57  anchors=36.9%  language_model.model.layers.53.linear_attn.in_proj_a
+[entropy]    78.4%  2b/gs128  H=1.57  anchors=36.8%  language_model.model.layers.62.linear_attn.in_proj_b
+[entropy]    78.4%  2b/gs128  H=1.57  anchors=36.9%  language_model.model.layers.25.linear_attn.in_proj_a
+[entropy]    78.4%  2b/gs128  H=1.57  anchors=37.0%  language_model.model.layers.34.linear_attn.in_proj_a
+[entropy]    78.4%  2b/gs128  H=1.57  anchors=36.7%  language_model.model.layers.28.linear_attn.in_proj_a
+[entropy]    78.4%  2b/gs128  H=1.57  anchors=36.7%  language_model.model.layers.40.linear_attn.in_proj_a
+[entropy]    78.5%  2b/gs128  H=1.57  anchors=36.7%  language_model.model.layers.36.linear_attn.in_proj_a
+EXIT_OK

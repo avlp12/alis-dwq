@@ -1,0 +1,85 @@
+[forensics][EXPERIMENTAL] classifying the transformation from its endpoints — see examples/bonsai-27b-audit for interpretation
+[forensics] language_model.model.layers.0.mlp.down_proj
+[forensics]   projection agree= 84.2% @k=0.5  col-drift=+0.013  spectra=1.000  w-corr=0.848  scale-ratio=0.835±0.035  4th-level=0.00%
+[forensics] language_model.model.layers.0.mlp.gate_proj
+[forensics]   projection agree= 86.8% @k=0.5  col-drift=-0.004  spectra=1.000  w-corr=0.857  scale-ratio=0.834±0.035  4th-level=0.00%
+[forensics] language_model.model.layers.0.mlp.up_proj
+[forensics]   projection agree= 85.7% @k=0.5  col-drift=-0.003  spectra=0.997  w-corr=0.852  scale-ratio=0.841±0.036  4th-level=0.00%
+[forensics] language_model.model.layers.1.mlp.down_proj
+[forensics]   projection agree= 83.3% @k=0.5  col-drift=+0.010  spectra=0.998  w-corr=0.845  scale-ratio=0.836±0.034  4th-level=0.00%
+[forensics] language_model.model.layers.1.mlp.gate_proj
+[forensics]   projection agree= 87.4% @k=0.5  col-drift=-0.004  spectra=1.000  w-corr=0.861  scale-ratio=0.825±0.034  4th-level=0.00%
+[forensics] language_model.model.layers.1.mlp.up_proj
+[forensics]   projection agree= 86.1% @k=0.5  col-drift=-0.005  spectra=0.986  w-corr=0.856  scale-ratio=0.832±0.034  4th-level=0.00%
+[forensics] language_model.model.layers.10.mlp.down_proj
+[forensics]   projection agree= 83.8% @k=0.5  col-drift=+0.006  spectra=0.964  w-corr=0.850  scale-ratio=0.835±0.037  4th-level=0.00%
+[forensics] language_model.model.layers.10.mlp.gate_proj
+[forensics]   projection agree= 86.1% @k=0.5  col-drift=-0.005  spectra=1.000  w-corr=0.858  scale-ratio=0.826±0.032  4th-level=0.00%
+[forensics] language_model.model.layers.10.mlp.up_proj
+[forensics]   projection agree= 84.7% @k=0.5  col-drift=-0.006  spectra=nan  w-corr=nan  scale-ratio=0.833±0.033  4th-level=0.00%
+[forensics] language_model.model.layers.11.mlp.down_proj
+[forensics]   projection agree= 84.1% @k=0.5  col-drift=+0.005  spectra=nan  w-corr=nan  scale-ratio=0.833±0.037  4th-level=0.00%
+[forensics] language_model.model.layers.11.mlp.gate_proj
+[forensics]   projection agree= 86.9% @k=0.5  col-drift=-0.005  spectra=nan  w-corr=nan  scale-ratio=0.823±0.032  4th-level=0.00%
+[forensics] language_model.model.layers.11.mlp.up_proj
+[forensics]   projection agree= 85.5% @k=0.5  col-drift=-0.006  spectra=nan  w-corr=nan  scale-ratio=0.829±0.032  4th-level=0.00%
+[forensics] language_model.model.layers.12.mlp.down_proj
+[forensics]   projection agree= 84.5% @k=0.5  col-drift=+0.006  spectra=nan  w-corr=nan  scale-ratio=0.832±0.038  4th-level=0.00%
+[forensics] language_model.model.layers.12.mlp.gate_proj
+[forensics]   projection agree= 87.2% @k=0.5  col-drift=-0.005  spectra=nan  w-corr=nan  scale-ratio=0.822±0.032  4th-level=0.00%
+[forensics] language_model.model.layers.12.mlp.up_proj
+[forensics]   projection agree= 85.9% @k=0.5  col-drift=-0.006  spectra=nan  w-corr=nan  scale-ratio=0.828±0.032  4th-level=0.00%
+[forensics] language_model.model.layers.13.mlp.down_proj
+[forensics]   projection agree= 84.4% @k=0.5  col-drift=+0.008  spectra=nan  w-corr=nan  scale-ratio=0.834±0.039  4th-level=0.00%
+[forensics] language_model.model.layers.13.mlp.gate_proj
+[forensics]   projection agree= 87.3% @k=0.5  col-drift=-0.006  spectra=nan  w-corr=nan  scale-ratio=0.823±0.031  4th-level=0.00%
+[forensics] language_model.model.layers.13.mlp.up_proj
+[forensics]   projection agree= 85.9% @k=0.5  col-drift=-0.006  spectra=nan  w-corr=nan  scale-ratio=0.829±0.032  4th-level=0.00%
+[forensics] language_model.model.layers.14.mlp.down_proj
+[forensics]   projection agree= 84.5% @k=0.5  col-drift=+0.008  spectra=nan  w-corr=nan  scale-ratio=0.833±0.039  4th-level=0.00%
+[forensics] language_model.model.layers.14.mlp.gate_proj
+[forensics]   projection agree= 87.2% @k=0.5  col-drift=-0.006  spectra=nan  w-corr=nan  scale-ratio=0.823±0.032  4th-level=0.00%
+[forensics] language_model.model.layers.14.mlp.up_proj
+[forensics]   projection agree= 85.8% @k=0.5  col-drift=-0.006  spectra=nan  w-corr=nan  scale-ratio=0.829±0.032  4th-level=0.00%
+[forensics] language_model.model.layers.15.mlp.down_proj
+[forensics]   projection agree= 84.6% @k=0.5  col-drift=+0.005  spectra=nan  w-corr=nan  scale-ratio=0.832±0.040  4th-level=0.00%
+[forensics] language_model.model.layers.15.mlp.gate_proj
+[forensics]   projection agree= 87.0% @k=0.5  col-drift=-0.004  spectra=nan  w-corr=nan  scale-ratio=0.823±0.032  4th-level=0.00%
+[forensics] language_model.model.layers.15.mlp.up_proj
+[forensics]   projection agree= 85.9% @k=0.5  col-drift=-0.005  spectra=nan  w-corr=nan  scale-ratio=0.828±0.032  4th-level=0.00%
+[forensics] language_model.model.layers.16.mlp.down_proj
+[forensics]   projection agree= 84.2% @k=0.5  col-drift=+0.005  spectra=nan  w-corr=nan  scale-ratio=0.834±0.041  4th-level=0.00%
+[forensics] language_model.model.layers.16.mlp.gate_proj
+[forensics]   projection agree= 86.8% @k=0.5  col-drift=-0.005  spectra=nan  w-corr=nan  scale-ratio=0.824±0.032  4th-level=0.00%
+[forensics] language_model.model.layers.16.mlp.up_proj
+[forensics]   projection agree= 85.5% @k=0.5  col-drift=-0.005  spectra=nan  w-corr=nan  scale-ratio=0.830±0.032  4th-level=0.00%
+[forensics] language_model.model.layers.17.mlp.down_proj
+[forensics]   projection agree= 83.7% @k=0.5  col-drift=+0.003  spectra=nan  w-corr=nan  scale-ratio=0.835±0.044  4th-level=0.00%
+[forensics] language_model.model.layers.17.mlp.gate_proj
+[forensics]   projection agree= 86.6% @k=0.5  col-drift=-0.004  spectra=nan  w-corr=nan  scale-ratio=0.824±0.032  4th-level=0.00%
+[forensics] language_model.model.layers.17.mlp.up_proj
+[forensics]   projection agree= 85.2% @k=0.5  col-drift=-0.006  spectra=nan  w-corr=nan  scale-ratio=0.831±0.033  4th-level=0.00%
+[forensics] language_model.model.layers.18.mlp.down_proj
+[forensics]   projection agree= 82.6% @k=0.5  col-drift=+0.003  spectra=nan  w-corr=nan  scale-ratio=0.835±0.036  4th-level=0.00%
+[forensics] language_model.model.layers.18.mlp.gate_proj
+[forensics]   projection agree= 86.1% @k=0.5  col-drift=-0.004  spectra=nan  w-corr=nan  scale-ratio=0.825±0.036  4th-level=0.00%
+[forensics] language_model.model.layers.18.mlp.up_proj
+[forensics]   projection agree= 84.5% @k=0.5  col-drift=-0.005  spectra=nan  w-corr=nan  scale-ratio=0.832±0.036  4th-level=0.00%
+[forensics] language_model.model.layers.19.mlp.down_proj
+[forensics]   projection agree= 81.7% @k=0.5  col-drift=-0.000  spectra=nan  w-corr=nan  scale-ratio=0.839±0.042  4th-level=0.00%
+[forensics] language_model.model.layers.19.mlp.gate_proj
+[forensics]   projection agree= 86.0% @k=0.5  col-drift=-0.005  spectra=nan  w-corr=nan  scale-ratio=0.824±0.033  4th-level=0.00%
+[forensics] language_model.model.layers.19.mlp.up_proj
+[forensics]   projection agree= 83.9% @k=0.5  col-drift=-0.006  spectra=nan  w-corr=nan  scale-ratio=0.833±0.033  4th-level=0.00%
+[forensics] language_model.model.layers.2.mlp.down_proj
+[forensics]   projection agree= 81.4% @k=0.5  col-drift=+0.008  spectra=nan  w-corr=nan  scale-ratio=0.843±0.037  4th-level=0.00%
+[forensics] language_model.model.layers.2.mlp.gate_proj
+[forensics]   projection agree= 85.7% @k=0.5  col-drift=-0.006  spectra=nan  w-corr=nan  scale-ratio=0.830±0.033  4th-level=0.00%
+[forensics] language_model.model.layers.2.mlp.up_proj
+[forensics]   projection agree= 84.1% @k=0.5  col-drift=-0.005  spectra=nan  w-corr=nan  scale-ratio=0.838±0.034  4th-level=0.00%
+[forensics] language_model.model.layers.20.mlp.down_proj
+[forensics]   projection agree= 81.1% @k=0.5  col-drift=+0.003  spectra=nan  w-corr=nan  scale-ratio=0.841±0.045  4th-level=0.00%
+[forensics] aggregate: agree=85.1%  drift=-0.001  spectra=0.993  w-corr=0.853
+[forensics] VERDICT: weights moved position-independently (training/distillation)
+[forensics] (verdict is a heuristic over these fingerprints — read the per-tensor rows before quoting it)
+EXIT_OK

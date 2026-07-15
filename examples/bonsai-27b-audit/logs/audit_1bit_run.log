@@ -1,0 +1,22 @@
+skip language_model.model.layers.30.self_attn.q_proj: 'language_model.model.layers.30.self_attn.q_proj.weight'
+language_model.model.layers.0.mlp.gate_proj
+  ones=49.89%  group-entropy=0.9944/1.0  level-symmetry |l0+l1|/|l1-l0| med=0.0000
+  agree(nearest-level)=90.43%  agree(sign)=90.43%  scale-ratio med=1.0159 (0.809..1.223)
+language_model.model.layers.0.mlp.down_proj
+  ones=49.85%  group-entropy=0.9943/1.0  level-symmetry |l0+l1|/|l1-l0| med=0.0000
+  agree(nearest-level)=89.00%  agree(sign)=89.00%  scale-ratio med=1.0134 (0.807..1.221)
+language_model.model.layers.20.mlp.up_proj
+  ones=49.84%  group-entropy=0.9943/1.0  level-symmetry |l0+l1|/|l1-l0| med=0.0000
+  agree(nearest-level)=88.59%  agree(sign)=88.59%  scale-ratio med=0.9994 (0.814..1.185)
+language_model.model.layers.40.mlp.gate_proj
+  ones=49.99%  group-entropy=0.9944/1.0  level-symmetry |l0+l1|/|l1-l0| med=0.0000
+  agree(nearest-level)=89.14%  agree(sign)=89.14%  scale-ratio med=0.9943 (0.818..1.168)
+language_model.model.layers.60.mlp.down_proj
+  ones=49.94%  group-entropy=0.9944/1.0  level-symmetry |l0+l1|/|l1-l0| med=0.0000
+  agree(nearest-level)=89.22%  agree(sign)=89.22%  scale-ratio med=1.0202 (0.848..1.195)
+language_model.model.layers.30.linear_attn.in_proj_a
+  ones=49.48%  group-entropy=0.9938/1.0  level-symmetry |l0+l1|/|l1-l0| med=0.0000
+  agree(nearest-level)=83.62%  agree(sign)=83.62%  scale-ratio med=1.0124 (0.874..1.147)
+
+aggregate: agree(nearest)=88.33%  code-entropy=0.9943/1.0
+AUDIT_1BIT_DONE

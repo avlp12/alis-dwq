@@ -1,0 +1,15 @@
+mx.metal.device_info is deprecated and will be removed in a future version. Use mx.device_info instead.
+[wire] wired limit set to 498.2 GB
+[mem ] load 7.6GB / peak 7.6GB
+[eval][EXPERIMENTAL] --loop-probe: greedy degeneration probe (256 tokens from a 64-token prompt per slice). Omit the flag (or pin branch backup/v0.1-pre-router-kd) for the previous KL/flip-only behavior.
+[loop]   EN: distinct4=0.134  cycle=len13 LOOPED
+[loop] code: distinct4=0.411  cycle=len2 LOOPED
+[loop]   ZH: distinct4=0.079  cycle=len18 LOOPED
+[eval][EXPERIMENTAL] --kv-probe 4: self-KL vs own FP16-KV baseline (per slice). Omit the flag for v0.1 behavior.
+[kv  ] 48/64 layer caches have no quantized form — left at full precision (probe is a lower bound)
+[kv  ]   EN: selfKL=0.00304  flip=0.0273
+[kv  ] code: selfKL=0.00287  flip=0.0088
+[kv  ]   ZH: selfKL=0.00277  flip=0.0283
+[kv  ] all : selfKL=0.00289  flip=0.0215  (kv 4-bit gs64)
+[save-ref] /Users/gesicht/bonsai_audit/bonsai_self_lp.npz  T=3072 V=248320
+EXIT_OK
