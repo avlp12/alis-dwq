@@ -173,6 +173,44 @@ peaked outputs are cheap to reproduce under cache noise — tolerance and
 degeneration may share a cause. The Tier 2 activation-kurtosis capture
 (test 6) is the discriminator.
 
+## Tier 2 results (measured 2026-07-15): the OBS prior is REFUTED — it's training
+
+`weight_forensics` against the bf16 original (`mlx_lm convert` of
+Qwen/Qwen3.6-27B — sanitize aligns naming and drops the vision tower),
+40 MLP tensors + 36 attention tensors:
+
+| fingerprint | MLP (40) | attention (36) | reading |
+|---|---|---|---|
+| projection agree | 85.1% @k=0.5 | 88.3% | not rounding (>98%), not rotation (<60%) |
+| column drift | **−0.001** | **−0.003** | **flat — no OBS/GPTQ column-compensation signature** |
+| spectra corr / w-corr | 0.993 / 0.853 | 0.985 / 0.787 | basis not rotated |
+| scale ratio vs closed form | **0.835 ± 0.035** | 0.78–1.01 | scales systematically ~17% below MSE-optimal ⇒ **trained** |
+| 4th-level usage | 0.00% | 0.00% | ternary, again |
+
+**VERDICT (both sweeps): "weights moved position-independently
+(training/distillation)".** The Hassibi/OBS lineage suggested curvature
+compensation; the fingerprints say otherwise — no positional error-absorption
+structure anywhere, weights moved ~15% of codes away from any threshold
+projection of the original, and the shipped group scales sit consistently
+*below* the analytic optimum (a distillation-pressure signature, not a
+closed form). Supporting detail: `linear_attn.in_proj_a` — the tensor family
+with the anomalous zero-fraction spread in Tier 1 — has the *lowest*
+projection agreement (76.3%), i.e. it was trained hardest. The method class
+is **QAT/distillation-style conversion** (BitNet-Distillation family), not
+OBS/GPTQ-style PTQ. What stays unrecoverable from endpoints: schedule, data,
+and the exact objective.
+
+Two practical corollaries for this repo:
+
+1. The open-reproduction path (ternary projection + layerwise distillation
+   with straight-through re-projection, §"If the fingerprints confirm")
+   targets exactly the *measured* method class — it just needs more than the
+   "short distillation" the OBS prior assumed (they moved ~15% of codes).
+2. Their loop-prone-but-KV-tolerant profile now reads as a *training*
+   outcome, not a rounding artifact — distillation on finite data at 1.71
+   bpw bought benchmark retention and cache robustness at the price of
+   long-horizon behavior our loop probe caught in one minute.
+
 ## Status
 
 - [x] Toolchain validated on **real mlx** (0.32 Linux CPU backend,
@@ -184,6 +222,9 @@ degeneration may share a cause. The Tier 2 activation-kurtosis capture
 - [x] Tier 1 on the actual Bonsai pack (2026-07-15, above): ternary label
   verified; KL/flip vs FP16 measured; loop-probe LOOPED ×3 vs clean FP16
   control; KV-tolerance reproduced at 56×.
-- [ ] Tier 2 pending (both weight sets on disk, ~70 GB total).
+- [x] Tier 2 run (2026-07-15, above): **OBS/GPTQ prior refuted** — flat
+  column drift, unrotated basis, trained scales ⇒ QAT/distillation-class
+  conversion. Reproduction decision escalated to the owner (it targets the
+  measured class, but is a training campaign, not a weekend).
 - Compiled 2026-07-14 from the whitepaper, Bonsai-demo repo, and public
-  reporting; the OBS-lineage prior is a hypothesis to test, not a finding.
+  reporting; the OBS-lineage prior was tested and rejected on 2026-07-15.
