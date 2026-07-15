@@ -1,0 +1,5 @@
+[kurt] bonsai: 64 layers  median=94.57  p90=2151.48  max=4096.39
+[kurt] fp16: 64 layers  median=2372.04  p90=4685.34  max=6949.22
+[kurt] per-layer kurtosis ratio bonsai/fp16: median=0.049  layers-flatter=64/64
+[kurt] reading: ratio << 1 across layers = flattened activations (noise-injection-training signature); ~1 = geometry preserved (compensated-PTQ-compatible)
+KURT_DONE

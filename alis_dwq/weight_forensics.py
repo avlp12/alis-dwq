@@ -176,8 +176,92 @@ def iter_pairs(original, transformed, pattern, max_tensors):
             return
 
 
+# ------------------------------------------------------------- selftest
+
+def _gptq_ternary(w, H, order):
+    """Minimal GPTQ-style ternary quantizer (numpy): quantize columns in
+    `order`, absorb each column's rounding error into the remaining columns
+    through the inverse-Hessian row (Frantar et al.), levels {-s, 0, +s}
+    with per-row absmean scale."""
+    w = w.copy()
+    d = w.shape[1]
+    Hinv = np.linalg.inv(H + 1e-3 * np.eye(d))
+    s = np.abs(w).mean(axis=1, keepdims=True)
+    thr = 0.5 * s
+    q = np.zeros_like(w)
+    for idx, j in enumerate(order):
+        col = w[:, j]
+        qc = np.sign(col) * (np.abs(col) > thr[:, 0]) * s[:, 0]
+        q[:, j] = qc
+        err = (col - qc) / Hinv[j, j]
+        rest = order[idx + 1:]
+        if len(rest):
+            w[:, rest] -= np.outer(err, Hinv[j, rest])
+    return np.sign(q)  # ternary codes in {-1, 0, +1}
+
+
+def _selftest():
+    """Method-class discrimination on synthetic ground truth, including the
+    act-order blind spot the 2026-07-15 3-lens review demonstrated: the
+    drift test detects storage-ordered GPTQ compensation but reads
+    act-order (Hessian-permuted) GPTQ as flat — i.e. as the
+    training/compensation-ambiguous class. This is a documented limit, not
+    a bug; the selftest pins it so a future 'refuted' overclaim fails loud."""
+    rng = np.random.default_rng(11)
+    R, D = 256, 512
+    w = rng.normal(size=(R, D)).astype(np.float64)
+    X = rng.normal(size=(2048, D))
+    # per-column energy skew at RANDOM positions: act-order's Hessian sort
+    # is then decorrelated from storage order — the condition under which
+    # the head-vs-tail drift test goes blind. (If a model's high-energy
+    # channels were contiguous in storage, act-order would remain partially
+    # detectable; the blind spot is order-decorrelation, not act-order per se.)
+    X *= rng.uniform(0.5, 3.0, size=D)
+    H = X.T @ X / len(X)
+
+    # 1. direct analytic projection: near-total agreement, flat drift
+    t_proj = twn_project(w, 0.5)
+    agree, k = projection_sweep(w, t_proj)
+    _, drift = column_drift(w, t_proj, k)
+    assert agree > 0.98 and abs(drift) < 0.01, (agree, drift)
+    v1 = verdict(agree, drift, 1.0, 1.0)
+    assert v1.startswith("direct analytic"), v1
+
+    # 2. storage-order GPTQ: compensation drift is DETECTED
+    t_sto = _gptq_ternary(w, H, np.arange(D))
+    agree_s, k_s = projection_sweep(w, t_sto)
+    _, drift_s = column_drift(w, t_sto, k_s)
+    assert drift_s < -0.015, f"storage-order drift not detected: {drift_s:.3f}"
+    v2 = verdict(agree_s, drift_s, 1.0, 1.0)
+    assert "storage-ordered" in v2, v2
+
+    # 3. act-order GPTQ: same compensation, permuted processing order ->
+    #    drift reads FLAT (the blind spot). Verdict falls into the ambiguous
+    #    position-independent class by design.
+    order = np.argsort(-np.diag(H))
+    t_act = _gptq_ternary(w, H, order)
+    agree_a, k_a = projection_sweep(w, t_act)
+    _, drift_a = column_drift(w, t_act, k_a)
+    assert drift_a > -0.015, f"act-order unexpectedly detected: {drift_a:.3f}"
+    assert agree_a < 0.98
+    v3 = verdict(agree_a, drift_a, 1.0, 1.0)
+    assert "cannot separate" in v3, v3
+
+    print(f"[forensics] selftest OK — projection {agree*100:.1f}%/{drift:+.3f} "
+          f"| storage-order GPTQ {agree_s*100:.1f}%/{drift_s:+.3f} (detected) "
+          f"| act-order GPTQ {agree_a*100:.1f}%/{drift_a:+.3f} (flat: the "
+          "documented blind spot)")
+
+
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--selftest", action="store_true",
+                    help="method-class discrimination on synthetic ground "
+                         "truth incl. the act-order blind spot (numpy-only)")
+    args_pre, _ = ap.parse_known_args()
+    if args_pre.selftest:
+        _selftest()
+        return
     ap.add_argument("--original", required=True)
     ap.add_argument("--transformed", required=True)
     ap.add_argument("--pattern", default="", help="regex filter on tensor names")

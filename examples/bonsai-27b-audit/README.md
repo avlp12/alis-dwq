@@ -235,12 +235,40 @@ independent reviewers demolished the inference:
 either **QAT/distillation-style conversion** (BitNet-Distillation family)
 or **order-permuted / Hessian-weighted compensated PTQ** (act-order GPTQ
 class, which the Hassibi/OBS lineage makes the natural in-house method) —
-the endpoints alone cannot separate the two. Provenance mildly favors the
-compensation family; the moved-code volume (~15%) is reachable by either.
-The discriminating measurements, both unrun: the activation-kurtosis
-capture (test 6 — flattened activations would indicate noise-injection
-training), and an act-order-GPTQ synthetic added to `weight_forensics`'
-validation set (drift measured in processing order, phase-folded per group).
+the endpoints' *weights* alone cannot separate the two. Provenance mildly
+favors the compensation family; the moved-code volume (~15%) is reachable
+by either.
+
+**Test 6 ran (2026-07-15, later the same day) and the discriminator moved
+— toward training.** Per-layer excess kurtosis of each decoder block's
+output on a fixed 768-token EN/code/ZH batch (`kurtosis_probe.py`, logs
+published):
+
+| | median | p90 | verdict input |
+|---|---|---|---|
+| FP16 Qwen3.6-27B | 2372 | 4685 | heavy-tailed, as expected |
+| zero-training PTQ control (clip arm, FFN 2-bit) | **2353** | 4355 | **low-bit weights alone do NOT flatten** |
+| Bonsai ternary | **94.6** | 2151 | **~25× flatter, all 64/64 layers** |
+
+The control is the load-bearing row: naive/clip PTQ at comparable FFN
+bit-width leaves the activation geometry essentially at FP16 levels, so the
+flattening is a property of Bonsai's *conversion*, not of ternary weights.
+Compensated PTQ's objective is to *preserve* layer outputs — a systematic
+25× kurtosis collapse across every layer is the opposite of that objective,
+and is exactly the predicted signature of noise-injection/QAT-style
+training. It also supplies the mechanism for the KV-tolerance result
+(flat activations → cache-quantization noise proportionally benign) and is
+consistent with the sharpened-output/greedy-loop behavior. Weights-only
+verdict stays bounded as stated; **with the activation evidence, the
+balance of evidence now favors the QAT/distillation branch.**
+
+The second discriminator also ships: `weight_forensics --selftest` now
+includes an act-order GPTQ synthetic — storage-order compensation is
+detected (drift −0.163) while act-order reads flat (−0.008), pinning the
+blind spot in code. Nuance the synthetic exposed: the blindness requires
+the Hessian processing order to be *decorrelated from storage order*; a
+model whose high-energy channels are contiguous would leave act-order
+partially detectable.
 
 Corollary for this repo either way: the open-reproduction path (ternary
 projection + layerwise distillation with straight-through re-projection)
@@ -324,6 +352,7 @@ as recipe-vs-recipe, not a scoreboard. Three honest observations:
   verified; KL/flip vs FP16 measured; loop-probe LOOPED ×3 vs clean FP16
   control (greedy-only, no temperature-matched control yet); KV-tolerance
   reproduced, per-slice 9–145×.
+- [x] Discriminators run (2026-07-15 pm): activation-kurtosis capture — Bonsai ~25× flatter than FP16 while a zero-training PTQ control matches FP16 ⇒ evidence favors the QAT/distillation branch; act-order synthetic added to `weight_forensics --selftest`.
 - [x] Tier 2 run (2026-07-15, above; wording hardened by a 3-lens review
   that broke the first "training, period" reading): direct rounding and
   rotation excluded; **training vs act-order-compensated PTQ not separable
