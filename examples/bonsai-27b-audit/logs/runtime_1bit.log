@@ -1,0 +1,51 @@
+=== sanity: fork kernels present ===
+mlx 0.31.2.dev20260715+10b5fe4
+1bit kernels OK
+=== smoke: generate ===
+GEN: Paris.
+
+<think>
+Here's a thinking process:
+
+1.  **Analyze User Input:**
+   - Statement
+=== KL vs FP16 ref + greedy loop probe + kv-probe ===
+mx.metal.device_info is deprecated and will be removed in a future version. Use mx.device_info instead.
+[wire] wired limit set to 498.2 GB
+[mem ] load 4.2GB / peak 4.2GB
+[eval][EXPERIMENTAL] --loop-probe: degeneration probe, greedy (256 tokens from a 64-token prompt per slice). Omit the flag (or pin branch backup/v0.1-pre-router-kd) for the previous KL/flip-only behavior.
+[loop]     EN: distinct4=0.146  cycle=len28 LOOPED
+[loop]   code: distinct4=0.103  cycle=none
+[loop]     ZH: distinct4=0.972  cycle=none
+[eval][EXPERIMENTAL] --kv-probe 4: self-KL vs own FP16-KV baseline (per slice). Omit the flag for v0.1 behavior.
+[kv  ] 48/64 layer caches have no quantized form — left at full precision (probe is a lower bound)
+[kv  ]   EN: selfKL=0.00211  flip=0.0186
+[kv  ] code: selfKL=0.00168  flip=0.0146
+[kv  ]   ZH: selfKL=0.00214  flip=0.0322
+[kv  ] all : selfKL=0.00198  flip=0.0218  (kv 4-bit gs64)
+[KLD ]   EN: KL=0.75827  flip=0.2490
+[KLD ] code: KL=1.63575  flip=0.2490
+[KLD ]   ZH: KL=1.65773  flip=0.5088
+[KLD ] /Users/gesicht/bonsai_audit/Bonsai-27B-mlx-1bit
+       KL(ref||cand)=1.35058±0.04820  top1_flip=0.3356  T=3072
+=== temperature-matched loop probe ===
+[loop]   EN#0: distinct4=0.731  cycle=none
+[loop]   EN#1: distinct4=0.486  cycle=none
+[loop]   EN#2: distinct4=0.257  cycle=len21 LOOPED
+[loop]   EN#3: distinct4=0.668  cycle=none
+[loop]   EN#4: distinct4=0.885  cycle=none
+[loop] code#0: distinct4=0.648  cycle=none
+[loop] code#1: distinct4=0.877  cycle=none
+[loop] code#2: distinct4=0.941  cycle=none
+[loop] code#3: distinct4=0.715  cycle=none
+[loop] code#4: distinct4=0.909  cycle=none
+[loop]   ZH#0: distinct4=0.972  cycle=none
+[loop]   ZH#1: distinct4=0.957  cycle=none
+[loop]   ZH#2: distinct4=0.984  cycle=none
+[loop]   ZH#3: distinct4=0.980  cycle=none
+[loop]   ZH#4: distinct4=0.850  cycle=none
+=== 512-window PPL (triangle row) ===
+[ppl-w512] /Users/gesicht/alis-dwq/data/wikitext.txt: ppl=12.1892  (56 windows, 14280 scored tokens)
+[ppl-w512] /Users/gesicht/alis-dwq/data/code.txt: ppl=3.1449  (50 windows, 12750 scored tokens)
+[ppl-w512] /Users/gesicht/alis-dwq/data/zh.txt: ppl=41.8057  (55 windows, 14025 scored tokens)
+RUNTIME_1BIT_DONE

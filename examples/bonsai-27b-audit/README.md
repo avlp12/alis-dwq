@@ -305,9 +305,40 @@ depth and module types:
   moving optimization" picture, and one more reason the training-vs-
   compensated-PTQ split can't be settled from endpoints.
 
-Runtime behavior (KL, loops, KV) of the 1-bit pack is **not measured** —
-it needs PrismML's fork built locally, which is queued behind an explicit
-approval gate (third-party fork build/run).
+**Runtime battery (measured 2026-07-15 pm, owner-approved fork build).**
+PrismML's MLX fork (`prism` branch, `10b5fe4`) built into an isolated venv
+— build notes for reproducers: cmake grabs the newest system Python unless
+`-DPython_EXECUTABLE` pins the venv's (a cpython-314 .so in a 3.13 venv
+imports as an *empty namespace package*, no error); `--no-build-isolation`
+is needed for the wheel to carry `libmlx.dylib`; and mlx-lm 0.31.3 needs a
+one-line `sitecustomize` shim (`new_thread_local_stream = new_stream` —
+equivalent single-threaded) since the fork's base predates that API. Full
+log: `logs/runtime_1bit.log`. Same tools as the ternary battery otherwise.
+
+| | 1-bit (1.25 bpw stored) | ternary (1.58 eff bpw) | FP16 |
+|---|---|---|---|
+| KL vs FP16 / flip (overall) | 1.351 / 33.6% | 1.077 / 29.8% | — |
+| ZH flip | **50.9%** | 45.6% | — |
+| 512-window PPL wikitext / code / ZH | 12.19 / 3.14 / **41.81** | 11.31 / 2.82 / 26.85 | 6.34 / 2.22 / 8.78 |
+| greedy loop probe | EN LOOPED (len-28); code distinct4 0.103 (no strict cycle); ZH clean | LOOPED ×3 | clean ×3 |
+| temperature-matched probe (×5/slice) | **14/15 — EN sample cycles at serving temp** | 15/15 clean | 15/15 clean |
+| KV selfKL (4-bit, overall) | **0.00198 (82× vs FP16)** | 0.00289 (56×) | 0.1622 |
+
+Three readings:
+
+1. **The non-EN collapse deepens with the bit cut**: ZH lands at 4.76× FP16
+   PPL with a *majority* of tokens flipped — while wikitext holds a
+   surprising 1.92× and code (1.42×) still beats our zero-training naive
+   PTQ at 4× the bytes. The conversion's EN/code-facing competence and its
+   non-EN cost both scale with aggressiveness.
+2. **Degeneration starts breaching the temperature defense**: the ternary
+   pack was cycle-free at serving temperature; the 1-bit pack looped in 1
+   of 15 sampled continuations (EN, period 21). The greedy-only qualifier
+   that protected the ternary pack is thinner here.
+3. **KV immunity strengthens as bits drop** (56× → 82×), completing a
+   two-point capacity trend consistent with the kurtosis mechanism: the
+   more aggressive the conversion, the flatter the activations — buying
+   cache robustness and paying in output sharpness/degeneration.
 
 ## Same-harness quality triangle (2026-07-15): trained ternary vs zero-training PTQ vs FP16
 
