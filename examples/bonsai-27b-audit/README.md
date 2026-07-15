@@ -154,6 +154,20 @@ FP16 control on the same probe is what isolates the quantization as the
 cause. Their published 80.49/15-benchmark average was sampled at their
 serving temperature through chat templates — both can be true.
 
+**Temperature-matched control (run 2026-07-15, after the above): the hard
+cycles are greedy-specific.** At the model's own serving distribution
+(generation_config: T=1.0, top-k 20, top-p 0.95; 5 seeded samples per
+slice, `--loop-temp`): **Bonsai 15/15 cycle-free** — the anticipated
+"it doesn't loop at serving temperature" rebuttal is *confirmed*, and the
+greedy result must be quoted with that qualifier. What persists at
+temperature is a heavier low-diversity tail: Bonsai's worst samples fall to
+distinct-4gram 0.265 (EN) and 0.589 (code) while the FP16 control's worst
+is 0.660 (means 0.839 vs 0.875, n=15 each) — consistent with sharpened
+output distributions, short of degeneration. Practical reading: greedy or
+near-greedy decoding regimes (the default for math/code evaluation
+harnesses, constrained decoding, some agent stacks) are where this build
+degenerates; sampled chat is substantially safer.
+
 **KV-tolerance: reproduced, 56×.** Self-KL of a 4-bit/gs64 KV cache vs each
 model's own FP16-KV run (16 of 64 layer caches quantizable on this hybrid —
 linear-attention states stay FP16, so both rows are lower bounds):
@@ -234,6 +248,38 @@ targets a method class consistent with the endpoints, but it is a research
 campaign, and the loop-prone-but-KV-tolerant profile shows the conversion
 cost long-horizon behavior that short-form metrics — including the ones
 Tier 1 ran — do not price in.
+
+## The 1-bit companion pack (format audit, 2026-07-15)
+
+`prism-ml/Bonsai-27B-mlx-1bit` (4.1 GB, config `bits: 1, group_size: 128`)
+**does not run on stock mlx** — 0.31.2 has no 1-bit kernels (`quantize`
+raises; `dequantize` fails kernel lookup), so unlike the ternary pack this
+one is usable only on PrismML's MLX fork. The *format* still audits without
+their runtime: manual LSB-first unpack (bit order cross-validated 100%
+against `mx.dequantize` codes on the 2-bit pack), 6 tensors sampled across
+depth and module types:
+
+- **True symmetric binary.** Per-group levels are exactly {−s, +s}
+  (|l0+l1|/|l1−l0| median 0.0000); code balance 49.9% ones; per-group code
+  entropy 0.994/1.0 — the same at-the-information-ceiling signature as the
+  ternary pack. Effective storage (128·1+32)/128 = **1.25 bpw** (4.1 GB /
+  26.9 B checks out).
+- **Same "moved weights" class as the ternary pack.** Codes agree with
+  sign(original) at only **88.3%** — ~11% of signs moved (ternary: ~15% of
+  codes). Nearest-level and sign agreement coincide (symmetric levels), and
+  the projection shortfall is again largest on `linear_attn.in_proj_a`
+  (83.6%), the same tensor family the ternary pack trained hardest.
+- **Scales sit at the analytic optimum: ratio 1.01** vs the per-group
+  MSE-optimal binary half-spread (mean|w − mean(w)|). For 2 levels the
+  absmean rule *is* the MSE optimum — so the 1-bit pack's scales are
+  consistent with pure analytic absmean, while its codes are not pure sign
+  rounding. One more point for the "absmean-family projection + weight-
+  moving optimization" picture, and one more reason the training-vs-
+  compensated-PTQ split can't be settled from endpoints.
+
+Runtime behavior (KL, loops, KV) of the 1-bit pack is **not measured** —
+it needs PrismML's fork built locally, which is queued behind an explicit
+approval gate (third-party fork build/run).
 
 ## Same-harness quality triangle (2026-07-15): trained ternary vs zero-training PTQ vs FP16
 
