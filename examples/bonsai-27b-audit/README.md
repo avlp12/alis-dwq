@@ -235,6 +235,37 @@ campaign, and the loop-prone-but-KV-tolerant profile shows the conversion
 cost long-horizon behavior that short-form metrics — including the ones
 Tier 1 ran — do not price in.
 
+## Same-harness quality triangle (2026-07-15): trained ternary vs zero-training PTQ vs FP16
+
+512-window non-overlapping PPL (llama.cpp-matched scorer, identical
+tokenizer and corpus bytes) on the same base model:
+
+| build | size | wikitext | code | ZH |
+|---|---|---|---|---|
+| FP16 Qwen3.6-27B | 54 GB | 6.34 | 2.22 | 8.78 |
+| **Bonsai ternary 1.71 bpw** (trained, end-to-end incl. embeddings) | **8.5 GB** | 11.31 | **2.82** | **26.85** |
+| ours, naive mixed PTQ (FFN 2-bit/gs128, rest 8-bit) | 14 GB | 11.19 | 3.23 | 17.12 |
+| ours, + anchor-guarded clip (zero training, ~minutes) | 14 GB | **9.91** | 3.04 | 15.80 |
+
+Not size-matched (8.5 vs 14 GB — theirs quantizes everything including
+embeddings/attention to ternary; ours leaves non-FFN at 8-bit), so read it
+as recipe-vs-recipe, not a scoreboard. Three honest observations:
+
+1. **Bonsai's training shows exactly where its calibration lived**: code is
+   its best slice (1.27× FP16 — beats our clip arm), while **ZH collapses
+   to 3.06× FP16** — worse than *naive* min-max PTQ (1.95×), which trains
+   on nothing at all. The KL/flip slice asymmetry (ZH flip 45.6%) and the
+   PPL triangle agree: the conversion bought EN/code retention at the
+   direct expense of the non-English mass. Our 45%-ZH-mix lesson, third
+   family in a row.
+2. A zero-training clip pass on a mid-bit mixed recipe beats the trained
+   1.71 bpw build on wikitext and ZH at 1.6× the bytes — the practical
+   floor trade-off (quality-per-byte vs training budget) in one table.
+3. Their loop-prone slices (EN/ZH greedy) are also their high-PPL slices;
+   the clean slice (code) is their PPL-strongest. Consistent with the
+   degeneration being distribution-sharpening damage where training data
+   was thin.
+
 ## Status
 
 - [x] Toolchain validated on **real mlx** (0.32 Linux CPU backend,
