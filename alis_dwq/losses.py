@@ -35,7 +35,11 @@ def parse(spec):
     if s in ("kl", "rkl", "cakld"):
         return s, None
     if s.startswith("kl_top_"):
-        k = int(s[len("kl_top_"):])
+        try:
+            k = int(s[len("kl_top_"):])
+        except ValueError:
+            raise ValueError(
+                f"ALIS_DWQ_LOSS={spec!r} not supported (kl | rkl | cakld | kl_top_K)")
         if k <= 0:
             raise ValueError(f"ALIS_DWQ_LOSS top-k must be positive: {spec}")
         return "kl_top", k
@@ -67,12 +71,20 @@ def per_token_loss(kind, topk, logits, targets, scale, labels=None, ids=None):
     `ids` (B, T, k) naming them. `labels` (B, T) = ground-truth next token,
     required by cakld only. `scale` = 1/temperature, matching the stock
     kl_div_loss(scale*logits, scale*targets) convention."""
+    # compute in float32 throughout: the stock Metal kl_div_loss kernel
+    # accumulates in f32 regardless of input dtype, and a bf16 elementwise
+    # path here is ~10x noisier — which would confound exactly the
+    # objective A/Bs this module exists for (blank-slate lens measurement:
+    # max err vs f32 reference 0.0047 stock vs 0.049 bf16 elementwise)
+    logits = logits.astype(mx.float32)
+    targets = targets.astype(mx.float32)
     if kind == "kl_top":
         if ids is not None:
             raise ValueError(
                 "kl_top_K with a top-k target dump is redundant — the dump "
                 "already restricts the loss to the teacher's top-k columns; "
                 "use ALIS_DWQ_LOSS=kl (or re-dump with a different --dwq-top-k)")
+        topk = min(topk, int(targets.shape[-1]))
         kidx = mx.argpartition(-targets, kth=topk - 1, axis=-1)[..., :topk]
         targets = mx.take_along_axis(targets, kidx, axis=-1)
         logits = mx.take_along_axis(logits, kidx, axis=-1)
@@ -89,8 +101,11 @@ def per_token_loss(kind, topk, logits, targets, scale, labels=None, ids=None):
     if kind == "cakld":
         if labels is None:
             raise ValueError("cakld needs ground-truth labels")
-        p_t = mx.softmax(targets.astype(mx.float32), axis=-1)  # conf at T=1
-        if ids is not None:  # top-k dump: label may be absent -> conf 0
+        p_t = mx.softmax(targets, axis=-1)  # conf at T=1
+        if ids is not None:
+            # top-k dump: label absent -> conf 0 (pure forward KL). When
+            # present, conf renormalizes over the dumped columns — an upper
+            # bound on the true full-vocab prob (small for realistic K)
             conf = (p_t * (ids == labels[..., None])).sum(axis=-1)
         else:
             conf = mx.take_along_axis(p_t, labels[..., None], axis=-1).squeeze(-1)

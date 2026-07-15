@@ -1,11 +1,17 @@
-"""Full-window non-overlapping PPL — the llama.cpp-comparable number.
+"""Non-overlapping-window PPL mirroring llama.cpp's `llama-perplexity`.
 
-llama.cpp's `llama-perplexity` evaluates full non-overlapping context
-windows; this repo's other PPL numbers are *strided* (ctx 2048 / stride
-1024) and are NOT comparable across harnesses. For a cross-engine
-head-to-head (examples/glm-5.2-ds4-vs-alis) recompute both sides under one
-windowing: run `llama-perplexity -c 512` on the GGUF and this on the MLX
-build, over byte-identical corpus files.
+Verified against tools/perplexity/perplexity.cpp (master, 2026-07): text is
+tokenized once with no special tokens, each window's token 0 is replaced by
+BOS when the tokenizer defines one, and NLL is scored only for predicted
+token positions >= window/2 + 1 (n_ctx-1-first targets = 255 at -c 512) —
+the first half of each window is context. This repo's other PPL numbers are
+*strided* (ctx 2048 / stride 1024) and are NOT comparable across harnesses.
+
+For a cross-engine head-to-head (examples/glm-5.2-ds4-vs-alis) run
+`llama-perplexity -c 512` on the GGUF and this on the MLX build over
+byte-identical corpus files. Residual comparability caveat: identical bytes
+do not guarantee identical token IDs across the GGUF and HF tokenizers —
+spot-check counts per slice before quoting a cross-engine delta.
 
   python -m alis_dwq.ppl_windows --model <mlx-dir> --window 512 \
       --text data/wikitext.txt data/code.txt data/zh.txt
@@ -18,18 +24,35 @@ from mlx_lm import load
 
 
 def window_ppl(model, tok, path, window):
-    ids = tok.encode(open(path).read())
+    """Mirror llama-perplexity's chunk scoring exactly (verified against
+    tools/perplexity/perplexity.cpp): raw tokenization (no special tokens),
+    each chunk's token 0 replaced by BOS when the tokenizer defines one, and
+    NLL scored only for token positions >= window/2 — the first half is
+    context. Scoring all 511 targets instead reads systematically worse
+    (low-context positions) and is NOT comparable across harnesses."""
+    with open(path) as f:
+        text = f.read()
+    ids = tok.encode(text, add_special_tokens=False)
+    bos = getattr(tok, "bos_token_id", None)
+    first = window // 2
     n_win = len(ids) // window
     tot_nll, tot_tok = 0.0, 0
     for w in range(n_win):
-        chunk = mx.array(ids[w * window:(w + 1) * window])[None]
+        chunk_ids = list(ids[w * window:(w + 1) * window])
+        if bos is not None:
+            chunk_ids[0] = bos
+        chunk = mx.array(chunk_ids)[None]
         logits = model(chunk[:, :-1]).astype(mx.float32)
         lp = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
         tgt = chunk[:, 1:]
-        nll = -mx.take_along_axis(lp, tgt[..., None], axis=-1).sum()
+        # llama.cpp keeps logits for positions >= first and scores
+        # n_ctx-1-first targets (predicted token positions first+1..n_ctx-1);
+        # target index j here predicts token position j+1, so j >= first
+        nll = -mx.take_along_axis(lp[:, first:], tgt[:, first:, None],
+                                  axis=-1).sum()
         mx.eval(nll)
         tot_nll += nll.item()
-        tot_tok += tgt.size
+        tot_tok += int(tgt.shape[1]) - first
     return math.exp(tot_nll / tot_tok), n_win, tot_tok
 
 

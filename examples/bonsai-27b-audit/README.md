@@ -111,7 +111,7 @@ path, not a format requirement.
 - Global level fractions: **35.2% −1 / 29.7% 0 / 35.1% +1** — near the
   max-entropy point for 3 levels. Effective **1.58 b/w of the nominal 2.00
   (79% — the ternary ceiling log₂3/2 = 79.2%)**, uniform across all 64
-  layers; per-tensor entropy min 1.551 / median 1.585 (max 1.585).
+  layers; per-tensor entropy min 1.551 / median 1.581 / max 1.585.
 - Zero fraction is *tight*: median 0.299, std 0.013 across tensors —
   a fixed-threshold-like criterion, not per-group-optimized support
   (which would spread wider). `linear_attn.in_proj_a/b` are the outliers
@@ -163,17 +163,23 @@ linear-attention states stay FP16, so both rows are lower bounds):
 | FP16 weights | 0.0458 | 0.4148 | 0.0261 | 0.1622 | 5.1% |
 | Bonsai ternary | 0.0030 | 0.0029 | 0.0028 | **0.0029** | 2.2% |
 
-**56× lower self-KL on the ternary build** — inside PrismML's claimed
-12–95× band, reproduced on an independent harness. The transferable
-hypothesis (discretization-shaped models absorb cache noise) survives its
-first outside test; running the same probe on our own DWQ'd students is
-§3b of the validation backlog. One mechanism caveat before quoting the
-number: a model this loop-prone has low-entropy output distributions, and
-peaked outputs are cheap to reproduce under cache noise — tolerance and
-degeneration may share a cause. The Tier 2 activation-kurtosis capture
-(test 6) is the discriminator.
+**56× lower self-KL on the ternary build in aggregate — but the per-slice
+ratios are 15× (EN) / 145× (code) / 9.4× (ZH)**, i.e. the aggregate is
+dominated by the FP16 model's anomalous code slice (0.415 vs 0.03–0.05
+elsewhere), and two of three slices fall *outside* PrismML's 12–95× band
+(3-lens review catch). The honest statement: the tolerance phenomenon
+reproduces strongly and in the claimed direction, with slice-dependent
+magnitude 9–145×. Running the same probe on our own DWQ'd students is §3b
+of the validation backlog. Two caveats before quoting numbers: (a) a model
+this loop-prone has low-entropy output distributions, and peaked outputs
+are cheap to reproduce under cache noise — tolerance and degeneration may
+share a cause (the Tier 2 activation-kurtosis capture, test 6, is the
+discriminator); (b) the loop probe is one greedy continuation per slice
+(n=3 total) with no temperature-matched control — whether the loops
+persist at the model's served sampling temperature is untested, which is
+also PrismML's most legitimate rebuttal line.
 
-## Tier 2 results (measured 2026-07-15): the OBS prior is REFUTED — it's training
+## Tier 2 results (measured 2026-07-15, wording hardened by 3-lens review): direct rounding excluded; training vs order-permuted compensation NOT separable from endpoints
 
 `weight_forensics` against the bf16 original (`mlx_lm convert` of
 Qwen/Qwen3.6-27B — sanitize aligns naming and drops the vision tower),
@@ -181,35 +187,53 @@ Qwen/Qwen3.6-27B — sanitize aligns naming and drops the vision tower),
 
 | fingerprint | MLP (40) | attention (36) | reading |
 |---|---|---|---|
-| projection agree | 85.1% @k=0.5 | 88.3% | not rounding (>98%), not rotation (<60%) |
-| column drift | **−0.001** | **−0.003** | **flat — no OBS/GPTQ column-compensation signature** |
+| projection agree | 85.1% @k=0.5 | 88.3% | not direct rounding (>98%), not rotation (<60%) |
+| column drift | −0.001 (flat) | −0.003 agg., ±0.04 per-tensor | no *storage-ordered* compensation signature |
 | spectra corr / w-corr | 0.993 / 0.853 | 0.985 / 0.787 | basis not rotated |
-| scale ratio vs closed form | **0.835 ± 0.035** | 0.78–1.01 | scales systematically ~17% below MSE-optimal ⇒ **trained** |
+| scale ratio vs conditional centroid | ~0.831 (per-tensor means 0.822–0.843) | 0.78–1.01 | absmean-family scales; NOT a training arrow (below) |
 | 4th-level usage | 0.00% | 0.00% | ternary, again |
 
-**VERDICT (both sweeps): "weights moved position-independently
-(training/distillation)".** The Hassibi/OBS lineage suggested curvature
-compensation; the fingerprints say otherwise — no positional error-absorption
-structure anywhere, weights moved ~15% of codes away from any threshold
-projection of the original, and the shipped group scales sit consistently
-*below* the analytic optimum (a distillation-pressure signature, not a
-closed form). Supporting detail: `linear_attn.in_proj_a` — the tensor family
-with the anomalous zero-fraction spread in Tier 1 — has the *lowest*
-projection agreement (76.3%), i.e. it was trained hardest. The method class
-is **QAT/distillation-style conversion** (BitNet-Distillation family), not
-OBS/GPTQ-style PTQ. What stays unrecoverable from endpoints: schedule, data,
-and the exact objective.
+**What the fingerprints exclude:** direct analytic rounding of the original
+(agreement is 15 points short of a projection), a rotated basis, and
+compensation applied in storage column order.
 
-Two practical corollaries for this repo:
+**What they cannot exclude — the 3-lens review broke our first reading.**
+The initial verdict here was "OBS/GPTQ refuted ⇒ QAT/distillation". Two
+independent reviewers demolished the inference:
 
-1. The open-reproduction path (ternary projection + layerwise distillation
-   with straight-through re-projection, §"If the fingerprints confirm")
-   targets exactly the *measured* method class — it just needs more than the
-   "short distillation" the OBS prior assumed (they moved ~15% of codes).
-2. Their loop-prone-but-KV-tolerant profile now reads as a *training*
-   outcome, not a rounding artifact — distillation on finite data at 1.71
-   bpw bought benchmark retention and cache robustness at the price of
-   long-horizon behavior our loop probe caught in one minute.
+- **The drift test is blind to act-order GPTQ.** desc_act (standard in
+  AutoGPTQ/GPTQModel) processes columns in Hessian-diagonal order and
+  inverse-permutes afterwards, scrambling the head-vs-tail signature:
+  a reviewer's simulated ternary GPTQ shows drift −0.078 (storage-ordered,
+  detected) collapsing to −0.011 (act-order — reads as "flat"). The
+  observed −0.001/−0.003 is consistent with *both* training and act-order
+  compensation.
+- **scale-ratio ≈ 0.83 is not a training signature.** BitNet-style absmean
+  scales (s = mean|w| over the whole group — analytic, no training) land at
+  0.75 ± 0.03 of this tool's conditional-centroid reference on Gaussian
+  weights, with ~31% zeros — matching the observed zero fraction and the
+  k=0.5 best threshold. The shipped 0.83 sits between absmean and the
+  centroid; only ≈1.0 would have been a sharp (analytic-centroid) reading.
+- The projection sweep thresholds per row while the pack scales per group
+  (gs128), which depresses agreement for *any* group-wise analytic method.
+
+**Bounded verdict:** the transformation is **not direct rounding**; it is
+either **QAT/distillation-style conversion** (BitNet-Distillation family)
+or **order-permuted / Hessian-weighted compensated PTQ** (act-order GPTQ
+class, which the Hassibi/OBS lineage makes the natural in-house method) —
+the endpoints alone cannot separate the two. Provenance mildly favors the
+compensation family; the moved-code volume (~15%) is reachable by either.
+The discriminating measurements, both unrun: the activation-kurtosis
+capture (test 6 — flattened activations would indicate noise-injection
+training), and an act-order-GPTQ synthetic added to `weight_forensics`'
+validation set (drift measured in processing order, phase-folded per group).
+
+Corollary for this repo either way: the open-reproduction path (ternary
+projection + layerwise distillation with straight-through re-projection)
+targets a method class consistent with the endpoints, but it is a research
+campaign, and the loop-prone-but-KV-tolerant profile shows the conversion
+cost long-horizon behavior that short-form metrics — including the ones
+Tier 1 ran — do not price in.
 
 ## Status
 
@@ -221,10 +245,12 @@ Two practical corollaries for this repo:
   −0.044 / rotation spectra-corr 0.999 with w-corr −0.02).
 - [x] Tier 1 on the actual Bonsai pack (2026-07-15, above): ternary label
   verified; KL/flip vs FP16 measured; loop-probe LOOPED ×3 vs clean FP16
-  control; KV-tolerance reproduced at 56×.
-- [x] Tier 2 run (2026-07-15, above): **OBS/GPTQ prior refuted** — flat
-  column drift, unrotated basis, trained scales ⇒ QAT/distillation-class
-  conversion. Reproduction decision escalated to the owner (it targets the
-  measured class, but is a training campaign, not a weekend).
+  control (greedy-only, no temperature-matched control yet); KV-tolerance
+  reproduced, per-slice 9–145×.
+- [x] Tier 2 run (2026-07-15, above; wording hardened by a 3-lens review
+  that broke the first "training, period" reading): direct rounding and
+  rotation excluded; **training vs act-order-compensated PTQ not separable
+  from endpoints**. Discriminators (kurtosis capture; act-order synthetic
+  for the tool) unrun. Reproduction decision escalated to the owner.
 - Compiled 2026-07-14 from the whitepaper, Bonsai-demo repo, and public
-  reporting; the OBS-lineage prior was tested and rejected on 2026-07-15.
+  reporting.

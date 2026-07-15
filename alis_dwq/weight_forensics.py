@@ -25,6 +25,13 @@ with |value| < 0.4x the group's max level classify as 0. This handles both
 the scale-only packing (levels {-s, 0, +s, 2s}, code 3 unused — any code-3
 usage is itself reported: it would falsify a "ternary" label) and min-max
 affine surrogates. Analysis is numpy; only the loader needs mlx.
+
+Known limits (verified in the 2026-07-15 3-lens review — read verdict()'s
+docstring before quoting a verdict): the projection sweep thresholds per
+ROW while shipped checkpoints scale per GROUP, so group-wise analytic
+methods depress agreement without any training; the drift test is blind to
+act-order (processing-order-permuted) compensation; and scale-ratio < 1 is
+expected for absmean-family analytic scales, not evidence of training.
 """
 import argparse
 import re
@@ -89,14 +96,33 @@ def scale_ratio(w_o, t, s_eff):
 
 
 def verdict(agree, drift, spec_c, w_c):
+    """Heuristic over the fingerprints. Two measured blind spots (3-lens
+    review, 2026-07-15) bound what the positive verdicts may claim:
+
+    - the drift test assumes processing order == storage order; **act-order
+      GPTQ** (desc_act, standard in AutoGPTQ/GPTQModel) permutes processing
+      by Hessian diagonal and then inverse-permutes — simulated drift
+      collapses from -0.078 to -0.011, i.e. it reads as "flat". Flat drift
+      therefore rules out *storage-ordered* compensation only.
+    - scale-ratio < 1 is NOT a training signature: BitNet-style absmean
+      scales (s = mean|w| over the whole group, no training) sit at
+      ~0.67-0.75 of this tool's conditional-centroid reference on
+      Gaussian/Laplace weights. Only ~1.0 (analytic centroid) is a sharp
+      reading.
+
+    So "moved position-independently" separates the transform from direct
+    rounding and from storage-ordered compensation — it cannot separate
+    training/distillation from order-permuted or Hessian-weighted PTQ."""
     if agree > 0.98 and abs(drift) < 0.01:
         return "direct analytic projection (rounding; theory in scale/threshold)"
     if agree > 0.65 and drift < -0.015:
-        return "column-ordered compensation (OBS/GPTQ family)"
+        return "column-ordered compensation (OBS/GPTQ family, storage-ordered)"
     if agree < 0.6 and spec_c > 0.95 and w_c < 0.5:
         return "rotated basis before quantization"
     if agree > 0.65:
-        return "weights moved position-independently (training/distillation)"
+        return ("weights moved position-independently — training/distillation "
+                "OR order-permuted compensation (act-order GPTQ class); "
+                "endpoints alone cannot separate these")
     return "unclassified (mixed or novel transformation)"
 
 

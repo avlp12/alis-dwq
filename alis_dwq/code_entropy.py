@@ -106,10 +106,12 @@ def scan(model_dir, chunk_elems=1 << 27, per_expert=False):
             per_row *= int(d)
         step = max(1, int(chunk_elems // max(per_row * (32 // bits), 1)))
 
-        # int64 accumulation on the host: a float32 GPU histogram silently
-        # saturates at 2^24 per bin (increments beyond 16,777,216 are lost),
-        # which clamped every >~50M-param tensor to a fake uniform histogram
-        # on the first real-model run (Bonsai 27B, 2026-07-15)
+        # int64 accumulation on the host: a float32 GPU *scatter-add*
+        # histogram silently saturates at 2^24 per bin (sequential adds of
+        # 1.0 past 16,777,216 are lost — pairwise reductions would not
+        # saturate, scatter-add accumulation does), which clamped every
+        # >~50M-param tensor to a fake uniform histogram on the first
+        # real-model run (Bonsai 27B, 2026-07-15)
         hist = np.zeros(nlev, dtype=np.int64)
         lo_groups = tot_groups = 0.0
         want_pe = per_expert and len(wq.shape) == 3 and bits <= 4
@@ -125,6 +127,13 @@ def scan(model_dir, chunk_elems=1 << 27, per_expert=False):
             s = mx.where(mx.abs(s) < 1e-30, mx.ones_like(s), s)
             q = mx.clip(mx.round((dq.reshape(*head, G, gs) - b) / s), 0, nlev - 1)
             flat = q.reshape(-1).astype(mx.uint32)
+            # int32 per-chunk bins are exact only while a chunk stays under
+            # 2^31 codes; `step` is derived from chunk_elems with a
+            # `32 // bits` unpack estimate and a max(1, ...) floor, neither
+            # of which is a hard bound — enforce it here instead of hoping
+            assert flat.size < (1 << 31), (
+                f"chunk of {flat.size} codes overflows int32 bins ({base}); "
+                "lower chunk_elems")
             ch = mx.zeros((nlev,), dtype=mx.int32)
             ch = ch.at[flat].add(mx.ones(flat.shape, dtype=mx.int32))
             mx.eval(ch)
