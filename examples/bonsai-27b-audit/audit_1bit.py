@@ -10,13 +10,19 @@ vs sign(original), and shipped-scale ratio vs the analytic binary optimum
 """
 import glob
 import json
+import os
 import struct
 import sys
 
 import numpy as np
 
-PACK = "/Users/gesicht/bonsai_audit/Bonsai-27B-mlx-1bit"
-ORIG = "/Users/gesicht/bonsai_audit/Qwen3.6-27B-mlx"
+AUDIT = os.environ.get("BONSAI_AUDIT_DIR")
+if not AUDIT:
+    raise SystemExit("set BONSAI_AUDIT_DIR to the directory holding the "
+                     "Bonsai-27B-mlx-1bit and Qwen3.6-27B-mlx dumps "
+                     "(see this example's README for the sources)")
+PACK = os.path.join(AUDIT, "Bonsai-27B-mlx-1bit")
+ORIG = os.path.join(AUDIT, "Qwen3.6-27B-mlx")
 GS = 128
 
 

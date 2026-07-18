@@ -34,6 +34,8 @@ from mlx_lm.tuner.losses import kl_div_loss
 from mlx_lm.tuner.trainer import grad_checkpoint, iterate_batches
 
 from . import losses
+from . import power
+from . import provenance
 
 _LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
 # router/gate modules producing expert logits ("mlp.gate", "mlp.router"); the
@@ -158,6 +160,11 @@ def layerwise_dwq_quantize(
     seed, dtype: mx.Dtype = mx.bfloat16, gradient_checkpoint: bool = False,
     temperature: float = 2.0, **_ignored,
 ):
+    if provenance.TARGET_DIR:
+        provenance.verify_targets_for_training(
+            provenance.TARGET_DIR, train_data, valid_data, batch_size,
+            max_seq_length, seed)
+
     K = int(os.environ.get("ALIS_DWQ_LAYERS_PER_ROUND", "8"))
     train_routers = os.environ.get("ALIS_DWQ_TRAIN_ROUTERS", "") == "1"
     lora_rank = int(os.environ.get("ALIS_DWQ_LORA_RANK", "0") or 0)
@@ -248,6 +255,7 @@ def layerwise_dwq_quantize(
         for i, (batch, lengths) in enumerate(
             iterate_batches(valid_data, batch_size, max_seq_length, seed=seed)
         ):
+            step_tic = time.time()
             labels = batch[:, 1:] if need_labels else None
             batch = batch[:, :-1]
             targets = target_fn(batch, i, split="valid")
@@ -256,12 +264,14 @@ def layerwise_dwq_quantize(
             mx.eval(loss, ntoks)
             v_tok += ntoks.item()
             v_loss += loss.item() * ntoks.item()
+            power.throttle(time.time() - step_tic)
         loss = v_loss / v_tok
         print(f"[alis-dwq][valid] {tag}: {loss:.4f}", file=sys.stderr)
         return loss
 
     model.freeze()
     best = init = validate("initial")
+    provenance.event("valid", tag="initial", loss=init)
 
     cka_prev = None
     if cka_mon:
@@ -272,6 +282,7 @@ def layerwise_dwq_quantize(
             break
 
     for r, subset in enumerate(rounds):
+        round_tic = time.time()
         model.freeze()
         sub, first = set(subset), r == 0
 
@@ -311,6 +322,7 @@ def layerwise_dwq_quantize(
                 desc=f"round {r + 1}/{len(rounds)} L{subset[-1]}-{subset[0]}",
             )
         ):
+            step_tic = time.time()
             labels = batch[:, 1:] if need_labels else None
             batch = batch[:, :-1]
             targets = target_fn(batch, it, split="train")
@@ -319,6 +331,7 @@ def layerwise_dwq_quantize(
             mx.eval(loss, params)
             tok += ntoks.item()
             total += loss.item() * ntoks.item()
+            power.throttle(time.time() - step_tic)
             if (it + 1) % 20 == 0:
                 pbar.set_description(
                     f"round {r + 1}/{len(rounds)} loss={total / tok:.4f} "
@@ -327,7 +340,7 @@ def layerwise_dwq_quantize(
 
         model.update(tree_map(lambda v: v.astype(dtype), params))
 
-        cka_post = None
+        cka_post, sims = None, []
         if cka_prev is not None:
             cka_post = _capture_hiddens(model, cka_batch)
             sims = [(_cka(a, b), i) for i, (a, b) in enumerate(zip(cka_prev, cka_post))
@@ -346,15 +359,25 @@ def layerwise_dwq_quantize(
             print(f"[alis-dwq][round {r + 1}/{len(rounds)}] REVERTED"
                   f" ({rv:.4f} > best {best:.4f})", file=sys.stderr)
             # cka_prev unchanged: the rollback restored exactly that state
+            decision = "reverted"
         else:
             best = rv
             print(f"[alis-dwq][round {r + 1}/{len(rounds)}] ACCEPTED {rv:.4f}",
                   file=sys.stderr)
             if cka_post is not None:
                 cka_prev = cka_post  # next round drifts against the kept state
+            decision = "accepted"
+        provenance.event(
+            "round", round=r + 1, rounds=len(rounds), layers=list(subset),
+            decision=decision, valid=rv, best=best,
+            train_loss=(total / tok if tok else None), tokens=tok,
+            peak_gb=round(mx.get_peak_memory() / 1e9, 1),
+            secs=round(time.time() - round_tic, 1),
+            cka=[[i, round(c, 6)] for c, i in sims] or None)
 
     model.freeze()
     print(f"[alis-dwq] valid {init:.4f} -> {best:.4f}", file=sys.stderr)
+    provenance.event("summary", initial=init, best=best, rounds=len(rounds))
     if lora_cfg is not None:
         _save_adapters(model, lora_cfg,
                        os.environ.get("ALIS_DWQ_ADAPTER_DIR", "alis_adapters"))

@@ -7,19 +7,23 @@ kurtosis of each decoder block's output, one fixed mixed batch, both models.
 
 Run with stock mlx (the ternary pack needs no fork).
 """
-import sys
+import os
 
 import numpy as np
 import mlx.core as mx
 from mlx_lm import load
 
-sys.path.insert(0, "/Users/gesicht/alis-dwq")
+# alis-dwq must be importable: pip install -e <repo root>
 from alis_dwq.layerwise import _capture_hiddens  # class-level call patch
 from alis_dwq.eval_kld import get_tokens
 
+AUDIT = os.environ.get("BONSAI_AUDIT_DIR")
+if not AUDIT:
+    raise SystemExit("set BONSAI_AUDIT_DIR to the directory holding the "
+                     "Bonsai/Qwen dumps (see this example's README)")
 MODELS = {
-    "bonsai": "/Users/gesicht/bonsai_audit/Ternary-Bonsai-27B-mlx-2bit",
-    "fp16": "/Users/gesicht/bonsai_audit/Qwen3.6-27B",
+    "bonsai": os.path.join(AUDIT, "Ternary-Bonsai-27B-mlx-2bit"),
+    "fp16": os.path.join(AUDIT, "Qwen3.6-27B"),
 }
 N_TOK = 768  # EN/code/ZH thirds via eval_kld's fixed slice
 
@@ -61,7 +65,7 @@ def main():
     print("[kurt] reading: ratio << 1 across layers = flattened activations "
           "(noise-injection-training signature); ~1 = geometry preserved "
           "(compensated-PTQ-compatible)")
-    np.savez("/Users/gesicht/bonsai_audit/kurtosis.npz", bonsai=b, fp16=f)
+    np.savez(os.path.join(AUDIT, "kurtosis.npz"), bonsai=b, fp16=f)
     print("KURT_DONE")
 
 

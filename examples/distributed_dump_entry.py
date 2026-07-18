@@ -17,7 +17,6 @@ The calibration jsonl files must be byte-identical on every host (hash them):
 each rank loads its own copy, and the shared seed only aligns the sample
 permutation if the underlying rows match.
 """
-import alis_dwq.run  # noqa: F401  (import installs the layerwise/wired/data patches)
-import mlx_lm.quant.dwq as D
+import alis_dwq.run  # import installs the layerwise/wired/data patches
 
-D.main()
+alis_dwq.run.main()  # adds the seed guard + run/manifest provenance over D.main()

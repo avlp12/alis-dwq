@@ -21,8 +21,14 @@ Works on **stock mlx-lm ≥ 0.31** (the layerwise trainer ships here as a patch 
 
 ```bash
 git clone https://github.com/avlp12/alis-dwq && cd alis-dwq
-pip install mlx-lm  # >= 0.31
+pip install -e .    # pulls mlx-lm >= 0.31 (+ numpy, tqdm)
+pytest              # optional: selftests + synthetic CPU checks, no model needed
 ```
+
+(`pip install mlx-lm` alone still works — the package is a patch toolkit over
+stock mlx-lm. On Linux — CI or any CPU box — add `pip install "mlx[cpu]"`:
+everything that doesn't load a real model runs there, which is what
+`.github/workflows/ci.yml` does; model-loading tests are marked `device`.)
 
 ### 0. Measure expert traffic first (optional — sizes the recipe)
 
@@ -62,7 +68,7 @@ Add `--per-expert` (experimental) to break expert stacks out along axis 0 (bits 
 Measured reference (GLM-5.2 E1r 2.3 bpw, 2026-07-15). Two facts the aggregate report hides:
 
 - **Expert damage lives in `down_proj`, and in the early layers' tail.** 93 of 19,200 down_proj experts sit under 70% utilization (gate/up: zero; MLA embed_q/unembed_out stacks: 93% healthy); medians are flat across depth (82.6%) but the extreme tail is all L3–L6 (worst: L3 expert 2 at 45.9%). The bit-spending prior "late layers matter" does not describe where 2-bit *grid damage* concentrates — consistent with the early-layer CKA/routing note in §3.
-- **Container constraint on the "bit-promotion" use:** MLX packs an expert stack as one tensor with uniform bits, so per-expert promotion is not shippable in-place — the actionable lever for the damaged list is `gen_calib` routing targets (give those experts calibration signal), or an unpack-style layout change (cf. the MiniMax shared-expert note below).
+- **Container constraint on the "bit-promotion" use:** MLX packs an expert stack as one tensor with uniform bits, so per-expert promotion is not shippable in-place — the actionable levers for the damaged list are `gen_calib` routing targets (give those experts calibration signal), an unpack-style layout change (cf. the MiniMax shared-expert note below), or — since bits are per-*tensor* — promoting the whole projection: `clip_quantize --bits-override 'down_proj@L3-L6=3'` ships per-projection asymmetry the container *does* support (§1b), which is exactly where the measured tail lives.
 - **Clip's mechanism, verified on the real artifact:** the same E1 student before vs after anchor-guarded clip-search: effective code payload **1.649 → 1.705 b/w, and all 225 of 225 expert tensors improved** — the utilization gain that decoded to the measured −6.1% raw wikitext PPL (part 2 of the E1 case study). Low code entropy predicting clip payoff is now a measured, not hypothesized, relationship on a 745B artifact.
 
 ### 1b. Clip-search requantize the student (free KL, before any training)
@@ -86,6 +92,8 @@ Two hard-won constraints (mechanisms + numbers in the [E1 case study, part 2](ex
 
 First A/B (2026-07-15, Qwen3.6-27B from bf16, FFN 2-bit/gs128 + rest 8-bit, 512-window PPL): **clip alone pays, permute on top did not** — naive → clip: wikitext 11.19→9.91 (−11%), code 3.23→3.04, ZH 17.12→15.80; clip+permute vs clip: PPL neutral-to-worse (9.96 / 3.04 / **16.13**, ZH +2.1%) while KL-vs-FP16 improved on all three slices (0.62/1.76/0.97 vs 0.66/1.84/1.00). Metric conflict resolves by the house rule: held-out PPL gates, so **permute is not adopted for this recipe class**. Scope caveat: this testbed's grids were already healthy (91% utilization — vs 80% on GLM E1-raw, where clip bought −6.1%), so the permutation had little stretched-grid pathology to fix; re-run the A/B on a low-utilization artifact before writing the idea off.
 
+**Experimental — per-projection bit asymmetry:** `--bits-override 'NAME[@La-Lb]=BITS[:gsG]'` (repeatable, first match wins) requantizes matching tensors at a different precision — e.g. `--bits-override 'down_proj@L3-L6=3'` promotes exactly the layers where the measured per-expert damage tail lives (§1a: 93/19,200 weak experts, all down_proj, all L3–L6 — and that measurement is *post-clip*, so clipping alone does not close it). The idea is the ds4-recipe asymmetry (its GGUF spends IQ2_XXS on up/gate but Q2_K on down) made shippable in MLX at the per-tensor granularity the container supports; per-module entries are written into `config.json`'s quantization sections so stock mlx-lm loads the result. Two cautions: (a) unlike GGUF there is nothing below 2-bit/gs128 to fund it from, so overrides only *add* bytes — a blanket `down_proj=3` on GLM-5.2 is ~+30 GB and lands past the 2.56 bpw sibling that already evals better; the measurement-matched variants are `down_proj=2:gs32`-style group-size promotion (~+7.5 GB) or the L3–L6-targeted 3-bit (~+1–2 GB). (b) Gate on held-out per-slice PPL vs an *equal-size* baseline, and re-run `code_entropy --per-expert` to confirm the damage tail actually closes. An overridden tensor that cannot be requantized from the source aborts the run rather than silently shipping the old bits.
+
 ### Where to spend bits (measured, from the 4-bitter Lesson Fig. 18)
 
 1. **Shared experts first** — near-free (+0.2 GB on a DeepSeek-style model) and the steepest single quality gain; they run for every token.
@@ -101,6 +109,16 @@ python -m alis_dwq.run \
   --model <teacher> --targets-only --target-dir ./targets \
   --num-samples 145 --max-seq-length 512 --batch-size 1 --seed 7
 ```
+
+Since v0.2 the dump is self-verifying (the ds4 "exact replay" lesson —
+`alis_dwq/provenance.py`): a `manifest.json` next to the targets pins a hash
+of the token streams actually consumed plus every replay parameter, and the
+dump immediately sanity-checks its own files (count per split, finite,
+non-constant, leading dim = batch size — the checks that catch a partial
+dump, the lazy-mmap zeroing incident, and the §2b `(ranks, seq, k)`
+all_gather corruption *before* you reclaim the teacher). Training re-derives
+the hash and refuses to start on any mismatch, naming the drifted field.
+Legacy manifest-less dumps: `ALIS_DWQ_ALLOW_UNVERIFIED_TARGETS=1`.
 
 ### 2b. Teacher too big for one box → distributed dump
 
@@ -124,7 +142,7 @@ Two gotchas cost us a full session on the first real distributed dump (790 GB 8-
 - **Every box needs the embedding shard — not just the first-stage rank.** The pipeline forward runs `embed_tokens(x)` on *all* ranks (later ranks discard it and overwrite with the `recv`). A rank missing the embed weights hangs at the embedding; its peer then trips the watchdog waiting at the collective. Replicate `embed_tokens` to every box; `lm_head`/final-norm only need the last rank.
 - **`mx.eval` the pipeline's final `all_gather` before any GPU op consumes it.** The collective is on the CPU stream (no watchdog) — but the final norm/slice that reads it runs on the GPU, so the GPU command buffer *waits* on the collective while the slowest rank finishes its whole forward. On forward #1, which includes cold Metal kernel compilation on the deep rank, that wait blows past the macOS ~5 s GPU watchdog and kills the rank that arrived first. Fix in the `deepseek_v3`/`v32` pipeline path: `n = h.shape[0]; h = all_gather(h, stream=cpu); mx.eval(h); h = h[:n]` — capture the local batch **before** `all_gather` grows axis 0. (Miss that and the dump silently saves `(ranks, seq, k)` logits — half of them the wrong rank's partial forward — instead of `(1, seq, k)`; slice back to row 0, the last-stage rank that owns `lm_head`.)
 
-**Keep `--batch-size 1` identical between the dump and the training run.** Targets are keyed by batch index, so a dump/train batch-size mismatch silently aligns teacher logits to the wrong samples. Batch 1 also keeps each command buffer small — batch 8 at seq 512 is 4096 tokens/layer and flirts with the same watchdog.
+**Keep `--batch-size 1` identical between the dump and the training run.** Targets are keyed by batch index, so a dump/train batch-size mismatch silently aligns teacher logits to the wrong samples — and the misalignment surface is wider than batch size: the jsonl *row count* (the sample permutation reshuffles wholesale), seed, tokenizer (dump tokenizes with the teacher's `--model`, training with the student's), and even which loader ran all feed batch composition. Since v0.2 the whole chain is fail-fast via the target manifest (§2 above) instead of a silent quality bug. Batch 1 also keeps each command buffer small — batch 8 at seq 512 is 4096 tokens/layer and flirts with the same watchdog.
 
 ### 3. Train the student, layerwise
 
@@ -138,6 +156,18 @@ python -m alis_dwq.run \
 ```
 
 (`--model` only supplies the tokenizer when targets exist — point it at the student; the teacher's 400 GB never move again.)
+
+Two v0.2 defaults on every run: the target manifest is verified before the
+first round (see §2; `ALIS_DWQ_ALLOW_UNVERIFIED_TARGETS=1` for legacy
+dumps — and `--seed 0` is refused outright, since `iterate_batches` only
+reseeds on a truthy seed, so 0 desyncs the per-round validation replays);
+and an append-only event log lands in `alis_runs/<utc>-<pid>/events.jsonl`
+(`run_start` with argv/env/versions/data hashes and the drawn sample
+permutation, one `round` line per accept/REVERT with train/valid loss, layer
+subset, peak memory, wall time and the full CKA vector when enabled, then
+`summary`). A run killed at round 9/13 keeps rounds 1–8 on disk instead of
+in a scrollback buffer; case-study tables stop being hand-copied.
+`ALIS_DWQ_RUN_LOG=0` disables, `ALIS_DWQ_RUN_LOG_DIR` relocates.
 
 **Experimental — LoRA error compensators:** `ALIS_DWQ_LORA_RANK=8` wraps every quantized module in a LoRA adapter ([Recover-LoRA](https://arxiv.org/abs/2606.04238) recovered 80–95% of 2-bit damage; [MiLo](https://arxiv.org/abs/2504.02658) is the MoE variant) and trains adapters alongside scales/biases under the same rounds/rollback. This adds the degree of freedom scales/biases (a per-group linear remap) fundamentally lack — the main lever left for the ~2.3 bpw floor builds, and it may reopen sharper teachers for low-bit students (the sweet-spot failure was a student-capacity limit). Adapters are saved to `ALIS_DWQ_ADAPTER_DIR` (default `alis_adapters/`) in mlx-lm's `--adapter-path` format; **the saved checkpoint stays stock** — wrappers are removed before mlx-lm writes it. Never fuse adapters into a quantized base (fusing requantizes = re-rounds the codes).
 
@@ -154,7 +184,7 @@ python -m alis_dwq.eval_kld --model <teacher> --save-ref ref.npz   # once
 python -m alis_dwq.eval_kld --model <out> --ref ref.npz            # per build
 ```
 
-Reports KL and top-1 flip per EN/code/ZH third (drop your own corpora in `data/`). Overall averages hide exactly the damage you're trying to fix.
+Reports KL and top-1 flip per EN/code/ZH third (the corpora are local files — see `data/README.md` for what goes where and the hashes behind the published numbers). Overall averages hide exactly the damage you're trying to fix.
 
 **Experimental — degeneration probe:** add `--loop-probe 256` to greedy-generate 256 tokens per slice and report distinct-4gram ratio + tail-cycle detection. Motivation: REAP's 504B held *eval parity* while its loop rate doubled (3.6%→7.2%, z≈5) — aggregate scores hide behavioral degeneration the same way they hide slice damage. Cheap to run on every build; treat a new `LOOPED` on a previously clean slice as a ship blocker until investigated.
 
@@ -162,7 +192,9 @@ Reports KL and top-1 flip per EN/code/ZH third (drop your own corpora in `data/`
 
 Measured (2026-07-15). Cross-family, the Bonsai phenomenon reproduces strongly (per-slice 9–145×, aggregate 56× — see the [audit](examples/bonsai-27b-audit/README.md) for why the aggregate flatters). In-family on our GLM-5.2 quants, self-KL orders with student bits — **2.3 bpw 0.079 → 2.56 bpw 0.113 → 3.5 bpw 0.143** (kv 4-bit gs64) — but read it as descriptive, not causal: top-1 flip is *not* monotone (8.9% / 13.0% / 12.1%), n=3, and the three builds differ in teacher and clip history as well as bit-width. Two takeaways that do survive: (a) PTQ+DWQ students show nothing near Bonsai-class KV immunity — whatever produces that immunity (their conversion process; see the audit's bounded Tier-2 verdict) is not a low-bit-container property; (b) ZH is the most KV-sensitive slice on every build (0.122/0.186/0.245 vs EN 0.074/0.096/0.105) — quantized-KV serving hits the language slices hardest exactly where weight quantization already does.
 
-**Gate caveat — selective collapse hides in short-form metrics.** Sub-4-bit damage concentrates in *long* reasoning chains: Bonsai's cross-family data shows IQ2_XXS holding MMLU (88.9) while AIME collapses 93→57. Our KL/flip slices and the loop probe are short-form; a build can pass both and still have lost long-CoT. Until a long-form reasoning probe ships here, treat KL/flip parity on an aggressive build as necessary, not sufficient — spot-check a few long thinking-mode problems before shipping a new low.
+**Gate caveat — selective collapse hides in short-form metrics.** Sub-4-bit damage concentrates in *long* reasoning chains: Bonsai's cross-family data shows IQ2_XXS holding MMLU (88.9) while AIME collapses 93→57. Our KL/flip slices and the loop probe are short-form; a build can pass both and still have lost long-CoT. Treat KL/flip parity on an aggressive build as necessary, not sufficient.
+
+**Experimental — long-form reasoning probe (the caveat above, made runnable):** `--reason-probe` generates full solutions to the fixed problem set in `data/reason_probe.jsonl` (six original problems, brute-force-verified integer answers, one ZH — kept out of any calibration mix per the disjointness rule) and grades only the final `ANSWER: <n>` line. This is ds4-eval's shape — a small deterministic capability gate run after every recipe change — but with a public problem set where ds4's original fixture was private. Two measured harness lessons are baked in: the budget must cover the whole thinking chain (`--reason-max-tokens`, default 2048 — the max_tokens=30 probe false-failed 0/3 on an 8-bit reference), and greedy alone can disagree with serving temperature in *both* directions (the Bonsai audit's loops vanished at T=1), so greedy always runs and `--reason-temp T` adds seeded sampled attempts. Read it as a collapse detector, not a ranker: a multi-problem drop vs the previous build is a ship blocker; a single-problem flip is noise to investigate. Unvalidated on-device — like every experimental flag, gate on held-out PPL/KL as always. `--save-json FILE` (independent, works without any probe) writes every metric the run produced — KL/flip per slice, loop/kv/reason results — so cross-build tables like the ds4 head-to-head stop being hand-assembled.
 
 ## Results
 
@@ -189,7 +221,7 @@ Measured (2026-07-15). Cross-family, the Bonsai phenomenon reproduces strongly (
 - **A REVERTED round near the end is the gate working, not a failure.** Both shipped GLM retunes ended with one late-round rollback (best already reached); treat consecutive reverts as the natural stopping signal.
 - When re-attaching a shard, **name it `model-*.safetensors`**: mlx-lm's loader collects shards by that glob, not by the index — a shard named anything else silently never loads and you get "missing parameters" for exactly its keys.
 - **`mx.load` is lazy (mmap) — never `save_safetensors` back to the path you loaded from.** The save truncates the file *before* the lazy view is read, so you write zeros over your own data. `mx.eval` the new arrays first, or write a temp file and `os.replace`. (We zeroed a whole target dump post-processing it this way — and the real fix was to not post-process at all: get the shape right in the forward, per §2b.)
-- **Verify a dump is non-zero and the right shape before you reclaim the teacher.** A distributed dump is your only local copy of the teacher's logits; the teacher weights are the cheap thing to reconstruct, the dump is not. After the corruption above we'd already deleted one box's teacher half — re-dumping meant re-pulling 400 GB. Keep the *peer* box's half until the targets pass a `min/max != 0` + shape check; and to free a box for the next stage, move the student to the peer over the local link (minutes) instead of deleting and re-pulling from HF (an hour).
+- **Verify a dump is non-zero and the right shape before you reclaim the teacher** *(automated since v0.2 — the dump self-checks and writes a manifest, §2; this note stays for manifest-less legacy dumps)*. A distributed dump is your only local copy of the teacher's logits; the teacher weights are the cheap thing to reconstruct, the dump is not. After the corruption above we'd already deleted one box's teacher half — re-dumping meant re-pulling 400 GB. Keep the *peer* box's half until the targets pass a `min/max != 0` + shape check; and to free a box for the next stage, move the student to the peer over the local link (minutes) instead of deleting and re-pulling from HF (an hour).
 - **Xet can also wedge after a device-level I/O interruption, not just mid-repo.** After a USB enclosure dropped and re-enumerated mid-download, `hf download` sat alive-but-dead — ~0% CPU, trickle network, zero file writes — because the background writer thread had died (`Internal Writer Error: Background writer channel closed`) and the main thread waits forever. It reproduced twice in one day, once at 57/59 shards. The stall watchdog that catches it: downloader process alive **and** no file in the target tree modified for 10 minutes → kill and relaunch (resume is safe; completed files are kept).
 - **VL MoE recipe note — check whether the shared expert is *packed* into the routed bank.** mlx-vlm's MiniMax-M3 packs the shared expert as expert #128 inside the same SwitchLinear when `shared_intermediate_size == intermediate_size`, welding the one tensor that sees **100% of tokens** (a routed expert sees ~3% at top-4/128) to the routed experts' bit-width. Unpacking it and holding it at 8-bit while routed experts drop to 3-bit cost +0.4% size and needs only a config-gated layout switch ([mlx-vlm#1544](https://github.com/Blaizzy/mlx-vlm/pull/1544); packed vs unpacked forward matches to 7.75e-07). The same audit applies before DWQ: a packed shared expert can't be given its own learning treatment either.
 - **Evaluating a thinking model: budget `max_tokens` for the thinking, and grade the tail.** A needle-retrieval probe with `max_tokens=30` "failed" 0/3 on an 8-bit reference — the model spent the whole budget inside `<mm:think>` and never emitted the answer; at 400 tokens it was 3/3 at every depth. Harness artifact, looks exactly like model damage.
@@ -247,10 +279,24 @@ Three additions landed 2026-07-12, motivated by REAP / router-KD (0xSero GLM-5.2
 | `--kv-probe BITS` | `eval_kld` (§4) | self-KL of a quantized KV cache vs own FP16-KV run | no KV probe |
 | *(new tool)* | `weight_forensics` | method-class fingerprints of a transformed model vs its original (Bonsai audit Tier 2) | — |
 | `ALIS_DWQ_LOSS=…` | DWQ (§3) | alternative distillation objectives: `rkl` / `cakld` / `kl_top_K` (AngelSlim port; selftest `python -m alis_dwq.losses`) | stock forward KL |
+| `--bits-override SPEC` | `clip_quantize` (§1b) | per-projection/per-layer precision override (`down_proj@L3-L6=3:gs64`); config.json per-module entries written | student's bits/gs as-is |
+| `--reason-probe [FILE]` | `eval_kld` (§4) | generative long-form reasoning gate, graded on the final `ANSWER:` line (`--reason-max-tokens`, `--reason-temp`, `--reason-samples`) | KL/flip only |
+| `--save-json FILE` | `eval_kld` (§4) | machine-readable dump of every metric the run produced | stderr/stdout only |
+| `ALIS_DWQ_ALLOW_UNVERIFIED_TARGETS=1` | DWQ (§2/§3) | escape hatch: train against a manifest-less (pre-v0.2) target dump | refuse to train unverified |
+| `ALIS_DWQ_RUN_LOG=0` / `ALIS_DWQ_RUN_LOG_DIR` | run/DWQ (§3) | disable / relocate the per-run `events.jsonl` | log to `alis_runs/` |
+| `ALIS_DWQ_POWER=N` | run/DWQ/clip/eval | ds4-style duty-cycle GPU throttle: sleep `(100-N)/N` of each work unit's wall time (10–100; heat/fan control, output bit-identical) | full speed |
 
 First on-device validation (2026-07-13, GLM-5.2 3-bit-expert student, 8-bit teacher, K=6): **router-KD is harmless but did not help** — same-teacher valid loss edged the baseline (0.1357 vs 0.1365) yet held-out wikitext lost by a hair (2.7820 vs 2.7774, well inside the CIs). The valid-vs-held-out inversion pattern strikes again; the baseline shipped. `--norms` and `--loop-probe` are validated in production use (see the E1 case study and the measured-reference note in §0).
 
 The 2026-07-13 batch (LoRA compensators, CKA monitor, `code_entropy`, `gen_calib`) carries no on-device measurements yet — validate on held-out PPL/KL before putting any of it in a shipping recipe. The LoRA adapter save/load round-trip in particular must be verified against `mlx_lm.load(..., adapter_path=...)` on-device before trusting a long run to it, and the CKA monitor exists precisely because the inversion above keeps recurring — use them together.
+
+### v0.2 (2026-07-18): the ds4-review batch
+
+Reading [antirez/ds4](https://github.com/antirez/ds4)'s engineering (exact-replay caching, embedded eval gate, shipped-artifact hygiene) against this repo produced one deliberate break from the "default pipeline byte-identical" rule and a set of default-off additions:
+
+- **Default ON (integrity, not behavior):** target dumps write `manifest.json` + self-check their files; training verifies the replay chain and refuses on mismatch or on `--seed 0` (escape: `ALIS_DWQ_ALLOW_UNVERIFIED_TARGETS=1`); runs append `events.jsonl` (`ALIS_DWQ_RUN_LOG=0` to disable). Model weights produced by the default pipeline are unchanged.
+- **Default OFF (experimental, unvalidated on-device):** `clip_quantize --bits-override` (per-projection asymmetry, §1b), `eval_kld --reason-probe` (long-form gate, §4), `eval_kld --save-json`, and `ALIS_DWQ_POWER=N` — ds4's `--power` ported: after each work unit (train/validate step, clip chunk, eval prefill chunk, dump batch) sleep `t·(100−N)/N` so the GPU duty cycle approximates N% for cool, quiet multi-hour runs; single sleeps are capped at 60 s so a cold-compile outlier doesn't stall, and generation probes are not paced (token-level units are thermally irrelevant). Output is bit-identical — the knob only paces.
+- **Packaging:** `pyproject.toml` (`pip install -e .`), a CPU-runnable pytest suite + GitHub Actions CI (36 tests: the two numpy selftests promoted, provenance round-trips, synthetic end-to-end `--bits-override` runs, `infer_qparams` collisions, grading/loop helpers), `data/` broken machine-local symlinks replaced by `data/README.md` (corpus provenance + hashes), example-script paths de-hardcoded (`BONSAI_AUDIT_DIR`).
 
 ## License
 

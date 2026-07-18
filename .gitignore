@@ -4,3 +4,8 @@ __pycache__/
 dwq_data/
 targets/
 ref.npz
+# local eval/calibration corpora — see data/README.md
+data/*.txt
+# per-run event logs (alis_dwq.provenance)
+alis_runs/
+*.egg-info/

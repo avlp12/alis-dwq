@@ -27,15 +27,68 @@ any dynamic per-layer recipe is preserved exactly. The source must be an
 to a NEW directory — never save over a lazily-loaded model (see README).
 """
 import argparse
+import json
+import re
 import shutil
 import sys
+import time
 from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
 
+from . import power
+
 VALID_BITS = (2, 3, 4, 5, 6, 8)
+GROUP_SIZES = (32, 64, 128)
 _FFN_FAMILIES = (("gate_proj", "up_proj", "down_proj"), ("fc1", "fc2"))
+_LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
+_OVERRIDE_RE = re.compile(
+    r"^(?P<name>[A-Za-z0-9_.]+)"
+    r"(?:@L(?P<lo>\d+)(?:-L?(?P<hi>\d+))?)?"
+    r"=(?P<bits>\d+)"
+    r"(?::gs(?P<gs>\d+))?$")
+
+
+def parse_bits_override(spec):
+    """'down_proj@L3-L6=3:gs64' -> (name_substr, lo, hi, bits, gs_or_None).
+
+    NAME is substring-matched against the tensor base path; @La-Lb (or @La)
+    restricts to those decoder layers; :gsG overrides the group size too.
+    Raises SystemExit on malformed or out-of-range specs."""
+    m = _OVERRIDE_RE.match(spec.strip())
+    if not m:
+        raise SystemExit(f"[clip] bad --bits-override {spec!r} "
+                         "(want NAME[@La[-Lb]]=BITS[:gsG], e.g. "
+                         "'down_proj@L3-L6=3:gs64')")
+    bits = int(m["bits"])
+    if bits not in VALID_BITS:
+        raise SystemExit(f"[clip] --bits-override {spec!r}: bits must be one "
+                         f"of {VALID_BITS}")
+    gs = int(m["gs"]) if m["gs"] else None
+    if gs is not None and gs not in GROUP_SIZES:
+        raise SystemExit(f"[clip] --bits-override {spec!r}: group size must "
+                         f"be one of {GROUP_SIZES}")
+    lo = int(m["lo"]) if m["lo"] else None
+    hi = int(m["hi"]) if m["hi"] is not None else lo
+    if lo is not None and hi < lo:
+        raise SystemExit(f"[clip] --bits-override {spec!r}: empty layer range")
+    return (m["name"], lo, hi, bits, gs)
+
+
+def match_override(overrides, base):
+    """First matching spec's (bits, gs_or_None) for tensor path `base`;
+    None when no spec matches. Layer-ranged specs never match tensors
+    outside `layers.<n>.` paths."""
+    mm = _LAYER_RE.search(base)
+    layer = int(mm.group(1)) if mm else None
+    for name, lo, hi, bits, gs in overrides:
+        if name not in base:
+            continue
+        if lo is not None and (layer is None or not lo <= layer <= hi):
+            continue
+        return (bits, gs)
+    return None
 
 
 def snake_perm(mag, group_size):
@@ -98,16 +151,20 @@ def clip_requantize(w, group_size, bits, ratios, scale_dtype, chunk_elems=1 << 2
         best_sum = base_sum = 0.0
         clip_cnt = grp_cnt = 0.0
         for i in range(0, rows, step):
+            chunk_tic = time.time()
             q, s, b, stats = _clip_chunk(w[i:i + step], group_size, bits, ratios, scale_dtype,
                                          max_err_slack)
             qs.append(q); ss.append(s); bs.append(b)
             best_sum += stats[0]; base_sum += stats[1]
             clip_cnt += stats[2]; grp_cnt += stats[3]
+            power.throttle(time.time() - chunk_tic)
         q = mx.concatenate(qs, axis=0); s = mx.concatenate(ss, axis=0); b = mx.concatenate(bs, axis=0)
         mx.eval(q, s, b)
         drop = 1 - best_sum / max(base_sum, 1e-30)
         return q, s, b, float(drop), float(clip_cnt / max(grp_cnt, 1.0))
+    chunk_tic = time.time()
     q, s, b, stats = _clip_chunk(w, group_size, bits, ratios, scale_dtype, max_err_slack)
+    power.throttle(time.time() - chunk_tic)
     drop = 1 - stats[0] / max(stats[1], 1e-30)
     return q, s, b, float(drop), float(stats[2] / max(stats[3], 1.0))
 
@@ -250,7 +307,26 @@ def main():
                     help="outlier-scattering permutation of each FFN hidden "
                          "axis before quantization (value-preserving, zero "
                          "runtime cost; float sources only)")
+    ap.add_argument("--bits-override", action="append", default=[],
+                    metavar="SPEC",
+                    help="requantize matching tensors at a different "
+                         "precision: NAME[@La[-Lb]]=BITS[:gsG], repeatable, "
+                         "first match wins (e.g. 'down_proj@L3-L6=3' promotes "
+                         "the measured damage tail; the ds4-recipe asymmetry, "
+                         "per-projection instead of per-expert)")
     a = ap.parse_args()
+
+    overrides = [parse_bits_override(s) for s in a.bits_override]
+    overridden = {}
+    if overrides:
+        print("[clip][EXPERIMENTAL] --bits-override: per-projection/per-layer "
+              "precision override — the shippable lever for expert-stack "
+              "damage (MLX packs a stack at uniform bits, so per-EXPERT "
+              "promotion is not shippable; per-TENSOR is). Changes model "
+              "size: gate on held-out per-slice PPL vs an equal-size "
+              "baseline, and re-scan code_entropy --per-expert to confirm "
+              "the damage tail actually closes. Omit the flag for the "
+              "previous behavior.", file=sys.stderr)
 
     out = Path(a.out)
     if out.resolve() in (Path(a.model).resolve(), Path(a.source).resolve()):
@@ -373,6 +449,12 @@ def main():
                     or wq.shape[-1] * 32 != bits * in_dim:
                 reason = f"cannot infer bits/group_size (in={in_dim})"
         if reason is not None:
+            if overrides and match_override(overrides, base) is not None:
+                # never silently ship the old precision for a tensor the
+                # operator explicitly asked to override (no silent caps)
+                raise SystemExit(f"[clip] --bits-override matched {base} but "
+                                 f"the tensor cannot be requantized ({reason})"
+                                 " — fix the source or narrow the override")
             if base in perms:
                 # a permuted block must be rewritten whole — a passthrough
                 # member would silently de-align it from its permuted peers
@@ -385,12 +467,27 @@ def main():
                 if base + suf in student:
                     pending[shard_of[base + suf]][base + suf] = student[base + suf]
             return
+        ov = match_override(overrides, base) if overrides else None
+        if ov is not None:
+            nb, ng = ov[0], ov[1] or gs
+            if in_dim % ng or (ng * nb) % 32:
+                raise SystemExit(f"[clip] --bits-override on {base}: "
+                                 f"{nb}b/gs{ng} does not divide in_dim "
+                                 f"{in_dim} into whole packed words")
+            if (nb, ng) != (bits, gs):
+                bits, gs = nb, ng
+                overridden[base] = {"bits": bits, "group_size": gs}
         if base in perms:
             pm, axis, _par = perms[base]
             sw = _apply_perm(sw, pm, axis, mx)
         q, s, b, drop, frac = clip_requantize(sw, gs, bits, ratios, sc.dtype,
                                               max_err_slack=a.max_err_slack)
-        assert q.shape == wq.shape and q.dtype == wq.dtype, base
+        if base in overridden:  # shapes legitimately differ from the student
+            assert q.shape[:-1] == wq.shape[:-1] \
+                and q.shape[-1] * 32 == bits * in_dim \
+                and q.dtype == wq.dtype, base
+        else:
+            assert q.shape == wq.shape and q.dtype == wq.dtype, base
         for suf, arr in ((".weight", q), (".scales", s), (".biases", b)):
             pending[shard_of[base + suf]][base + suf] = arr
         drops.append((drop, frac, base, bits))
@@ -425,6 +522,33 @@ def main():
     for f in Path(a.model).iterdir():  # config, tokenizer, index, ...
         if f.is_file() and not f.name.endswith(".safetensors"):
             shutil.copy2(f, out / f.name)
+
+    if overridden:
+        # per-module entries in the quantization config are how mlx-lm's
+        # loader learns non-default bits/gs (class_predicate returns the
+        # dict for matching module paths) — without this the output loads
+        # with the old shapes and fails
+        cfg_path = out / "config.json"
+        if not cfg_path.exists():
+            raise SystemExit("[clip] --bits-override: no config.json in the "
+                             "student dir — cannot record per-module "
+                             "quantization, the output would not load")
+        cfg = json.load(open(cfg_path))
+        patched = 0
+        for key in ("quantization", "quantization_config"):
+            q = cfg.get(key)
+            if isinstance(q, dict) and "bits" in q:
+                for mod, params in overridden.items():
+                    q[mod] = params
+                patched += 1
+        if not patched:
+            raise SystemExit("[clip] --bits-override: config.json has no "
+                             "quantization section to record overrides in")
+        with open(cfg_path, "w") as fh:
+            json.dump(cfg, fh, indent=2)
+        print(f"[clip] --bits-override: {len(overridden)} tensors requantized "
+              "at overridden precision; per-module entries written to "
+              "config.json", file=sys.stderr)
 
     for base, reason in skipped:
         print(f"[clip] skipped {base}: {reason}", file=sys.stderr)
