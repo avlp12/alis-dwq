@@ -26,6 +26,15 @@ def test_extract_answer_case_and_negatives():
     assert extract_answer("no marker at all, though 42 appears") is None
 
 
+def test_extract_answer_formatting_tolerance():
+    # thousands grouping and markdown emphasis are formatting, not wrongness
+    assert extract_answer("ANSWER: 52,432") == 52432
+    assert extract_answer("ANSWER: **12,000**") == 12000
+    assert extract_answer("ANSWER: `233`") == 233
+    # prose after a bare number still parses the number itself
+    assert extract_answer("ANSWER: 52, which concludes the proof") == 52
+
+
 def test_grade_reason():
     assert grade_reason("steps...\nANSWER: 233", 233)
     assert not grade_reason("steps...\nANSWER: 234", 233)

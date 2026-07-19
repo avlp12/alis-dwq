@@ -22,8 +22,11 @@ test = ["pytest"]
 [tool.setuptools]
 packages = ["alis_dwq"]
 
+[tool.setuptools.package-data]
+alis_dwq = ["data/*.jsonl"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
-    "device: needs a real model on Apple Silicon (excluded in CI)",
+    "device: needs a real model on Apple Silicon (excluded in CI; no tests carry it yet)",
 ]

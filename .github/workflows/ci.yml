@@ -15,7 +15,7 @@ jobs:
           python-version: "3.11"
       # mlx ships Linux CPU wheels — the numpy-reference selftests, the
       # provenance/manifest logic, and small synthetic quantize runs all
-      # execute without Apple Silicon; model-loading paths are marked
-      # `device` and excluded here
+      # execute without Apple Silicon; model-loading tests, when added, are
+      # marked `device` and excluded here (none exist yet)
       - run: pip install "mlx[cpu]" -e ".[test]"
       - run: pytest -m "not device" -q
