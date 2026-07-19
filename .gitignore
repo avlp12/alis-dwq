@@ -9,3 +9,4 @@ data/*.txt
 # per-run event logs (alis_dwq.provenance)
 alis_runs/
 *.egg-info/
+build/
