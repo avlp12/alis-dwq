@@ -872,6 +872,18 @@ class TargetContractTests(unittest.TestCase):
                     text_dataset_factory=FakeTextDataset,
                 )
 
+    def test_json_loader_rejects_duplicate_keys_and_nonfinite_numbers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "contract.json"
+            for raw, message in (
+                ('{"schema":"one","schema":"two"}\n', "duplicate JSON key"),
+                ('{"value":NaN}\n', "non-finite JSON number"),
+            ):
+                with self.subTest(raw=raw):
+                    path.write_text(raw)
+                    with self.assertRaisesRegex(ValueError, message):
+                        target_contract.load_json(path)
+
 
 if __name__ == "__main__":
     unittest.main()

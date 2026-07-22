@@ -99,10 +99,15 @@ def _object_without_duplicates(pairs):
     return value
 
 
+def _reject_nonfinite_json(value: str) -> None:
+    raise ValueError(f"non-finite JSON number: {value}")
+
+
 def load_json(path: Path) -> Any:
     return json.loads(
         Path(path).read_text(encoding="utf-8"),
         object_pairs_hook=_object_without_duplicates,
+        parse_constant=_reject_nonfinite_json,
     )
 
 

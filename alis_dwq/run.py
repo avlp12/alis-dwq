@@ -16,8 +16,10 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -31,6 +33,7 @@ from .io_utils import directory_digest, move_no_replace
 from .memory_guard import MemoryGuard, configure_recommended_wired_limit
 from .target_contract import (
     CONTRACT_NAME,
+    TOKENIZER_FILES,
     build_target_contract,
     load_json,
     numeric_target_files,
@@ -45,6 +48,44 @@ ALIS_DWQ_BASE_REVISION = "e68c8f708032bfc751d4393b3544c600572e0c16"
 MLX_LM_BASE_REVISION = "cf10f962b7a20e63a6df43dbf0faf06070153d40"
 TARGET_TOP_K = 1024
 DATA = Path(os.environ.get("ALIS_DWQ_DATA_DIR", "dwq_data")).expanduser()
+
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_TOKENIZER_RUNTIME_FILES = frozenset(TOKENIZER_FILES)
+_TOKENIZER_FILE_FIELDS = frozenset(
+    {
+        "added_tokens_file",
+        "chat_template_file",
+        "merges_file",
+        "sentencepiece_model_file",
+        "sp_model_file",
+        "special_tokens_map_file",
+        "tokenizer_file",
+        "vocab_file",
+    }
+)
+_KNOWN_TOKENIZER_FILES = _TOKENIZER_RUNTIME_FILES | {
+    "chat_template.json",
+    "chat_templates.json",
+    "merges.txt",
+    "sentencepiece.bpe.model",
+    "spiece.model",
+    "vocab.json",
+    "vocab.txt",
+}
+_JINJA_FILE_RE = re.compile(
+    r"{%[-+]?\s*(?:include|import|from)\s+(['\"])([^'\"]+)\1",
+    re.IGNORECASE,
+)
+
+
+@dataclass(frozen=True)
+class RuntimeTokenizerBundle:
+    source: Path
+    target_contract: Path
+    target_contract_sha256: str
+    files_sha256: dict[str, str]
+    files_bytes: dict[str, bytes]
+
 
 _TRACKED_ENV = (
     "ALIS_DWQ_RUN_ID",
@@ -85,6 +126,326 @@ _TARGET_CONTRACT_DIGEST: str | None = None
 _TARGET_CONTRACT_PATH: Path | None = None
 
 
+def _object_without_duplicates(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON key: {key!r}")
+        value[key] = item
+    return value
+
+
+def _reject_nonfinite_json(value: str) -> None:
+    raise ValueError(f"non-finite JSON number: {value}")
+
+
+def _load_json_bytes(raw: bytes, *, label: str) -> dict[str, Any]:
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"{label} is not UTF-8") from exc
+    try:
+        value = json.loads(
+            text,
+            object_pairs_hook=_object_without_duplicates,
+            parse_constant=_reject_nonfinite_json,
+        )
+    except (json.JSONDecodeError, ValueError) as exc:
+        raise ValueError(f"invalid {label}: {exc}") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} must be a JSON object")
+    return value
+
+
+def _sha256_bytes(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def _regular_file_bytes(path: Path, *, label: str) -> bytes:
+    if path.is_symlink() or not path.is_file():
+        raise ValueError(f"{label} is missing, not regular, or a symlink: {path}")
+    return path.read_bytes()
+
+
+def _safe_tokenizer_name(value: object, *, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value in {".", ".."}
+        or "/" in value
+        or "\\" in value
+        or value.startswith("._")
+        or Path(value).name != value
+    ):
+        raise ValueError(f"{label} is not a safe top-level file name: {value!r}")
+    return value
+
+
+def _is_tokenizer_related_name(name: str) -> bool:
+    candidate = name[2:] if name.startswith("._") else name
+    lower = candidate.lower()
+    return (
+        candidate in _KNOWN_TOKENIZER_FILES
+        or lower.startswith(
+            (
+                "added_token",
+                "chat_template",
+                "merges",
+                "sentencepiece",
+                "special_token",
+                "spiece",
+                "tokenizer",
+                "vocab",
+            )
+        )
+        or lower.endswith((".jinja", ".jinja2"))
+    )
+
+
+def _tokenizer_dependencies(files: Mapping[str, bytes]) -> set[str]:
+    config = _load_json_bytes(
+        files["tokenizer_config.json"], label="runtime tokenizer config"
+    )
+    dependencies = set()
+    for field in _TOKENIZER_FILE_FIELDS:
+        value = config.get(field)
+        if value is None:
+            continue
+        dependencies.add(
+            _safe_tokenizer_name(value, label=f"tokenizer config field {field!r}")
+        )
+
+    def scan_template(value: object) -> None:
+        if isinstance(value, str):
+            for match in _JINJA_FILE_RE.finditer(value):
+                dependencies.add(
+                    _safe_tokenizer_name(
+                        match.group(2), label="chat template dependency"
+                    )
+                )
+            if "{%" not in value and value.endswith((".jinja", ".jinja2")):
+                dependencies.add(
+                    _safe_tokenizer_name(value, label="chat template file")
+                )
+        elif isinstance(value, dict):
+            for nested in value.values():
+                scan_template(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                scan_template(nested)
+
+    scan_template(config.get("chat_template"))
+    for name, raw in files.items():
+        if not name.endswith((".jinja", ".jinja2")):
+            continue
+        try:
+            scan_template(raw.decode("utf-8"))
+        except UnicodeDecodeError as exc:
+            raise ValueError(
+                f"runtime tokenizer template is not UTF-8: {name}"
+            ) from exc
+    return dependencies
+
+
+def _validate_exact_tokenizer_files(
+    root: Path,
+    declared: Mapping[str, str],
+    *,
+    expected_bytes: Mapping[str, bytes] | None = None,
+    clean_root: bool,
+) -> dict[str, bytes]:
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError(f"runtime tokenizer root is missing or a symlink: {root}")
+    entries = list(root.iterdir())
+    apple_double = sorted(
+        path.name
+        for path in entries
+        if path.name.startswith("._")
+        and (clean_root or _is_tokenizer_related_name(path.name))
+    )
+    if apple_double:
+        raise ValueError(f"runtime tokenizer contains AppleDouble files: {apple_double}")
+    if clean_root:
+        observed = {path.name for path in entries}
+    else:
+        observed = {
+            path.name for path in entries if _is_tokenizer_related_name(path.name)
+        }
+    if observed != set(declared):
+        raise ValueError(
+            "runtime tokenizer file set differs from target contract: "
+            f"expected={sorted(declared)}, observed={sorted(observed)}"
+        )
+
+    files = {}
+    for name, expected_digest in declared.items():
+        raw = _regular_file_bytes(root / name, label=f"runtime tokenizer file {name}")
+        actual_digest = _sha256_bytes(raw)
+        if actual_digest != expected_digest:
+            raise ValueError(
+                f"runtime tokenizer hash mismatch for {name}: "
+                f"{actual_digest} != {expected_digest}"
+            )
+        if expected_bytes is not None and raw != expected_bytes[name]:
+            raise ValueError(f"runtime tokenizer bytes changed during the run: {name}")
+        files[name] = raw
+
+    dependencies = _tokenizer_dependencies(files)
+    if not dependencies <= set(declared):
+        raise ValueError(
+            "runtime tokenizer references files outside the target contract: "
+            f"{sorted(dependencies - set(declared))}"
+        )
+    return files
+
+
+def _load_runtime_tokenizer_bundle(
+    source: Path, target_contract: Path
+) -> RuntimeTokenizerBundle:
+    source = Path(source).expanduser()
+    target_contract = Path(target_contract).expanduser()
+    if source.is_symlink() or not source.is_dir():
+        raise ValueError(f"runtime tokenizer source is missing or a symlink: {source}")
+    contract_raw = _regular_file_bytes(target_contract, label="target contract")
+    contract = _load_json_bytes(contract_raw, label="target contract")
+    if contract.get("schema") != "alis-dwq.targets/v1":
+        raise ValueError("target contract must use alis-dwq.targets/v1")
+
+    declared_value = contract.get("tokenizer_files_sha256")
+    if not isinstance(declared_value, dict):
+        raise ValueError("target contract lacks tokenizer_files_sha256")
+    declared = {}
+    for raw_name, digest in declared_value.items():
+        name = _safe_tokenizer_name(raw_name, label="target tokenizer file")
+        if name not in _TOKENIZER_RUNTIME_FILES:
+            raise ValueError(f"unsupported target tokenizer file: {name}")
+        if not isinstance(digest, str) or _SHA256_RE.fullmatch(digest) is None:
+            raise ValueError(f"invalid target tokenizer SHA-256 for {name}")
+        declared[name] = digest
+    if not {"tokenizer.json", "tokenizer_config.json"} <= set(declared):
+        raise ValueError("target tokenizer file set is incomplete")
+
+    equivalence = contract.get("tokenizer_equivalence")
+    if equivalence is not None and (
+        not isinstance(equivalence, dict)
+        or equivalence.get("schema") != "alis-dwq.tokenizer-equivalence/v1"
+        or equivalence.get("mode")
+        not in {"file-identity", "all-declared-row-token-ids"}
+        or equivalence.get("all_rows_verified") is not True
+        or equivalence.get("runtime_tokenizer_files_sha256") != declared
+    ):
+        raise ValueError("target tokenizer equivalence evidence is invalid")
+
+    source_resolved = source.resolve(strict=True)
+    contract_resolved = target_contract.resolve(strict=True)
+    files = _validate_exact_tokenizer_files(
+        source_resolved, declared, clean_root=True
+    )
+    return RuntimeTokenizerBundle(
+        source=source_resolved,
+        target_contract=contract_resolved,
+        target_contract_sha256=_sha256_bytes(contract_raw),
+        files_sha256=dict(sorted(declared.items())),
+        files_bytes=files,
+    )
+
+
+def _revalidate_runtime_tokenizer_bundle(bundle: RuntimeTokenizerBundle) -> None:
+    contract_raw = _regular_file_bytes(bundle.target_contract, label="target contract")
+    if _sha256_bytes(contract_raw) != bundle.target_contract_sha256:
+        raise RuntimeError("target contract changed during the run")
+    _load_json_bytes(contract_raw, label="target contract")
+    _validate_exact_tokenizer_files(
+        bundle.source,
+        bundle.files_sha256,
+        expected_bytes=bundle.files_bytes,
+        clean_root=True,
+    )
+
+
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _materialize_frozen_runtime_tokenizer(
+    root: Path, bundle: RuntimeTokenizerBundle
+) -> None:
+    for name, raw in bundle.files_bytes.items():
+        destination = root / name
+        with destination.open("xb") as handle:
+            handle.write(raw)
+            handle.flush()
+            os.fsync(handle.fileno())
+    _fsync_directory(root)
+    _validate_exact_tokenizer_files(
+        root,
+        bundle.files_sha256,
+        expected_bytes=bundle.files_bytes,
+        clean_root=True,
+    )
+
+
+def _remove_generated_tokenizer_files(root: Path) -> None:
+    for path in root.iterdir():
+        if not _is_tokenizer_related_name(path.name):
+            continue
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"generated tokenizer path is not a regular file: {path}")
+        path.unlink()
+
+
+def _remove_generated_appledouble(destination: Path) -> None:
+    sidecar = destination.with_name(f"._{destination.name}")
+    if not sidecar.exists() and not sidecar.is_symlink():
+        return
+    if sidecar.is_symlink() or not sidecar.is_file():
+        raise ValueError(f"generated AppleDouble path is not a regular file: {sidecar}")
+    sidecar.unlink()
+
+
+def _install_runtime_tokenizer(
+    root: Path, bundle: RuntimeTokenizerBundle
+) -> dict[str, str]:
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError(f"DWQ staging root is missing or a symlink: {root}")
+    _revalidate_runtime_tokenizer_bundle(bundle)
+    _remove_generated_tokenizer_files(root)
+    for name, raw in bundle.files_bytes.items():
+        destination = root / name
+        with destination.open("xb") as handle:
+            handle.write(raw)
+            handle.flush()
+            os.fsync(handle.fileno())
+        _remove_generated_appledouble(destination)
+    _fsync_directory(root)
+    _revalidate_installed_runtime_tokenizer(root, bundle)
+    return dict(sorted(bundle.files_sha256.items()))
+
+
+def _revalidate_installed_runtime_tokenizer(
+    root: Path, bundle: RuntimeTokenizerBundle
+) -> None:
+    _revalidate_runtime_tokenizer_bundle(bundle)
+    output = _validate_exact_tokenizer_files(
+        root,
+        bundle.files_sha256,
+        expected_bytes=bundle.files_bytes,
+        clean_root=False,
+    )
+    if output != bundle.files_bytes:
+        raise RuntimeError("runtime tokenizer output differs from frozen bytes")
+
+
+def _option_count(values: list[str], name: str) -> int:
+    return sum(
+        str(value) == name or str(value).startswith(f"{name}=") for value in values
+    )
+
+
 def _parse_run_context(argv=None, environ=None) -> dict[str, Any]:
     environ = os.environ if environ is None else environ
     parser = argparse.ArgumentParser(add_help=False)
@@ -92,6 +453,8 @@ def _parse_run_context(argv=None, environ=None) -> dict[str, Any]:
     parser.add_argument("--quantized-model")
     parser.add_argument("--mlx-path", default="mlx_model")
     parser.add_argument("--target-dir")
+    parser.add_argument("--runtime-tokenizer-source")
+    parser.add_argument("--target-contract")
     parser.add_argument("--targets-only", action="store_true")
     parser.add_argument("--pipeline", action="store_true")
     parser.add_argument("--num-samples", type=int, default=2048)
@@ -101,6 +464,9 @@ def _parse_run_context(argv=None, environ=None) -> dict[str, Any]:
     values = list(sys.argv if argv is None else argv)
     if values and not str(values[0]).startswith("-"):
         values = values[1:]
+    for option in ("--runtime-tokenizer-source", "--target-contract"):
+        if _option_count(values, option) > 1:
+            raise ValueError(f"{option} may be supplied exactly once")
     args, _ = parser.parse_known_args(values)
     if not args.model:
         raise ValueError("--model is required")
@@ -108,6 +474,21 @@ def _parse_run_context(argv=None, environ=None) -> dict[str, Any]:
         raise ValueError("contracted ALIS-DWQ runs require --seed > 0")
     if not args.target_dir:
         raise ValueError("contracted ALIS-DWQ runs require --target-dir")
+    if bool(args.runtime_tokenizer_source) != bool(args.target_contract):
+        raise ValueError(
+            "--runtime-tokenizer-source and --target-contract must be supplied together"
+        )
+    target_dir = Path(args.target_dir).expanduser()
+    runtime_tokenizer_source = None
+    target_contract = None
+    if args.runtime_tokenizer_source:
+        runtime_tokenizer_source = Path(args.runtime_tokenizer_source).expanduser()
+        target_contract = Path(args.target_contract).expanduser()
+        expected_contract = target_dir / CONTRACT_NAME
+        if os.path.abspath(target_contract) != os.path.abspath(expected_contract):
+            raise ValueError(
+                "--target-contract must be exactly --target-dir/target-contract.json"
+            )
     if args.pipeline:
         raise ValueError(
             "contracted ALIS-DWQ runs do not support --pipeline: per-rank "
@@ -128,7 +509,10 @@ def _parse_run_context(argv=None, environ=None) -> dict[str, Any]:
             Path(args.quantized_model).expanduser() if args.quantized_model else None
         ),
         "mlx_path": Path(args.mlx_path).expanduser(),
-        "target_dir": Path(args.target_dir).expanduser() if args.target_dir else None,
+        "target_dir": target_dir,
+        "runtime_tokenizer_source": runtime_tokenizer_source,
+        "target_contract": target_contract,
+        "tokenizer_path": runtime_tokenizer_source or Path(args.model).expanduser(),
         "targets_only": bool(args.targets_only),
         "pipeline": bool(args.pipeline),
         "lora_rank": lora_rank,
@@ -348,7 +732,7 @@ def _load_local(
     train, valid, binding = prepare_local_data(
         tokenizer,
         context["data_dir"],
-        tokenizer_path=context["model"],
+        tokenizer_path=context["tokenizer_path"],
         num_samples=num_samples,
         num_valid_samples=context["num_valid_samples"],
         max_seq_length=max_seq_length,
@@ -751,7 +1135,8 @@ def _validate_live_data_binding(context: Mapping[str, Any], binding: dict) -> No
             raise RuntimeError("calibration manifest appeared during the run")
     else:
         raise RuntimeError("calibration manifest binding kind changed during the run")
-    if tokenizer_files_sha256(context["model"]) != binding["tokenizer_files_sha256"]:
+    tokenizer_path = context.get("tokenizer_path", context["model"])
+    if tokenizer_files_sha256(tokenizer_path) != binding["tokenizer_files_sha256"]:
         raise RuntimeError("tokenizer artifacts changed during the run")
 
 
@@ -850,10 +1235,26 @@ def _reserve_memory_evidence_path(final_path: str | Path | None) -> Path | None:
 
 
 def _upstream_argv(argv: list[str], *, mlx_path: Path | None) -> list[str]:
-    """Return a complete argv with upstream writes redirected to staging."""
+    """Strip wrapper-only flags and redirect upstream writes to staging."""
     values = list(argv)
     if not values or str(values[0]).startswith("-"):
         values.insert(0, "alis_dwq.run")
+    wrapper_options = {"--runtime-tokenizer-source", "--target-contract"}
+    stripped = [values[0]]
+    index = 1
+    while index < len(values):
+        value = str(values[index])
+        if value in wrapper_options:
+            if index + 1 >= len(values):
+                raise ValueError(f"{value} requires a value")
+            index += 2
+            continue
+        if any(value.startswith(f"{option}=") for option in wrapper_options):
+            index += 1
+            continue
+        stripped.append(values[index])
+        index += 1
+    values = stripped
     if mlx_path is None:
         return values
     replacement = str(mlx_path)
@@ -877,6 +1278,13 @@ def _upstream_argv(argv: list[str], *, mlx_path: Path | None) -> list[str]:
     return values
 
 
+def _frozen_tokenizer_loader(original, frozen_root: Path):
+    def load(_requested_path, *args, **kwargs):
+        return original(str(frozen_root), *args, **kwargs)
+
+    return load
+
+
 def main(argv=None) -> None:
     global _ACTIVE_DATA_BINDING, _RUN_CONTEXT
     global _TARGET_CONTRACT_DIGEST, _TARGET_CONTRACT_PATH
@@ -885,6 +1293,12 @@ def main(argv=None) -> None:
     _TARGET_CONTRACT_DIGEST = None
     _TARGET_CONTRACT_PATH = None
     _RUN_CONTEXT = _parse_run_context(raw_argv)
+    runtime_tokenizer = None
+    if _RUN_CONTEXT["runtime_tokenizer_source"] is not None:
+        runtime_tokenizer = _load_runtime_tokenizer_bundle(
+            _RUN_CONTEXT["runtime_tokenizer_source"],
+            _RUN_CONTEXT["target_contract"],
+        )
     start = _started_payload(argv=raw_argv, environ=os.environ, cwd=Path.cwd())
     run_id = start["run_id"]
     group = mx.distributed.init()
@@ -899,6 +1313,8 @@ def main(argv=None) -> None:
     diagnostic = False
     pre_digest = None
     artifact_staging = None
+    frozen_tokenizer_dir = None
+    previous_load_tokenizer = None
     try:
         if group.rank() == 0:
             _reserve_memory_evidence_path(
@@ -914,6 +1330,17 @@ def main(argv=None) -> None:
             raise RuntimeError(
                 "contracted local data loader is unavailable; set "
                 "ALIS_DWQ_DATA_DIR to an existing directory before launching"
+            )
+        if runtime_tokenizer is not None:
+            frozen_tokenizer_dir = tempfile.TemporaryDirectory(
+                prefix="alis-dwq-runtime-tokenizer-"
+            )
+            frozen_root = Path(frozen_tokenizer_dir.name)
+            _materialize_frozen_runtime_tokenizer(frozen_root, runtime_tokenizer)
+            _RUN_CONTEXT["tokenizer_path"] = frozen_root
+            previous_load_tokenizer = D.load_tokenizer
+            D.load_tokenizer = _frozen_tokenizer_loader(
+                previous_load_tokenizer, frozen_root
             )
         target_dir = _RUN_CONTEXT["target_dir"]
         target_state = _target_dir_state(
@@ -956,6 +1383,12 @@ def main(argv=None) -> None:
                 raise
         finally:
             sys.argv = previous_argv
+            if previous_load_tokenizer is not None:
+                D.load_tokenizer = previous_load_tokenizer
+                previous_load_tokenizer = None
+
+        if runtime_tokenizer is not None:
+            _revalidate_runtime_tokenizer_bundle(runtime_tokenizer)
 
         target_path = _TARGET_CONTRACT_PATH
         target_digest = _TARGET_CONTRACT_DIGEST
@@ -963,6 +1396,13 @@ def main(argv=None) -> None:
             raise RuntimeError(
                 "completed run has no target contract verified by the contracted "
                 "local loader or target transaction"
+            )
+        if runtime_tokenizer is not None and (
+            target_path.resolve(strict=True) != runtime_tokenizer.target_contract
+            or target_digest != runtime_tokenizer.target_contract_sha256
+        ):
+            raise RuntimeError(
+                "verified target contract does not match runtime tokenizer binding"
             )
         if _ACTIVE_DATA_BINDING is None:
             raise RuntimeError("completed run has no live calibration-data binding")
@@ -988,6 +1428,8 @@ def main(argv=None) -> None:
 
         if artifact_staging is None or not artifact_staging.is_dir():
             raise RuntimeError("DWQ did not produce its reserved staging directory")
+        if runtime_tokenizer is not None:
+            _install_runtime_tokenizer(artifact_staging, runtime_tokenizer)
 
         if diagnostic:
             _write_artifact_status_no_replace(
@@ -997,6 +1439,10 @@ def main(argv=None) -> None:
                 completion_kind="diagnostic_partial",
                 target_contract_digest=target_digest,
             )
+            if runtime_tokenizer is not None:
+                _revalidate_installed_runtime_tokenizer(
+                    artifact_staging, runtime_tokenizer
+                )
             final_digest = directory_digest(artifact_staging)
             move_no_replace(artifact_staging, _RUN_CONTEXT["mlx_path"])
             recorder.publish_incomplete(
@@ -1019,6 +1465,10 @@ def main(argv=None) -> None:
             completion_kind="dwq_training",
             target_contract_digest=target_digest,
         )
+        if runtime_tokenizer is not None:
+            _revalidate_installed_runtime_tokenizer(
+                artifact_staging, runtime_tokenizer
+            )
         final_digest = directory_digest(artifact_staging)
         move_no_replace(artifact_staging, _RUN_CONTEXT["mlx_path"])
         recorder.publish(
@@ -1044,6 +1494,11 @@ def main(argv=None) -> None:
             )
         )
         raise
+    finally:
+        if previous_load_tokenizer is not None:
+            D.load_tokenizer = previous_load_tokenizer
+        if frozen_tokenizer_dir is not None:
+            frozen_tokenizer_dir.cleanup()
 
 
 if __name__ == "__main__":

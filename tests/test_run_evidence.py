@@ -12,6 +12,34 @@ from alis_dwq.memory_guard import emit_evidence
 
 
 class RunEvidenceTests(unittest.TestCase):
+    def _runtime_tokenizer_fixture(self, root: Path):
+        source = root / "runtime-tokenizer"
+        targets = root / "targets"
+        source.mkdir()
+        targets.mkdir()
+        files = {
+            "tokenizer.json": b'{"version": "1.0"}\n',
+            "tokenizer_config.json": b'{"tokenizer_file": "tokenizer.json"}\n',
+        }
+        for name, raw in files.items():
+            (source / name).write_bytes(raw)
+        hashes = {
+            name: hashlib.sha256(raw).hexdigest() for name, raw in files.items()
+        }
+        contract = {
+            "schema": "alis-dwq.targets/v1",
+            "tokenizer_files_sha256": hashes,
+            "tokenizer_equivalence": {
+                "schema": "alis-dwq.tokenizer-equivalence/v1",
+                "mode": "file-identity",
+                "all_rows_verified": True,
+                "runtime_tokenizer_files_sha256": hashes,
+            },
+        }
+        contract_path = targets / "target-contract.json"
+        contract_path.write_text(json.dumps(contract, sort_keys=True) + "\n")
+        return source, targets, contract_path, files, contract
+
     def test_run_started_environment_binds_generated_run_id(self):
         environ = {}
         with mock.patch.object(run, "_code_provenance", return_value={}):
@@ -138,6 +166,246 @@ class RunEvidenceTests(unittest.TestCase):
             with self.assertRaises(FileExistsError):
                 run.move_no_replace(staging, final)
             self.assertEqual((final / "sentinel").read_text(), "preserve\n")
+
+    def test_runtime_tokenizer_flags_are_paired_exact_and_hidden_from_upstream(self):
+        base = [
+            "alis_dwq.run",
+            "--model",
+            "/model",
+            "--target-dir",
+            "/targets",
+            "--seed",
+            "7",
+        ]
+        with self.assertRaisesRegex(ValueError, "must be supplied together"):
+            run._parse_run_context(
+                [*base, "--runtime-tokenizer-source", "/tokenizer"]
+            )
+        with self.assertRaisesRegex(ValueError, "exactly --target-dir"):
+            run._parse_run_context(
+                [
+                    *base,
+                    "--runtime-tokenizer-source",
+                    "/tokenizer",
+                    "--target-contract",
+                    "/other/target-contract.json",
+                ]
+            )
+        with self.assertRaisesRegex(ValueError, "exactly once"):
+            run._parse_run_context(
+                [
+                    *base,
+                    "--runtime-tokenizer-source=/one",
+                    "--runtime-tokenizer-source=/two",
+                    "--target-contract=/targets/target-contract.json",
+                ]
+            )
+
+        wrapped = [
+            *base,
+            "--runtime-tokenizer-source=/tokenizer",
+            "--target-contract",
+            "/targets/target-contract.json",
+            "--mlx-path",
+            "/final",
+        ]
+        context = run._parse_run_context(wrapped)
+        self.assertEqual(context["runtime_tokenizer_source"], Path("/tokenizer"))
+        upstream = run._upstream_argv(wrapped, mlx_path=Path("/staging"))
+        self.assertFalse(any("runtime-tokenizer-source" in value for value in upstream))
+        self.assertFalse(any("target-contract" in value for value in upstream))
+        self.assertEqual(upstream[upstream.index("--mlx-path") + 1], "/staging")
+
+    def test_runtime_tokenizer_bundle_is_frozen_and_installed_byte_exact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, _, contract_path, files, _ = self._runtime_tokenizer_fixture(root)
+            bundle = run._load_runtime_tokenizer_bundle(source, contract_path)
+
+            frozen = root / "frozen"
+            frozen.mkdir()
+            run._materialize_frozen_runtime_tokenizer(frozen, bundle)
+            calls = []
+
+            def fake_loader(path, **kwargs):
+                calls.append((Path(path), kwargs))
+                return "tokenizer"
+
+            loader = run._frozen_tokenizer_loader(fake_loader, frozen)
+            self.assertEqual(loader("ignored", local_files_only=True), "tokenizer")
+            self.assertEqual(calls, [(frozen, {"local_files_only": True})])
+
+            output = root / "owned.partial-run"
+            output.mkdir()
+            (output / "model.safetensors").write_bytes(b"weights")
+            (output / "config.json").write_text("{}\n")
+            (output / "tokenizer.json").write_bytes(b"generated")
+            (output / "tokenizer_config.json").write_bytes(b"generated")
+            (output / "vocab.json").write_bytes(b"generated")
+            (output / "._tokenizer.json").write_bytes(b"AppleDouble")
+
+            installed = run._install_runtime_tokenizer(output, bundle)
+            self.assertEqual(installed, bundle.files_sha256)
+            for name, raw in files.items():
+                self.assertEqual((output / name).read_bytes(), raw)
+            self.assertFalse((output / "vocab.json").exists())
+            self.assertFalse((output / "._tokenizer.json").exists())
+            self.assertTrue((output / "model.safetensors").is_file())
+            self.assertTrue((output / "config.json").is_file())
+
+            (source / "tokenizer.json").write_bytes(b"mutated")
+            with self.assertRaisesRegex(ValueError, "hash mismatch|bytes changed"):
+                run._revalidate_runtime_tokenizer_bundle(bundle)
+
+    def test_runtime_tokenizer_preflight_rejects_ambiguous_inputs(self):
+        cases = ("duplicate-contract", "nonfinite-contract", "symlink", "appledouble", "extra", "dependency")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                source, _, contract_path, _, contract = self._runtime_tokenizer_fixture(
+                    root
+                )
+                if case == "duplicate-contract":
+                    contract_path.write_text(
+                        '{"schema":"alis-dwq.targets/v1",'
+                        '"schema":"alis-dwq.targets/v1"}\n'
+                    )
+                elif case == "nonfinite-contract":
+                    contract["invalid"] = float("nan")
+                    contract_path.write_text(json.dumps(contract) + "\n")
+                elif case == "symlink":
+                    path = source / "tokenizer.json"
+                    real = source / "real-tokenizer.json"
+                    path.rename(real)
+                    path.symlink_to(real.name)
+                elif case == "appledouble":
+                    (source / "._tokenizer.json").write_bytes(b"metadata")
+                elif case == "extra":
+                    (source / "README.txt").write_text("not part of the bundle\n")
+                elif case == "dependency":
+                    config = b'{"vocab_file": "vocab.json"}\n'
+                    (source / "tokenizer_config.json").write_bytes(config)
+                    digest = hashlib.sha256(config).hexdigest()
+                    contract["tokenizer_files_sha256"]["tokenizer_config.json"] = digest
+                    contract["tokenizer_equivalence"][
+                        "runtime_tokenizer_files_sha256"
+                    ]["tokenizer_config.json"] = digest
+                    contract_path.write_text(json.dumps(contract) + "\n")
+                with self.assertRaises(ValueError):
+                    run._load_runtime_tokenizer_bundle(source, contract_path)
+
+    def test_fake_upstream_output_is_replaced_before_digest_and_completion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, targets, contract_path, files, _ = self._runtime_tokenizer_fixture(
+                root
+            )
+            teacher = root / "teacher"
+            student = root / "student"
+            output = root / "output"
+            teacher.mkdir()
+            student.mkdir()
+            (teacher / "model.safetensors").write_bytes(b"teacher")
+            (student / "model.safetensors").write_bytes(b"student")
+            argv = [
+                "alis_dwq.run",
+                "--model",
+                str(teacher),
+                "--quantized-model",
+                str(student),
+                "--target-dir",
+                str(targets),
+                "--runtime-tokenizer-source",
+                str(source),
+                "--target-contract",
+                str(contract_path),
+                "--mlx-path",
+                str(output),
+                "--seed",
+                "7",
+            ]
+            sequence = []
+            loaded_from = []
+            target_digest = hashlib.sha256(contract_path.read_bytes()).hexdigest()
+
+            class Recorder:
+                def record(self, payload):
+                    sequence.append("record")
+
+                def publish(self, payload):
+                    sequence.append("publish")
+
+                def publish_incomplete(self, payload):
+                    sequence.append("publish-incomplete")
+
+            def fake_tokenizer_loader(path, *args, **kwargs):
+                del args, kwargs
+                loaded_from.append(Path(path))
+                return object()
+
+            def fake_upstream():
+                sequence.append("upstream")
+                self.assertFalse(
+                    any("runtime-tokenizer-source" in value for value in run.sys.argv)
+                )
+                self.assertFalse(any("target-contract" in value for value in run.sys.argv))
+                staging = Path(run.sys.argv[run.sys.argv.index("--mlx-path") + 1])
+                (staging / "model.safetensors").write_bytes(b"dwq")
+                (staging / "config.json").write_text("{}\n")
+                (staging / "tokenizer.json").write_bytes(b"generated")
+                (staging / "tokenizer_config.json").write_bytes(b"generated")
+                (staging / "vocab.json").write_bytes(b"generated")
+                run.D.load_tokenizer("requested-model")
+                run._ACTIVE_DATA_BINDING = {}
+                run._TARGET_CONTRACT_PATH = contract_path
+                run._TARGET_CONTRACT_DIGEST = target_digest
+
+            real_install = run._install_runtime_tokenizer
+
+            def ordered_install(staging, bundle):
+                sequence.append("install")
+                return real_install(staging, bundle)
+
+            def validate(*args, **kwargs):
+                del args, kwargs
+                sequence.append("validate")
+
+            group = mock.Mock()
+            group.rank.return_value = 0
+            group.size.return_value = 1
+            with (
+                mock.patch.object(run.mx.distributed, "init", return_value=group),
+                mock.patch.object(run.D, "load_data", run._load_local),
+                mock.patch.object(run.D, "load_tokenizer", fake_tokenizer_loader),
+                mock.patch.object(run.D, "main", side_effect=fake_upstream),
+                mock.patch.object(run, "_target_dir_state", return_value="reuse"),
+                mock.patch.object(run, "_install_runtime_tokenizer", side_effect=ordered_install),
+                mock.patch.object(run, "_validate_completion_inputs", side_effect=validate),
+                mock.patch.object(run, "_RunEvidenceRecorder", return_value=Recorder()),
+                mock.patch.object(
+                    run,
+                    "_started_payload",
+                    return_value={"run_id": "runtime-tokenizer-test"},
+                ),
+            ):
+                run.main(argv)
+
+            self.assertEqual(
+                sequence,
+                ["record", "upstream", "validate", "install", "publish"],
+            )
+            self.assertEqual(len(loaded_from), 1)
+            self.assertNotEqual(loaded_from[0], source)
+            self.assertFalse(loaded_from[0].exists())
+            for name, raw in files.items():
+                self.assertEqual((output / name).read_bytes(), raw)
+            self.assertFalse((output / "vocab.json").exists())
+            self.assertEqual(
+                json.loads((output / "alis-dwq-run-status.json").read_text())[
+                    "target_contract_digest"
+                ],
+                target_digest,
+            )
 
     def test_completed_evidence_is_exactly_two_no_clobber_events(self):
         with tempfile.TemporaryDirectory() as directory:
