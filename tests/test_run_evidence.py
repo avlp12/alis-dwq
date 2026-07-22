@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest import mock
 
 from alis_dwq import run
-from alis_dwq.memory_guard import emit_evidence
+from alis_dwq.memory_guard import MemoryLimitExceeded, emit_evidence
 
 
 class RunEvidenceTests(unittest.TestCase):
@@ -405,6 +405,121 @@ class RunEvidenceTests(unittest.TestCase):
                     "target_contract_digest"
                 ],
                 target_digest,
+            )
+
+    def test_laguna_student_load_stop_retains_partial_and_restores_patches(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            teacher = root / "teacher"
+            student = root / "student"
+            targets = root / "targets"
+            output = root / "output"
+            for checkpoint in (teacher, student):
+                checkpoint.mkdir()
+                (checkpoint / "model.safetensors").write_bytes(b"weights")
+                (checkpoint / "config.json").write_text(
+                    json.dumps({"model_type": "laguna"}) + "\n"
+                )
+            targets.mkdir()
+            sequence = []
+            state = {}
+            captured = {}
+
+            class Recorder:
+                def record(self, _payload):
+                    sequence.append("record")
+
+                def publish(self, _payload):
+                    raise AssertionError("a stopped run must not publish completion")
+
+                def publish_incomplete(self, _payload):
+                    sequence.append("publish-incomplete")
+                    state["restored_during_failure"] = (
+                        run.D.load is state["original_load"]
+                        and run.D.dwq_quantize is state["original_quantizer"]
+                    )
+
+            class Guard:
+                def __init__(self, phase, recommended, **kwargs):
+                    sequence.append(("guard", phase, recommended))
+                    captured.update(kwargs)
+
+                def start(self):
+                    sequence.append("start")
+
+                def check(self, checkpoint, **context):
+                    sequence.append(("check", checkpoint, context.get("model_role")))
+                    if checkpoint == "after-upstream-model-load":
+                        raise MemoryLimitExceeded(
+                            {"event": "memory_stop_gate", "checkpoint": checkpoint}
+                        )
+
+            def fake_load(path, *_args, **_kwargs):
+                sequence.append(("load", Path(path)))
+                return object(), object(), {"quantization": {}}
+
+            def fake_upstream():
+                sequence.append("upstream")
+                run.D.load(str(student), lazy=True, return_config=True)
+                self.fail("student load stop must prevent DWQ training")
+
+            argv = [
+                "alis_dwq.run",
+                "--model",
+                str(teacher),
+                "--quantized-model",
+                str(student),
+                "--target-dir",
+                str(targets),
+                "--mlx-path",
+                str(output),
+                "--seed",
+                "7",
+            ]
+            group = mock.Mock()
+            group.rank.return_value = 0
+            group.size.return_value = 1
+            with (
+                mock.patch.object(run.mx.distributed, "init", return_value=group),
+                mock.patch.object(run.D, "load_data", run._load_local),
+                mock.patch.object(run.D, "load", side_effect=fake_load) as original_load,
+                mock.patch.object(run.D, "dwq_quantize") as original_quantizer,
+                mock.patch.object(run.D, "main", side_effect=fake_upstream),
+                mock.patch.object(run, "_target_dir_state", return_value="reuse"),
+                mock.patch.object(run, "_RunEvidenceRecorder", return_value=Recorder()),
+                mock.patch.object(
+                    run,
+                    "_started_payload",
+                    return_value={"run_id": "memory-stop-test"},
+                ),
+                mock.patch.object(
+                    run,
+                    "configure_recommended_wired_limit",
+                    side_effect=lambda phase: sequence.append(("wired", phase))
+                    or 1_000,
+                ),
+                mock.patch.object(run, "MemoryGuard", Guard),
+            ):
+                state["original_load"] = original_load
+                state["original_quantizer"] = original_quantizer
+                with self.assertRaises(MemoryLimitExceeded):
+                    run.main(argv)
+
+            self.assertTrue(state["restored_during_failure"])
+            self.assertTrue(captured["require_recommended_working_set"])
+            self.assertTrue(captured["require_swap_measurement"])
+            self.assertEqual(captured["limits"].max_peak_fraction, 0.90)
+            self.assertIn(
+                ("check", "before-upstream-model-load", "student"), sequence
+            )
+            self.assertIn(
+                ("check", "after-upstream-model-load", "student"), sequence
+            )
+            self.assertIn("publish-incomplete", sequence)
+            self.assertFalse(output.exists())
+            self.assertEqual(
+                list(root.glob("output.partial-memory-stop-test-*")),
+                [root / f"output.partial-memory-stop-test-{os.getpid()}"],
             )
 
     def test_completed_evidence_is_exactly_two_no_clobber_events(self):
