@@ -204,6 +204,10 @@ pre-DWQ checkpoint, target contract, and final artifact digests.
 The launcher exclusively reserves `ALIS_DWQ_MEMORY_EVIDENCE_PATH` before any
 model or checkpoint work as well, so every run must use a new memory JSONL and
 cannot append to evidence from an earlier attempt.
+Validation and round-decision lines on stderr record binary64 metrics with 17
+significant digits. This preserves the exact `rv > best` rollback ordering for
+receipt verification; the live training progress display remains rounded to
+four decimal places for readability.
 The student is saved into a run-owned sibling staging directory and published
 to `--mlx-path` only by an atomic no-replace move, so concurrent runs cannot
 mix or overwrite shards.

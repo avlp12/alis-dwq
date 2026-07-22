@@ -45,6 +45,16 @@ _LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
 _ROUTER_RE = re.compile(r"(?:^|\.)(?:gate|router)$")
 
 
+def _format_validation_metric(value):
+    """Format a binary64 validation metric without losing its ordering."""
+
+    # Seventeen significant decimal digits round-trip every finite Python
+    # float.  Receipt tooling uses these stable text lines to independently
+    # re-evaluate the raw ``rv > best`` rollback decision, so this must not be
+    # shortened to the four-decimal progress-display precision.
+    return format(value, ".17g")
+
+
 def _is_router(name, m):
     return (
         _ROUTER_RE.search(name) is not None
@@ -344,7 +354,10 @@ def layerwise_dwq_quantize(
             v_tok += ntoks.item()
             v_loss += loss.item() * ntoks.item()
         loss = v_loss / v_tok
-        print(f"[alis-dwq][valid] {tag}: {loss:.4f}", file=sys.stderr)
+        print(
+            f"[alis-dwq][valid] {tag}: {_format_validation_metric(loss)}",
+            file=sys.stderr,
+        )
         return loss
 
     model.freeze()
@@ -468,21 +481,27 @@ def layerwise_dwq_quantize(
             model.update(snapshot)
             print(
                 f"[alis-dwq][round {r + 1}/{len(rounds)}] REVERTED"
-                f" ({rv:.4f} > best {best:.4f})",
+                f" ({_format_validation_metric(rv)} > best "
+                f"{_format_validation_metric(best)})",
                 file=sys.stderr,
             )
             # cka_prev unchanged: the rollback restored exactly that state
         else:
             best = rv
             print(
-                f"[alis-dwq][round {r + 1}/{len(rounds)}] ACCEPTED {rv:.4f}",
+                f"[alis-dwq][round {r + 1}/{len(rounds)}] ACCEPTED "
+                f"{_format_validation_metric(rv)}",
                 file=sys.stderr,
             )
             if cka_post is not None:
                 cka_prev = cka_post  # next round drifts against the kept state
 
     model.freeze()
-    print(f"[alis-dwq] valid {init:.4f} -> {best:.4f}", file=sys.stderr)
+    print(
+        f"[alis-dwq] valid {_format_validation_metric(init)} -> "
+        f"{_format_validation_metric(best)}",
+        file=sys.stderr,
+    )
     if lora_cfg is not None:
         _save_adapters(
             model, lora_cfg, os.environ.get("ALIS_DWQ_ADAPTER_DIR", "alis_adapters")
