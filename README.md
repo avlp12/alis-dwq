@@ -19,6 +19,11 @@ Measured on the 745B case: **OOM at step 0 → stable training at ~334 GB peak**
 
 Works on **stock mlx-lm ≥ 0.31** (the layerwise trainer ships here as a patch module; upstream PR [ml-explore/mlx-lm#1499](https://github.com/ml-explore/mlx-lm/pull/1499) adds `--layers-per-round` natively — once merged you can use either path).
 
+For a current large-MoE example with mixed full/sliding caches, strict router
+exclusions, precomputed-target verification, and separate compact and
+quality-first release arms, see the
+[Laguna S 2.1 recipe](examples/laguna-s-2.1/README.md).
+
 ```bash
 git clone https://github.com/avlp12/alis-dwq && cd alis-dwq
 pip install mlx-lm  # >= 0.31
@@ -47,7 +52,21 @@ Add `--norms` (experimental) to also accumulate each selected expert's output L2
 
 ### 1. Build a calibration mix (optional but recommended)
 
-`dwq_data/train.jsonl` + `valid.jsonl`, one `{"text": ...}` per line. Language mix matters: low-bit damage concentrates in the model's non-English mass (we measured ZH slices 1.4–3.9× worse than EN on two different MoE families); a ~45% target-language mix is what recovered it. Without `ALIS_DWQ_DATA_DIR`, mlx-lm's default `--data-path` loader is used.
+`dwq_data/train.jsonl` + `valid.jsonl`, one `{"text": ...}` per line. A
+`manifest.json` is strongly recommended; when present, its exact bytes and any
+declared `tokenizer_files_sha256` are enforced. Without one, the launcher binds
+a derived manifest made from the two JSONL hashes. Language mix matters: low-bit
+damage concentrates in the model's non-English mass (we measured ZH slices
+1.4–3.9× worse than EN on two different MoE families); a ~45% target-language
+mix is what recovered it. Without `ALIS_DWQ_DATA_DIR`, mlx-lm's default
+`--data-path` loader is used and release-grade target contracts are unavailable.
+
+Raw `{"text": ...}` rows use mlx-lm's normal `TextDataset` processing. If every
+row already contains the exact chat-template output, set
+`ALIS_DWQ_TEXT_TOKENIZATION=preformatted_chat`; this uses
+`add_special_tokens=False`, appends no EOS, and hashes the final truncated token
+IDs. Use the same mode for target creation and training. Contracted local runs
+require a positive seed.
 
 Two hygiene rules from [Unsloth Dynamic 2.0](https://unsloth.ai/docs/basics/unsloth-dynamic-2.0-ggufs)'s methodology notes: **(a) keep calibration and evaluation corpora disjoint** — calibrating on wikitext-like data while gating ships on wikitext PPL overfits the quant to the gate (our held-out gates are wikitext-heavy; check the mix before trusting a small win); **(b) instruct/thinking models should be calibrated through their chat template** — raw text misses the serving token distribution (`gen_calib --chat-template` does this).
 
@@ -72,8 +91,17 @@ MLX's affine mode maps each group's exact min/max onto the grid ends, so one out
 ```bash
 python -m alis_dwq.clip_quantize \
   --source <bf16/fp16 dump, or a Q8 dump with --dequantize-source> \
-  --model <student> --out <student-clip> --max-err-slack 1.1
+  --model <student> --out <student-clip> --max-err-slack 1.1 \
+  --require-no-skips
 ```
+
+The transaction always binds both canonical input-directory digests and
+recomputes them before publication to detect mutation during lazy-mmap
+processing. When Laguna conversion plans are present, both are required and
+their plan hashes and pinned lineage must match: the source must be the
+unquantized `bf16-mlx-layout` recipe and the student must be quantized,
+unclipped, and pre-DWQ. Generic MLX inputs without Laguna plans retain the
+original digest-bound workflow and the numeric lattice guards below.
 
 Tries a few clipped ranges per group and accepts one only when it lowers the group MSE **without raising the group's max abs error beyond `--max-err-slack`×** the unclipped grid's (unclipped is always a candidate). Per-tensor bits/group_size are inferred from shapes, so dynamic recipes pass through untouched. **Run it before DWQ, never after**: DWQ trains scales/biases with the packed codes frozen, and re-deciding the codes is exactly what clipping adds (it would also discard an existing DWQ, since everything is recomputed from `--source`).
 
@@ -102,22 +130,48 @@ python -m alis_dwq.run \
   --num-samples 145 --max-seq-length 512 --batch-size 1 --seed 7
 ```
 
-### 2b. Teacher too big for one box → distributed dump
+The dump is written to a sibling staging directory and published only after
+all batches and `target-contract.json` are complete. The contract binds the
+data-manifest hash, tokenizer files, teacher identity/revision/checkpoint
+digest, selected row hashes, final token IDs, actual length-sorted/seeded batch
+order, and every target checksum. A later run recomputes all live bindings
+before loading a model and rejects partial, reordered, or replaced targets.
+Creation and reuse also validate safetensor keys and metadata, the exact
+pad-to-32 batch/sequence shape used by pinned mlx-lm, finiteness, nonzero
+payloads, integer indices, per-token top-k uniqueness, and vocabulary bounds on
+CPU. Release workflows must
+still retain a standalone numeric-target manifest for independent receipt
+verification.
 
-The dump is forward-only, so it pipelines across N Macs — each box loads only its layer range's shards:
+To backfill this contract beside an older complete dump without touching any
+numeric target file:
 
 ```bash
-mlx.launch --hosts <box1>,<box2> --backend ring \
-  --env ALIS_DWQ_DATA_DIR=<identical-path>/dwq_data \
-  --python <venv>/bin/python \
-  examples/distributed_dump_entry.py \
-  --model <local teacher dir> --targets-only --pipeline --target-dir ./targets \
-  --num-samples 145 --max-seq-length 512 --batch-size 1 --seed 7
+python -m alis_dwq.target_contract \
+  --data-dir ./dwq_data --tokenizer <teacher-or-identical-tokenizer> \
+  --teacher-checkpoint <teacher-checkpoint> --target-dir ./targets \
+  --teacher-identity <repo-or-stable-id> --teacher-revision <immutable-revision> \
+  --num-samples 145 --num-valid-samples 32 --max-seq-length 512 \
+  --batch-size 1 --top-k 1024 --seed 7 \
+  --tokenization preformatted_chat
 ```
 
-`mlx.launch` takes a **script file** it can verify on every host — `-m alis_dwq.run` does not work — hence the 3-line [`examples/distributed_dump_entry.py`](examples/distributed_dump_entry.py). The calibration jsonl must be **byte-identical on every host** (hash it): each rank loads its own copy, and the shared seed only aligns the permutation if the rows match.
+The helper uses exclusive creation and refuses an existing sidecar.
 
-Point `--model` at a **local** teacher dir on each box (an HF repo id makes every box re-download). Split by the pipeline's own layer assignment — it snaps to DSA "full"-layer boundaries so IndexShare never crosses a rank — and give each box its layers' shards **plus every globally-shared weight** (see below).
+### 2b. Distributed target dumps are not contracted
+
+`alis_dwq.run` deliberately rejects `--pipeline` and any multi-process target
+creation. A pipeline host sees only its local layer shards, so hashing rank 0's
+directory would falsely label a partial checkpoint as the complete teacher.
+Release-complete target evidence requires one process with the full checkpoint.
+[`examples/distributed_dump_entry.py`](examples/distributed_dump_entry.py) is
+retained only as a fail-closed legacy entrypoint; it does not bypass this
+provenance boundary.
+
+The notes below describe historical upstream pipeline debugging, not a supported
+ALIS target-contract recipe. A future distributed contract must aggregate every
+rank's owned-file manifest, prove completeness/no overlap, and bind every rank's
+runtime and code before this path can be re-enabled.
 
 Two gotchas cost us a full session on the first real distributed dump (790 GB 8-bit GLM-5.2 teacher across two 512 GB boxes; single-node teachers never hit this path). Both surface **identically** as `[METAL] Command buffer execution failed: GPU Timeout` on *one* rank even though the compute is fine — `eval_every`, wired-limit, and warmup are all red herrings. Diagnose by tracing per-layer (`mx.eval(h); print` after each layer, **both** ranks): you'll see one rank finish every layer while the other never enters its loop.
 
@@ -139,7 +193,29 @@ python -m alis_dwq.run \
 
 (`--model` only supplies the tokenizer when targets exist — point it at the student; the teacher's 400 GB never move again.)
 
-**Experimental — LoRA error compensators:** `ALIS_DWQ_LORA_RANK=8` wraps every quantized module in a LoRA adapter ([Recover-LoRA](https://arxiv.org/abs/2606.04238) recovered 80–95% of 2-bit damage; [MiLo](https://arxiv.org/abs/2504.02658) is the MoE variant) and trains adapters alongside scales/biases under the same rounds/rollback. This adds the degree of freedom scales/biases (a per-group linear remap) fundamentally lack — the main lever left for the ~2.3 bpw floor builds, and it may reopen sharper teachers for low-bit students (the sweet-spot failure was a student-capacity limit). Adapters are saved to `ALIS_DWQ_ADAPTER_DIR` (default `alis_adapters/`) in mlx-lm's `--adapter-path` format; **the saved checkpoint stays stock** — wrappers are removed before mlx-lm writes it. Never fuse adapters into a quantized base (fusing requantizes = re-rounds the codes).
+Memory stop gates are on by default for both target creation and training:
+90% of MLX's recommended wired working set and at most 16 GiB of added swap.
+They are checked after every target batch, training step, and validation step.
+Set `ALIS_DWQ_MAX_PEAK_FRACTION` or
+`ALIS_DWQ_MAX_SWAP_INCREASE_GIB` to a value `<= 0` only when intentionally
+disabling that gate, and retain the memory JSONL as evidence. Set
+`ALIS_DWQ_RUN_EVIDENCE_PATH` for a no-clobber two-event run JSONL that binds the
+pre-DWQ checkpoint, target contract, and final artifact digests.
+The launcher exclusively reserves `ALIS_DWQ_MEMORY_EVIDENCE_PATH` before any
+model or checkpoint work as well, so every run must use a new memory JSONL and
+cannot append to evidence from an earlier attempt.
+The student is saved into a run-owned sibling staging directory and published
+to `--mlx-path` only by an atomic no-replace move, so concurrent runs cannot
+mix or overwrite shards.
+Before completion the launcher revalidates persisted calibration/tokenizer
+files, all target semantics and hashes, and fresh teacher/pre-DWQ directory
+digests; long-run input drift therefore emits only incomplete failure evidence.
+
+`ALIS_DWQ_MAX_ROUNDS` and `ALIS_DWQ_MAX_STEPS_PER_ROUND` are diagnostic only.
+Such runs require `diagnostic` in `--mlx-path`, write an incomplete marker into
+the artifact, and never emit release-complete evidence.
+
+**Experimental — LoRA error compensators:** The layerwise implementation can wrap quantized modules in LoRA adapters ([Recover-LoRA](https://arxiv.org/abs/2606.04238); [MiLo](https://arxiv.org/abs/2504.02658)), but the contracted `alis_dwq.run` launcher currently rejects nonzero `ALIS_DWQ_LORA_RANK`. Its separately saved `ALIS_DWQ_ADAPTER_DIR` is not yet transactional or included in the final artifact digest, so emitting release-complete evidence would be false provenance. Re-enable it only after the adapter directory has its own no-clobber transaction and is bound into run completion. Never fuse adapters into a quantized base (fusing requantizes = re-rounds the codes).
 
 **Experimental — CKA drift monitor:** `ALIS_DWQ_CKA_MONITOR=1` reports per-round layerwise CKA between accepted states on a fixed valid batch (diagnostic only, ~2 extra forwards/round). Rationale: [CKA-QAD](https://arxiv.org/abs/2606.05682) showed KL-only distillation can degrade internal geometry *while outputs match* — the same valid-vs-held-out inversion we measured twice (8-bit-teacher 2.56 bpw arm; router-KD arm). A round that valid-KL accepts but that craters one layer's CKA is the signature to investigate before shipping. Reading tip: weight **early-layer** drift heaviest — routing is largely decided by the upstream residual stream ([pulsar](https://github.com/giannisanni/pulsar) prefetches by running layer N+1's router on layer N's input, and it works), so early-layer CKA drift is a routing-path damage signal for *every* layer downstream; it also explains why retraining router weights alone (router-KD) bought nothing.
 
@@ -239,14 +315,14 @@ Research and probe notes from scoping a sub-2.56-bpw GLM-5.2 build. The build ra
 
 ## Experimental features & rollback (v0.1 baseline)
 
-Three additions landed 2026-07-12, motivated by REAP / router-KD (0xSero GLM-5.2-504B). **All are opt-in and default-off — the default pipeline is byte-identical to the pre-change baseline**, preserved as branch [`backup/v0.1-pre-router-kd`](https://github.com/avlp12/alis-dwq/tree/backup/v0.1-pre-router-kd) (commit `27863a7`). Pin that branch if you need the exact prior behavior. Every experimental path announces itself with an `[EXPERIMENTAL]` banner on stderr, so any session/model log shows at a glance whether a build used them:
+Three additions landed 2026-07-12, motivated by REAP / router-KD (0xSero GLM-5.2-504B). The experimental training transforms remain opt-in and default-off. The current launcher is intentionally **not byte-identical** to the old baseline around I/O: memory gates, target contracts, no-clobber publication, and run evidence are now default safety behavior. The historical implementation is preserved as branch [`backup/v0.1-pre-router-kd`](https://github.com/avlp12/alis-dwq/tree/backup/v0.1-pre-router-kd) (commit `27863a7`). Every experimental path announces itself with an `[EXPERIMENTAL]` banner on stderr, so any session/model log shows at a glance whether a build used it:
 
 | Flag | Tool | What it adds | Off = |
 |---|---|---|---|
 | `ALIS_DWQ_TRAIN_ROUTERS=1` | DWQ (§3) | router gates train with scales/biases (router-KD) | scales/biases only |
 | `--norms` | `expert_traffic` (§0) | expert output-norm saliency (REAP proxy), busy-but-weak report | frequency only |
 | `--loop-probe N` | `eval_kld` (§4) | greedy degeneration probe per slice | KL/flip only |
-| `ALIS_DWQ_LORA_RANK=r` | DWQ (§3) | LoRA error compensators train with scales/biases; adapters saved separately | scales/biases only |
+| `ALIS_DWQ_LORA_RANK=r` | DWQ (§3) | rejected by the contracted launcher until the adapter artifact is bound | scales/biases only |
 | `ALIS_DWQ_CKA_MONITOR=1` | DWQ (§3) | per-round layerwise CKA drift report (diagnostic) | no report |
 | *(new tool)* | `code_entropy` (§1a) | effective-bpw / clip pre-scan from the student alone (`--per-expert`: damage-proxy saliency) | — |
 | *(new tool)* | `gen_calib` (§1) | synthetic calibration mix with expert-coverage stopping (`--chat-template`: serve-distribution calibration) | curated jsonl |
