@@ -20,6 +20,7 @@ class RunEvidenceTests(unittest.TestCase):
         files = {
             "tokenizer.json": b'{"version": "1.0"}\n',
             "tokenizer_config.json": b'{"tokenizer_file": "tokenizer.json"}\n',
+            "chat_template.jinja": b"{{ messages }}\n",
         }
         for name, raw in files.items():
             (source / name).write_bytes(raw)
@@ -28,10 +29,25 @@ class RunEvidenceTests(unittest.TestCase):
             "schema": "alis-dwq.targets/v1",
             "tokenizer_files_sha256": hashes,
             "tokenizer_equivalence": {
-                "schema": "alis-dwq.tokenizer-equivalence/v1",
+                "schema": "alis-dwq.tokenizer-equivalence/v2",
                 "mode": "file-identity",
-                "all_rows_verified": True,
+                "source_tokenizer_files_sha256": hashes,
+                "source_tokenizer_options": {"fix_mistral_regex": True},
                 "runtime_tokenizer_files_sha256": hashes,
+                "row_evidence": {
+                    "schema": "alis-dwq.tokenizer-row-equivalence/v1",
+                    "method": "live-runtime-tokenizer-encode/v1",
+                    "tokenization": {
+                        "name": "ALIS_DWQ_TEXT_TOKENIZATION=preformatted_chat",
+                        "preformatted_chat": True,
+                        "add_special_tokens": False,
+                        "append_eos": False,
+                    },
+                    "row_count": 220,
+                    "splits": {"train": {}, "valid": {}, "heldout": {}},
+                    "all_rows_verified": True,
+                },
+                "all_rows_verified": True,
             },
         }
         contract_path = targets / "target-contract.json"
@@ -384,8 +400,8 @@ class RunEvidenceTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            source, targets, contract_path, files, _ = self._runtime_tokenizer_fixture(
-                root
+            source, targets, contract_path, files, contract = (
+                self._runtime_tokenizer_fixture(root)
             )
             teacher = root / "teacher"
             student = root / "student"
@@ -468,6 +484,7 @@ class RunEvidenceTests(unittest.TestCase):
             def validate(*args, **kwargs):
                 del args, kwargs
                 sequence.append("validate")
+                return contract
 
             group = mock.Mock()
             group.rank.return_value = 0
@@ -511,6 +528,12 @@ class RunEvidenceTests(unittest.TestCase):
                     "target_contract_digest"
                 ],
                 target_digest,
+            )
+            self.assertEqual(
+                json.loads((output / "alis-dwq-run-status.json").read_text())[
+                    "target_contract_canonical_sha256"
+                ],
+                run.canonical_sha256(contract),
             )
 
     def test_laguna_student_load_stop_retains_partial_and_restores_patches(self):
@@ -1124,6 +1147,7 @@ class RunEvidenceTests(unittest.TestCase):
                 release_complete=False,
                 completion_kind="diagnostic_partial",
                 target_contract_digest="d" * 64,
+                target_contract_canonical_sha256="e" * 64,
             )
             incomplete = recorder.publish_incomplete(
                 run._completion_payload(
@@ -1142,6 +1166,8 @@ class RunEvidenceTests(unittest.TestCase):
             marker = json.loads(status.read_text())
             self.assertFalse(marker["release_complete"])
             self.assertEqual(marker["completion_kind"], "diagnostic_partial")
+            self.assertEqual(marker["target_contract_digest"], "d" * 64)
+            self.assertEqual(marker["target_contract_canonical_sha256"], "e" * 64)
 
     def test_diagnostic_limits_are_detected(self):
         self.assertFalse(run._diagnostic_enabled({}))

@@ -25,10 +25,14 @@ CONTRACT_NAME = "target-contract.json"
 TOKENIZER_FILES = (
     "tokenizer.json",
     "tokenizer_config.json",
-    "special_tokens_map.json",
     "chat_template.jinja",
-    "tokenizer.model",
     "added_tokens.json",
+    "merges.txt",
+    "sentencepiece.bpe.model",
+    "special_tokens_map.json",
+    "spiece.model",
+    "tokenizer.model",
+    "vocab.json",
 )
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _PREFORMATTED_CONTRACT = {
@@ -38,9 +42,30 @@ _PREFORMATTED_CONTRACT = {
     "append_eos": False,
 }
 _TOKEN_ID_HASH_SCHEMA = "sha256-canonical-json-token-ids/v1"
-_TOKENIZER_EQUIVALENCE_SCHEMA = "alis-dwq.tokenizer-equivalence/v1"
+_TOKENIZER_EQUIVALENCE_SCHEMA = "alis-dwq.tokenizer-equivalence/v2"
+_TOKENIZER_ROW_EQUIVALENCE_SCHEMA = "alis-dwq.tokenizer-row-equivalence/v1"
+_TOKENIZER_ROW_EQUIVALENCE_METHOD = "live-runtime-tokenizer-encode/v1"
 _LAGUNA_SOURCE_TOKENIZER_OPTIONS = {"fix_mistral_regex": True}
 _LAGUNA_SPLIT_COUNTS = {"train": 80, "valid": 40, "heldout": 100}
+_LAGUNA_RUNTIME_TOKENIZER_REQUIRED_FILES = frozenset(
+    {"tokenizer.json", "tokenizer_config.json", "chat_template.jinja"}
+)
+_TOKENIZER_FILE_FIELDS = frozenset(
+    {
+        "added_tokens_file",
+        "chat_template_file",
+        "merges_file",
+        "sentencepiece_model_file",
+        "sp_model_file",
+        "special_tokens_map_file",
+        "tokenizer_file",
+        "vocab_file",
+    }
+)
+_JINJA_FILE_RE = re.compile(
+    r"{%[-+]?\s*(?:include|import|from)\s+(['\"])([^'\"]+)\1",
+    re.IGNORECASE,
+)
 _TARGET_PAD_TO = 32
 _SAFETENSOR_DTYPES = {
     "F16": (2, "<u2"),
@@ -121,6 +146,103 @@ def tokenizer_files_sha256(tokenizer_path: Path) -> dict[str, str]:
     if not hashes:
         raise ValueError(f"no tokenizer artifacts found in {root}")
     return hashes
+
+
+def _safe_tokenizer_dependency(value: object, *, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value in {".", ".."}
+        or "/" in value
+        or "\\" in value
+        or value.startswith("._")
+        or Path(value).name != value
+    ):
+        raise ValueError(f"{label} is not a safe top-level tokenizer file: {value!r}")
+    if value not in TOKENIZER_FILES:
+        raise ValueError(f"{label} is not a supported tokenizer file: {value!r}")
+    return value
+
+
+def _laguna_runtime_tokenizer_files_sha256(tokenizer_path: Path) -> dict[str, str]:
+    """Bind exactly Laguna's required tokenizer files and live dependencies."""
+    root = Path(tokenizer_path).expanduser().resolve()
+    observed = {
+        name
+        for name in TOKENIZER_FILES
+        if (root / name).exists() or (root / name).is_symlink()
+    }
+    missing_required = _LAGUNA_RUNTIME_TOKENIZER_REQUIRED_FILES - observed
+    if missing_required:
+        raise ValueError(
+            "Laguna runtime tokenizer is missing required files: "
+            f"{sorted(missing_required)}"
+        )
+    for name in observed:
+        path = root / name
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(
+                f"Laguna runtime tokenizer file is missing, not regular, or a symlink: {name}"
+            )
+
+    config = load_json(root / "tokenizer_config.json")
+    if not isinstance(config, dict):
+        raise ValueError("Laguna runtime tokenizer_config.json must be an object")
+    dependencies: set[str] = set()
+    for field in _TOKENIZER_FILE_FIELDS:
+        value = config.get(field)
+        if value is None:
+            continue
+        dependencies.add(
+            _safe_tokenizer_dependency(
+                value, label=f"Laguna tokenizer config field {field!r}"
+            )
+        )
+
+    def scan_template(value: object) -> None:
+        if isinstance(value, str):
+            for match in _JINJA_FILE_RE.finditer(value):
+                dependencies.add(
+                    _safe_tokenizer_dependency(
+                        match.group(2), label="Laguna tokenizer Jinja dependency"
+                    )
+                )
+            if "{%" not in value and value.endswith((".jinja", ".jinja2")):
+                dependencies.add(
+                    _safe_tokenizer_dependency(
+                        value, label="Laguna tokenizer template file"
+                    )
+                )
+        elif isinstance(value, dict):
+            for nested in value.values():
+                scan_template(nested)
+        elif isinstance(value, list):
+            for nested in value:
+                scan_template(nested)
+
+    scan_template(config.get("chat_template"))
+    for name in sorted(observed):
+        if not name.endswith((".jinja", ".jinja2")):
+            continue
+        try:
+            scan_template((root / name).read_text(encoding="utf-8"))
+        except UnicodeDecodeError as exc:
+            raise ValueError(
+                f"Laguna runtime tokenizer template is not UTF-8: {name}"
+            ) from exc
+
+    required_and_referenced = _LAGUNA_RUNTIME_TOKENIZER_REQUIRED_FILES | dependencies
+    if not required_and_referenced <= observed:
+        missing = sorted(required_and_referenced - observed)
+        raise ValueError(
+            "Laguna runtime tokenizer file set must contain required files plus "
+            f"declared dependencies: missing={missing}"
+        )
+    # Every supported adjacent tokenizer file is part of the runtime contract,
+    # even when tokenizer_config.json does not reference it explicitly.  This
+    # keeps later release verification from accepting an unbound tokenizer
+    # sidecar that can change loading behavior.
+    return {name: sha256_file(root / name) for name in sorted(observed)}
 
 
 def _tokenizer_vocab_size(tokenizer, tokenizer_path: Path) -> int:
@@ -319,22 +441,17 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
                 not isinstance(declared_token_hash, str)
                 or _SHA256_RE.fullmatch(declared_token_hash) is None
             ):
-                raise ValueError(
-                    f"{path}:{line_number}: invalid token_ids_sha256"
-                )
+                raise ValueError(f"{path}:{line_number}: invalid token_ids_sha256")
             declared_token_count = row.get("eval_sequence_tokens")
             if declared_token_count is not None and (
                 type(declared_token_count) is not int or declared_token_count < 0
             ):
-                raise ValueError(
-                    f"{path}:{line_number}: invalid eval_sequence_tokens"
-                )
+                raise ValueError(f"{path}:{line_number}: invalid eval_sequence_tokens")
             rows.append(
                 {
                     "row": row,
                     "jsonl_line_sha256": hashlib.sha256(stripped).hexdigest(),
-                    "raw_sha256": declared_raw
-                    or hashlib.sha256(stripped).hexdigest(),
+                    "raw_sha256": declared_raw or hashlib.sha256(stripped).hexdigest(),
                 }
             )
     return rows
@@ -371,12 +488,10 @@ def _validate_declared_token_bindings(
     tokenizer,
     *,
     tokenization: str,
-) -> dict[str, dict[str, Any]]:
+) -> dict[str, Any]:
     """Fail early for Laguna manifests whose persisted token claims drift."""
     if manifest.get("chat_template") != "Laguna-S-2.1 local tokenizer":
-        raise ValueError(
-            "Laguna format-v2 manifest has an unexpected chat_template"
-        )
+        raise ValueError("Laguna format-v2 manifest has an unexpected chat_template")
     declared_contract = manifest.get("tokenization_contract")
     if declared_contract != _PREFORMATTED_CONTRACT:
         raise ValueError(
@@ -431,37 +546,69 @@ def _validate_declared_token_bindings(
             "Laguna format-v2 data must contain exactly 80 train, 40 valid, "
             "and 100 heldout rows"
         )
-    verified_splits = {}
+    evidence_splits = {}
     for split in ("train", "valid", "heldout"):
-        ordered_hashes = []
+        rows = []
+        source_ordered_hashes = []
+        runtime_ordered_hashes = []
         for data_index, entry in enumerate(source[split]):
             text = entry["row"]["text"]
-            token_ids = [
-                int(token)
-                for token in tokenizer.encode(text, add_special_tokens=False)
+            runtime_token_ids = [
+                int(token) for token in tokenizer.encode(text, add_special_tokens=False)
             ]
-            token_hash = canonical_sha256(token_ids)
-            if entry["row"].get("token_ids_sha256") != token_hash:
-                raise ValueError(
-                    f"{split} row {data_index} token_ids_sha256 mismatch"
-                )
-            if entry["row"].get("eval_sequence_tokens") != len(token_ids):
+            source_token_hash = entry["row"].get("token_ids_sha256")
+            source_token_count = entry["row"].get("eval_sequence_tokens")
+            runtime_token_hash = canonical_sha256(runtime_token_ids)
+            runtime_token_count = len(runtime_token_ids)
+            if source_token_hash != runtime_token_hash:
+                raise ValueError(f"{split} row {data_index} token_ids_sha256 mismatch")
+            if source_token_count != runtime_token_count:
                 raise ValueError(
                     f"{split} row {data_index} eval_sequence_tokens mismatch"
                 )
-            ordered_hashes.append(token_hash)
-        expected = {
+            row = {
+                "data_index": data_index,
+                "jsonl_line_sha256": entry["jsonl_line_sha256"],
+                "raw_sha256": entry["raw_sha256"],
+                "source_token_ids_sha256": source_token_hash,
+                "runtime_token_ids_sha256": runtime_token_hash,
+                "source_token_count": source_token_count,
+                "runtime_token_count": runtime_token_count,
+            }
+            rows.append(row)
+            source_ordered_hashes.append(source_token_hash)
+            runtime_ordered_hashes.append(runtime_token_hash)
+        source_ordered_digest = canonical_sha256(source_ordered_hashes)
+        runtime_ordered_digest = canonical_sha256(runtime_ordered_hashes)
+        expected_manifest_split = {
             "row_count": len(source[split]),
-            "ordered_token_ids_sha256": canonical_sha256(ordered_hashes),
+            "ordered_token_ids_sha256": source_ordered_digest,
         }
-        if summary["splits"].get(split) != expected:
+        if summary["splits"].get(split) != expected_manifest_split:
             raise ValueError(f"data manifest {split} token_id_hashes mismatch")
-        verified_splits[split] = expected
-    return verified_splits
+        if source_ordered_digest != runtime_ordered_digest:
+            raise ValueError(f"{split} source/runtime ordered token IDs mismatch")
+        evidence_splits[split] = {
+            "row_count": len(rows),
+            "rows": rows,
+            "source_ordered_token_ids_sha256": source_ordered_digest,
+            "runtime_ordered_token_ids_sha256": runtime_ordered_digest,
+            "rows_sha256": canonical_sha256(rows),
+        }
+    return {
+        "schema": _TOKENIZER_ROW_EQUIVALENCE_SCHEMA,
+        "method": _TOKENIZER_ROW_EQUIVALENCE_METHOD,
+        "tokenization": dict(_PREFORMATTED_CONTRACT),
+        "row_count": sum(row["row_count"] for row in evidence_splits.values()),
+        "splits": evidence_splits,
+        "all_rows_verified": True,
+    }
 
 
 def _is_laguna_format_v2_manifest(manifest: dict[str, Any]) -> bool:
-    return type(manifest.get("format_version")) is int and manifest["format_version"] == 2
+    return (
+        type(manifest.get("format_version")) is int and manifest["format_version"] == 2
+    )
 
 
 def prepare_local_data(
@@ -481,33 +628,37 @@ def prepare_local_data(
     if seed <= 0:
         raise ValueError("contracted local data requires --seed > 0")
     if num_samples <= 0 or max_seq_length <= 1:
-        raise ValueError("num_samples must be positive and max_seq_length must exceed 1")
+        raise ValueError(
+            "num_samples must be positive and max_seq_length must exceed 1"
+        )
     if tokenization not in {"text_dataset", "preformatted_chat"}:
         raise ValueError(
-            "ALIS_DWQ_TEXT_TOKENIZATION must be 'text_dataset' or "
-            "'preformatted_chat'"
+            "ALIS_DWQ_TEXT_TOKENIZATION must be 'text_dataset' or 'preformatted_chat'"
         )
 
     manifest = _manifest_binding(data_dir)
     source = {
-        split: _read_jsonl(data_dir / f"{split}.jsonl")
-        for split in ("train", "valid")
+        split: _read_jsonl(data_dir / f"{split}.jsonl") for split in ("train", "valid")
     }
     laguna_format_v2 = _is_laguna_format_v2_manifest(manifest["manifest"])
-    verified_token_splits = None
+    row_evidence = None
     if laguna_format_v2:
         source["heldout"] = _read_jsonl(data_dir / "heldout.jsonl")
-        verified_token_splits = _validate_declared_token_bindings(
+        row_evidence = _validate_declared_token_bindings(
             manifest["manifest"], source, tokenizer, tokenization=tokenization
         )
     datasets = {
         split: text_dataset_factory([entry["row"] for entry in entries], tokenizer)
         for split, entries in source.items()
     }
-    train_indices = np.random.RandomState(seed).permutation(len(source["train"]))[
-        :num_samples
-    ].tolist()
-    requested_valid = len(source["valid"]) if num_valid_samples <= 0 else num_valid_samples
+    train_indices = (
+        np.random.RandomState(seed)
+        .permutation(len(source["train"]))[:num_samples]
+        .tolist()
+    )
+    requested_valid = (
+        len(source["valid"]) if num_valid_samples <= 0 else num_valid_samples
+    )
     selected = {
         "train": train_indices,
         "valid": list(range(min(requested_valid, len(source["valid"])))),
@@ -530,9 +681,7 @@ def prepare_local_data(
             declared_hash = entry["row"].get("token_ids_sha256")
             live_full_hash = canonical_sha256(full_token_ids)
             if declared_hash is not None and declared_hash != live_full_hash:
-                raise ValueError(
-                    f"{split} row {data_index} token_ids_sha256 mismatch"
-                )
+                raise ValueError(f"{split} row {data_index} token_ids_sha256 mismatch")
             declared_count = entry["row"].get("eval_sequence_tokens")
             if declared_count is not None and declared_count != len(full_token_ids):
                 raise ValueError(
@@ -553,14 +702,20 @@ def prepare_local_data(
             )
         split_bindings[split] = {"selected_rows": bound_rows}
 
-    tokenizer_hashes = tokenizer_files_sha256(tokenizer_path)
+    tokenizer_hashes = (
+        _laguna_runtime_tokenizer_files_sha256(tokenizer_path)
+        if laguna_format_v2
+        else tokenizer_files_sha256(tokenizer_path)
+    )
     declared_tokenizer = manifest["manifest"].get("tokenizer_files_sha256")
     if (
         declared_tokenizer is not None
         and declared_tokenizer != tokenizer_hashes
         and not laguna_format_v2
     ):
-        raise ValueError("data manifest tokenizer_files_sha256 differs from live tokenizer")
+        raise ValueError(
+            "data manifest tokenizer_files_sha256 differs from live tokenizer"
+        )
     binding = {
         "data_manifest_kind": manifest["data_manifest_kind"],
         "data_manifest_sha256": manifest["data_manifest_sha256"],
@@ -581,7 +736,7 @@ def prepare_local_data(
             "source_tokenizer_files_sha256": dict(declared_tokenizer),
             "source_tokenizer_options": dict(_LAGUNA_SOURCE_TOKENIZER_OPTIONS),
             "runtime_tokenizer_files_sha256": dict(tokenizer_hashes),
-            "verified_splits": verified_token_splits,
+            "row_evidence": row_evidence,
             "all_rows_verified": True,
         }
     return output["train"], output["valid"], binding
@@ -639,7 +794,9 @@ def build_target_contract(
         ordered_batches = _ordered_selected_indices(
             selected_rows, batch_size=batch_size, seed=seed
         )
-        expected_names = [f"{index:010d}.safetensors" for index in range(len(ordered_batches))]
+        expected_names = [
+            f"{index:010d}.safetensors" for index in range(len(ordered_batches))
+        ]
         split_dir = target_dir / split
         if split_dir.is_symlink() or not split_dir.is_dir():
             raise ValueError(f"target split directory must not be a symlink: {split}")
@@ -657,15 +814,12 @@ def build_target_contract(
             if target_path.is_symlink():
                 raise ValueError(f"target file must not be a symlink: {target_file}")
             max_token_count = max(
-                selected_rows[selected_index]["token_count"]
-                for selected_index in batch
+                selected_rows[selected_index]["token_count"] for selected_index in batch
             )
             padded_length = 1 + _TARGET_PAD_TO * (
                 (max_token_count + _TARGET_PAD_TO - 1) // _TARGET_PAD_TO
             )
-            expected_sequence_length = min(
-                padded_length, max_seq_length
-            ) - 1
+            expected_sequence_length = min(padded_length, max_seq_length) - 1
             validate_target_safetensors(
                 target_path,
                 batch_size=batch_size,
@@ -675,9 +829,7 @@ def build_target_contract(
                 vocab_size=binding["vocab_size"],
             )
             target_sha256 = sha256_file(target_path)
-            files.append(
-                {"target_file": target_file, "target_sha256": target_sha256}
-            )
+            files.append({"target_file": target_file, "target_sha256": target_sha256})
             for batch_position, selected_index in enumerate(batch):
                 source = selected_rows[selected_index]
                 rows.append(
@@ -774,7 +926,9 @@ def validate_target_contract(
         raise ValueError(f"missing target contract: {path}")
     actual = load_json(path)
     if actual.get("schema") != SCHEMA:
-        raise ValueError(f"unsupported target contract schema: {actual.get('schema')!r}")
+        raise ValueError(
+            f"unsupported target contract schema: {actual.get('schema')!r}"
+        )
     teacher = actual.get("teacher")
     if not isinstance(teacher, dict):
         raise ValueError("target contract has no teacher identity")

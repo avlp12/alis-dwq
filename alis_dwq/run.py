@@ -40,6 +40,7 @@ from .target_contract import (
     CONTRACT_NAME,
     TOKENIZER_FILES,
     build_target_contract,
+    canonical_sha256,
     load_json,
     numeric_target_files,
     prepare_local_data,
@@ -336,17 +337,58 @@ def _load_runtime_tokenizer_bundle(
         if not isinstance(digest, str) or _SHA256_RE.fullmatch(digest) is None:
             raise ValueError(f"invalid target tokenizer SHA-256 for {name}")
         declared[name] = digest
-    if not {"tokenizer.json", "tokenizer_config.json"} <= set(declared):
+    if not {
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "chat_template.jinja",
+    } <= set(declared):
         raise ValueError("target tokenizer file set is incomplete")
 
     equivalence = contract.get("tokenizer_equivalence")
-    if equivalence is not None and (
+    row_evidence = (
+        equivalence.get("row_evidence") if isinstance(equivalence, dict) else None
+    )
+    if (
         not isinstance(equivalence, dict)
-        or equivalence.get("schema") != "alis-dwq.tokenizer-equivalence/v1"
+        or set(equivalence)
+        != {
+            "schema",
+            "mode",
+            "source_tokenizer_files_sha256",
+            "source_tokenizer_options",
+            "runtime_tokenizer_files_sha256",
+            "row_evidence",
+            "all_rows_verified",
+        }
+        or equivalence.get("schema") != "alis-dwq.tokenizer-equivalence/v2"
         or equivalence.get("mode")
         not in {"file-identity", "all-declared-row-token-ids"}
+        or equivalence.get("source_tokenizer_options") != {"fix_mistral_regex": True}
         or equivalence.get("all_rows_verified") is not True
         or equivalence.get("runtime_tokenizer_files_sha256") != declared
+        or not isinstance(row_evidence, dict)
+        or set(row_evidence)
+        != {
+            "schema",
+            "method",
+            "tokenization",
+            "row_count",
+            "splits",
+            "all_rows_verified",
+        }
+        or row_evidence.get("schema") != "alis-dwq.tokenizer-row-equivalence/v1"
+        or row_evidence.get("method") != "live-runtime-tokenizer-encode/v1"
+        or row_evidence.get("tokenization")
+        != {
+            "name": "ALIS_DWQ_TEXT_TOKENIZATION=preformatted_chat",
+            "preformatted_chat": True,
+            "add_special_tokens": False,
+            "append_eos": False,
+        }
+        or row_evidence.get("row_count") != 220
+        or row_evidence.get("all_rows_verified") is not True
+        or not isinstance(row_evidence.get("splits"), dict)
+        or set(row_evidence["splits"]) != {"train", "valid", "heldout"}
     ):
         raise ValueError("target tokenizer equivalence evidence is invalid")
 
@@ -1184,10 +1226,10 @@ def _validate_completion_inputs(
     *,
     target_contract_digest: str,
     pre_dwq_checkpoint_digest: str | None,
-) -> None:
+) -> dict[str, Any]:
     """Revalidate long-lived lazy-mmap inputs before completion evidence."""
     _validate_live_data_binding(context, binding)
-    _contract, live_target_digest = validate_target_contract(
+    contract, live_target_digest = validate_target_contract(
         binding,
         context["target_dir"],
         max_seq_length=context["max_seq_length"],
@@ -1217,6 +1259,7 @@ def _validate_completion_inputs(
         pre_dwq = context["quantized_model"] or context["model"]
         if live_digest(pre_dwq) != pre_dwq_checkpoint_digest:
             raise RuntimeError("pre-DWQ student checkpoint changed during the run")
+    return contract
 
 
 def _write_artifact_status_no_replace(
@@ -1226,6 +1269,7 @@ def _write_artifact_status_no_replace(
     release_complete: bool,
     completion_kind: str,
     target_contract_digest: str,
+    target_contract_canonical_sha256: str,
 ) -> Path:
     path = Path(artifact) / "alis-dwq-run-status.json"
     payload = {
@@ -1234,6 +1278,7 @@ def _write_artifact_status_no_replace(
         "release_complete": bool(release_complete),
         "completion_kind": completion_kind,
         "target_contract_digest": target_contract_digest,
+        "target_contract_canonical_sha256": target_contract_canonical_sha256,
     }
     with path.open("x", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
@@ -1690,12 +1735,13 @@ def main(argv=None) -> None:
             )
         if _ACTIVE_DATA_BINDING is None:
             raise RuntimeError("completed run has no live calibration-data binding")
-        _validate_completion_inputs(
+        completed_contract = _validate_completion_inputs(
             _RUN_CONTEXT,
             _ACTIVE_DATA_BINDING,
             target_contract_digest=target_digest,
             pre_dwq_checkpoint_digest=pre_digest,
         )
+        target_contract_canonical_sha256 = canonical_sha256(completed_contract)
 
         if _RUN_CONTEXT["targets_only"]:
             recorder.publish(
@@ -1706,6 +1752,7 @@ def main(argv=None) -> None:
                     completion_kind="target_dump",
                     target_contract_path=str(target_path.resolve()),
                     target_contract_digest=target_digest,
+                    target_contract_canonical_sha256=(target_contract_canonical_sha256),
                 )
             )
             return
@@ -1722,6 +1769,7 @@ def main(argv=None) -> None:
                 release_complete=False,
                 completion_kind="diagnostic_partial",
                 target_contract_digest=target_digest,
+                target_contract_canonical_sha256=(target_contract_canonical_sha256),
             )
             if runtime_tokenizer is not None:
                 _revalidate_installed_runtime_tokenizer(
@@ -1738,6 +1786,7 @@ def main(argv=None) -> None:
                     pre_dwq_checkpoint_digest=pre_digest,
                     target_contract_path=str(target_path.resolve()),
                     target_contract_digest=target_digest,
+                    target_contract_canonical_sha256=(target_contract_canonical_sha256),
                     final_artifact_digest=final_digest,
                 )
             )
@@ -1748,6 +1797,7 @@ def main(argv=None) -> None:
             release_complete=True,
             completion_kind="dwq_training",
             target_contract_digest=target_digest,
+            target_contract_canonical_sha256=target_contract_canonical_sha256,
         )
         if runtime_tokenizer is not None:
             _revalidate_installed_runtime_tokenizer(artifact_staging, runtime_tokenizer)
@@ -1762,6 +1812,7 @@ def main(argv=None) -> None:
                 pre_dwq_checkpoint_digest=pre_digest,
                 target_contract_path=str(target_path.resolve()),
                 target_contract_digest=target_digest,
+                target_contract_canonical_sha256=(target_contract_canonical_sha256),
                 final_artifact_digest=final_digest,
             )
         )
