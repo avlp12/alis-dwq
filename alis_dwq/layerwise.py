@@ -201,9 +201,11 @@ def layerwise_dwq_quantize(
 ):
     K = int(os.environ.get("ALIS_DWQ_LAYERS_PER_ROUND", "8"))
     memory_phase = "precomputed-target-training"
-    recommended = configure_recommended_wired_limit(memory_phase)
-    memory_guard = MemoryGuard(memory_phase, recommended)
-    memory_guard.start()
+    memory_guard = _ignored.pop("_alis_memory_guard", None)
+    if memory_guard is None:
+        recommended = configure_recommended_wired_limit(memory_phase)
+        memory_guard = MemoryGuard(memory_phase, recommended)
+        memory_guard.start()
     memory_guard.check("training-entry")
     extras_mode = os.environ.get("ALIS_DWQ_EXTRAS_MODE", "first").strip().lower()
     if extras_mode not in {"first", "skip"}:

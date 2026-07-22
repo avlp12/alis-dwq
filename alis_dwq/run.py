@@ -30,7 +30,11 @@ from mlx_lm.tuner.datasets import TextDataset
 
 from . import layerwise  # noqa: F401  (installs the layerwise patch)
 from .io_utils import directory_digest, move_no_replace
-from .memory_guard import MemoryGuard, configure_recommended_wired_limit
+from .memory_guard import (
+    MemoryGuard,
+    MemoryLimits,
+    configure_recommended_wired_limit,
+)
 from .target_contract import (
     CONTRACT_NAME,
     TOKENIZER_FILES,
@@ -122,6 +126,7 @@ _orig_compute = D.compute_dwq_targets
 _orig_iterate_batches = D.iterate_batches
 _RUN_CONTEXT: dict[str, Any] | None = None
 _ACTIVE_DATA_BINDING: dict[str, Any] | None = None
+_RUN_MEMORY_GUARD: MemoryGuard | None = None
 _TARGET_CONTRACT_DIGEST: str | None = None
 _TARGET_CONTRACT_PATH: Path | None = None
 
@@ -859,9 +864,22 @@ def _wired_compute(
     _distributed_barrier(group)
 
     phase = "target-computation"
-    recommended = configure_recommended_wired_limit(phase)
-    guard = MemoryGuard(phase, recommended)
-    guard.start()
+    guard = _RUN_MEMORY_GUARD
+    if guard is None:
+        strict_laguna = _is_guarded_laguna_context(_RUN_CONTEXT)
+        recommended = configure_recommended_wired_limit(phase)
+        guard = MemoryGuard(
+            phase,
+            recommended,
+            limits=(
+                MemoryLimits.guarded_laguna()
+                if strict_laguna
+                else MemoryLimits.from_env()
+            ),
+            require_recommended_working_set=strict_laguna,
+            require_swap_measurement=strict_laguna,
+        )
+        guard.start()
     guard.check("before-model-eval")
     mx.eval(model.parameters())
     guard.check("before-target-dump")
@@ -1285,11 +1303,89 @@ def _frozen_tokenizer_loader(original, frozen_root: Path):
     return load
 
 
+def _checkpoint_declares_laguna(root: Path | str | None) -> bool:
+    """Recognize a Laguna checkpoint without importing or loading its model."""
+    if root is None:
+        return False
+    root = Path(root).expanduser()
+    plan_path = root / "conversion_plan.json"
+    config_path = root / "config.json"
+    try:
+        if plan_path.is_file() and not plan_path.is_symlink():
+            plan = load_json(plan_path)
+            if (
+                isinstance(plan, dict)
+                and plan.get("schema_version") == "laguna.conversion/v2"
+                and plan.get("source_repo") == "poolside/Laguna-S-2.1"
+            ):
+                return True
+    except (OSError, UnicodeDecodeError, ValueError):
+        pass
+    try:
+        if config_path.is_file() and not config_path.is_symlink():
+            config = load_json(config_path)
+            return isinstance(config, dict) and config.get("model_type") == "laguna"
+    except (OSError, UnicodeDecodeError, ValueError):
+        pass
+    return False
+
+
+def _is_guarded_laguna_context(context: Mapping[str, Any] | None) -> bool:
+    if not context:
+        return False
+    return any(
+        _checkpoint_declares_laguna(context.get(key))
+        for key in ("quantized_model", "model")
+    )
+
+
+def _guarded_model_loader(original, guard: MemoryGuard, context: Mapping[str, Any]):
+    """Put the same pre-load baseline around upstream lazy model construction."""
+    student = context.get("quantized_model")
+    student_path = os.path.abspath(student) if student is not None else None
+
+    def load(model_path, *args, **kwargs):
+        observed = os.path.abspath(model_path)
+        role = (
+            "student"
+            if student_path is not None and observed == student_path
+            else "teacher"
+        )
+        guard.check(
+            "before-upstream-model-load",
+            model_role=role,
+            model_path=observed,
+        )
+        result = original(model_path, *args, **kwargs)
+        # Upstream uses lazy=True.  This checkpoint therefore covers mmap/model
+        # wiring; later training and target checkpoints cover materialization.
+        guard.check(
+            "after-upstream-model-load",
+            model_role=role,
+            model_path=observed,
+        )
+        return result
+
+    return load
+
+
+def _guarded_dwq_quantizer(original, guard: MemoryGuard):
+    def quantize(*args, **kwargs):
+        # This runs after student load (and after deepcopy/stock quantization
+        # when --quantized-model is omitted), but before the first DWQ step.
+        guard.check("before-upstream-dwq-training")
+        kwargs["_alis_memory_guard"] = guard
+        return original(*args, **kwargs)
+
+    return quantize
+
+
 def main(argv=None) -> None:
-    global _ACTIVE_DATA_BINDING, _RUN_CONTEXT
+    global _ACTIVE_DATA_BINDING, _RUN_CONTEXT, _RUN_MEMORY_GUARD
     global _TARGET_CONTRACT_DIGEST, _TARGET_CONTRACT_PATH
     raw_argv = list(sys.argv if argv is None else argv)
     _ACTIVE_DATA_BINDING = None
+    _RUN_MEMORY_GUARD = None
     _TARGET_CONTRACT_DIGEST = None
     _TARGET_CONTRACT_PATH = None
     _RUN_CONTEXT = _parse_run_context(raw_argv)
@@ -1315,6 +1411,8 @@ def main(argv=None) -> None:
     artifact_staging = None
     frozen_tokenizer_dir = None
     previous_load_tokenizer = None
+    previous_model_loader = None
+    previous_dwq_quantizer = None
     try:
         if group.rank() == 0:
             _reserve_memory_evidence_path(
@@ -1369,6 +1467,31 @@ def main(argv=None) -> None:
             pre_dwq = _RUN_CONTEXT["quantized_model"] or _RUN_CONTEXT["model"]
             pre_digest = directory_digest(pre_dwq)
 
+        strict_laguna = _is_guarded_laguna_context(_RUN_CONTEXT)
+        memory_phase = "upstream-dwq-bootstrap"
+        recommended = configure_recommended_wired_limit(memory_phase)
+        _RUN_MEMORY_GUARD = MemoryGuard(
+            memory_phase,
+            recommended,
+            limits=(
+                MemoryLimits.guarded_laguna()
+                if strict_laguna
+                else MemoryLimits.from_env()
+            ),
+            require_recommended_working_set=strict_laguna,
+            require_swap_measurement=strict_laguna,
+        )
+        _RUN_MEMORY_GUARD.start()
+        _RUN_MEMORY_GUARD.check("before-upstream-main")
+        previous_model_loader = D.load
+        D.load = _guarded_model_loader(
+            previous_model_loader, _RUN_MEMORY_GUARD, _RUN_CONTEXT
+        )
+        previous_dwq_quantizer = D.dwq_quantize
+        D.dwq_quantize = _guarded_dwq_quantizer(
+            previous_dwq_quantizer, _RUN_MEMORY_GUARD
+        )
+
         exit_code = None
         previous_argv = sys.argv
         try:
@@ -1377,6 +1500,7 @@ def main(argv=None) -> None:
                 mlx_path=artifact_staging,
             )
             D.main()
+            _RUN_MEMORY_GUARD.check("after-upstream-main")
         except SystemExit as exc:
             exit_code = exc.code
             if exit_code not in (None, 0):
@@ -1386,6 +1510,12 @@ def main(argv=None) -> None:
             if previous_load_tokenizer is not None:
                 D.load_tokenizer = previous_load_tokenizer
                 previous_load_tokenizer = None
+            if previous_model_loader is not None:
+                D.load = previous_model_loader
+                previous_model_loader = None
+            if previous_dwq_quantizer is not None:
+                D.dwq_quantize = previous_dwq_quantizer
+                previous_dwq_quantizer = None
 
         if runtime_tokenizer is not None:
             _revalidate_runtime_tokenizer_bundle(runtime_tokenizer)
@@ -1497,6 +1627,11 @@ def main(argv=None) -> None:
     finally:
         if previous_load_tokenizer is not None:
             D.load_tokenizer = previous_load_tokenizer
+        if previous_model_loader is not None:
+            D.load = previous_model_loader
+        if previous_dwq_quantizer is not None:
+            D.dwq_quantize = previous_dwq_quantizer
+        _RUN_MEMORY_GUARD = None
         if frozen_tokenizer_dir is not None:
             frozen_tokenizer_dir.cleanup()
 

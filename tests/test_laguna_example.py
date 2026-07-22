@@ -8,6 +8,19 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from alis_dwq.memory_guard import MemoryLimitExceeded
+
+
+class PermissiveMemoryGuard:
+    def __init__(self, *_args, **_kwargs):
+        pass
+
+    def start(self):
+        pass
+
+    def check(self, _checkpoint, **_context):
+        pass
+
 
 def load_converter():
     path = Path(__file__).parents[1] / "examples" / "laguna-s-2.1" / "convert.py"
@@ -182,6 +195,8 @@ class TestLagunaExampleConverter(unittest.TestCase):
         mlx_lm_package.__path__ = []
         convert_module = types.ModuleType("mlx_lm.convert")
         convert_module.convert = convert
+        convert_module.load = lambda *args, **kwargs: (args, kwargs)
+        convert_module.save = lambda *args, **kwargs: (args, kwargs)
         return {
             "mlx": mlx_package,
             "mlx.core": mlx_core,
@@ -240,6 +255,13 @@ class TestLagunaExampleConverter(unittest.TestCase):
                 mock.patch.object(
                     self.converter, "move_no_replace", side_effect=publish
                 ),
+                mock.patch(
+                    "alis_dwq.memory_guard.configure_recommended_wired_limit",
+                    return_value=1_000,
+                ),
+                mock.patch(
+                    "alis_dwq.memory_guard.MemoryGuard", PermissiveMemoryGuard
+                ),
                 mock.patch.object(sys, "argv", argv),
             ):
                 self.assertEqual(self.converter.main(), 0)
@@ -286,6 +308,13 @@ class TestLagunaExampleConverter(unittest.TestCase):
                 ) as verify,
                 mock.patch.object(self.converter, "preserve_source_notices") as preserve,
                 mock.patch.object(self.converter, "move_no_replace") as publish,
+                mock.patch(
+                    "alis_dwq.memory_guard.configure_recommended_wired_limit",
+                    return_value=1_000,
+                ),
+                mock.patch(
+                    "alis_dwq.memory_guard.MemoryGuard", PermissiveMemoryGuard
+                ),
                 mock.patch.object(sys, "argv", argv),
             ):
                 with self.assertRaisesRegex(ValueError, "changed during conversion"):
@@ -296,6 +325,101 @@ class TestLagunaExampleConverter(unittest.TestCase):
             publish.assert_not_called()
             self.assertFalse(output.exists())
             self.assertEqual(len(list(root.glob("output.partial-*"))), 1)
+
+    def test_guarded_convert_checks_load_and_write_and_restores_hooks(self):
+        sequence = []
+        module = types.SimpleNamespace()
+
+        def original_load(*_args, **_kwargs):
+            sequence.append("load")
+            return "model"
+
+        def original_save(*_args, **_kwargs):
+            sequence.append("save")
+
+        def convert(**_kwargs):
+            module.load("source", lazy=True)
+            module.save("output")
+
+        module.load = original_load
+        module.save = original_save
+        module.convert = convert
+
+        class Guard:
+            def check(self, checkpoint, **_context):
+                sequence.append(checkpoint)
+
+        self.converter._guarded_convert(module, Guard())
+        self.assertEqual(
+            sequence,
+            [
+                "before-conversion",
+                "before-model-load",
+                "load",
+                "after-model-load",
+                "before-model-write",
+                "save",
+                "after-model-write",
+                "after-conversion",
+            ],
+        )
+        self.assertIs(module.load, original_load)
+        self.assertIs(module.save, original_save)
+
+    def test_cli_memory_stop_after_conversion_retains_partial(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            output = root / "output"
+            evidence = {"shard_manifest_sha256": "a" * 64}
+
+            def convert(**kwargs):
+                staging = Path(kwargs["mlx_path"])
+                staging.mkdir()
+                (staging / "model.safetensors").write_bytes(b"partial")
+                (staging / "tokenizer_config.json").write_text("{}\n")
+
+            class StopGuard(PermissiveMemoryGuard):
+                def check(self, checkpoint, **_context):
+                    if checkpoint == "after-conversion":
+                        raise MemoryLimitExceeded(
+                            {"event": "memory_stop_gate", "checkpoint": checkpoint}
+                        )
+
+            argv = [
+                "convert.py",
+                "--source",
+                str(source),
+                "--out",
+                str(output),
+                "--recipe",
+                "bf16-mlx-layout",
+            ]
+            with (
+                mock.patch.dict(sys.modules, self._fake_mlx_modules(convert)),
+                mock.patch.object(
+                    self.converter, "verify_source", return_value=evidence
+                ) as verify,
+                mock.patch.object(self.converter, "preserve_source_notices") as preserve,
+                mock.patch.object(self.converter, "move_no_replace") as publish,
+                mock.patch(
+                    "alis_dwq.memory_guard.configure_recommended_wired_limit",
+                    return_value=1_000,
+                ),
+                mock.patch("alis_dwq.memory_guard.MemoryGuard", StopGuard),
+                mock.patch.object(sys, "argv", argv),
+            ):
+                with self.assertRaises(MemoryLimitExceeded):
+                    self.converter.main()
+
+            self.assertEqual(verify.call_count, 1)
+            preserve.assert_not_called()
+            publish.assert_not_called()
+            self.assertFalse(output.exists())
+            partials = list(root.glob("output.partial-*"))
+            self.assertEqual(len(partials), 1)
+            self.assertTrue((partials[0] / "model.safetensors").is_file())
 
     def test_source_revision_and_exact_index_count_are_enforced(self):
         with tempfile.TemporaryDirectory() as directory:

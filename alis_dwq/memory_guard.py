@@ -111,6 +111,19 @@ class MemoryLimits:
             max_swap_increase_bytes=(int(swap_gib * GIB) if swap_gib > 0 else None),
         )
 
+    @classmethod
+    def guarded_laguna(cls, environ: Optional[Mapping[str, str]] = None):
+        """Keep Laguna limits at least as strict as 90% / 16 GiB."""
+        configured = cls.from_env(environ)
+        peak = configured.max_peak_fraction
+        swap = configured.max_swap_increase_bytes
+        return cls(
+            max_peak_fraction=min(0.90, peak) if peak is not None else 0.90,
+            max_swap_increase_bytes=(
+                min(16 * GIB, swap) if swap is not None else 16 * GIB
+            ),
+        )
+
 
 class MemoryLimitExceeded(RuntimeError):
     def __init__(self, evidence):
@@ -142,6 +155,8 @@ class MemoryGuard:
         mx_module=mx,
         swap_reader=read_swap_used_bytes,
         emitter=emit_evidence,
+        require_recommended_working_set=False,
+        require_swap_measurement=False,
     ):
         self.phase = phase
         self.recommended_working_set_bytes = recommended_working_set_bytes
@@ -149,6 +164,10 @@ class MemoryGuard:
         self.mx = mx_module
         self.swap_reader = swap_reader
         self.emitter = emitter
+        self.require_recommended_working_set = bool(
+            require_recommended_working_set
+        )
+        self.require_swap_measurement = bool(require_swap_measurement)
         self.baseline_swap_bytes = None
         self.started = False
 
@@ -164,6 +183,10 @@ class MemoryGuard:
                 "baseline_swap_bytes": self.baseline_swap_bytes,
                 "max_peak_fraction": self.limits.max_peak_fraction,
                 "max_swap_increase_bytes": (self.limits.max_swap_increase_bytes),
+                "require_recommended_working_set": (
+                    self.require_recommended_working_set
+                ),
+                "require_swap_measurement": self.require_swap_measurement,
             }
         )
 
@@ -223,11 +246,24 @@ class MemoryGuard:
         evidence = self.sample(checkpoint, **context)
         reasons = []
         if (
+            self.require_recommended_working_set
+            and (
+                evidence["recommended_working_set_bytes"] is None
+                or evidence["recommended_working_set_bytes"] <= 0
+            )
+        ):
+            reasons.append("recommended_working_set_unavailable")
+        if (
             self.limits.max_peak_fraction is not None
             and evidence["peak_fraction"] is not None
             and evidence["peak_fraction"] > self.limits.max_peak_fraction
         ):
             reasons.append("peak_working_set")
+        if self.require_swap_measurement and (
+            evidence["baseline_swap_bytes"] is None
+            or evidence["swap_used_bytes"] is None
+        ):
+            reasons.append("swap_measurement_unavailable")
         if (
             self.limits.max_swap_increase_bytes is not None
             and evidence["swap_increase_bytes"] is not None

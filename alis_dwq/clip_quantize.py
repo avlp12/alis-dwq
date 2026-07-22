@@ -391,6 +391,12 @@ def main():
     import mlx.core as mx
     from tqdm import tqdm
 
+    from .memory_guard import (
+        MemoryGuard,
+        MemoryLimits,
+        configure_recommended_wired_limit,
+    )
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--source", required=True, help="unquantized MLX-layout dump")
     ap.add_argument("--model", required=True, help="quantized (pre-DWQ) student dir")
@@ -444,8 +450,28 @@ def main():
         raise SystemExit("[clip] ratios must be in (0, 1]")
     ratios = [1.0] + sorted(extra, reverse=True)  # baseline first
 
+    strict_laguna = input_binding["lineage_mode"] == "laguna-pinned"
+    memory_phase = "clip-requantization"
+    recommended = configure_recommended_wired_limit(memory_phase, mx_module=mx)
+    memory_guard = MemoryGuard(
+        memory_phase,
+        recommended,
+        limits=(
+            MemoryLimits.guarded_laguna()
+            if strict_laguna
+            else MemoryLimits.from_env()
+        ),
+        mx_module=mx,
+        require_recommended_working_set=strict_laguna,
+        require_swap_measurement=strict_laguna,
+    )
+    memory_guard.start()
+    memory_guard.check("before-student-load")
     student, shard_of = _load_dir(student_root)
+    memory_guard.check("after-student-load")
+    memory_guard.check("before-bf16-source-load")
     source, _ = _load_dir(source_root)
+    memory_guard.check("after-bf16-source-load")
 
     bases = {k[: -len(".scales")] for k in student if k.endswith(".scales")}
     triple_keys = {b + suf for b in bases for suf in (".weight", ".scales", ".biases")}
@@ -469,6 +495,7 @@ def main():
             down_perms = {par: np.asarray(pm) for pm, ax, par in perms.values()
                           if ax == -1}
             np.savez(out / "ffn_perms.npz", **down_perms)
+        memory_guard.check("after-ffn-permutation")
 
     def process(base):
         wq, sc = student[base + ".weight"], student[base + ".scales"]
@@ -593,6 +620,7 @@ def main():
         for k in by_shard[fname]:
             student.pop(k, None)
         mx.clear_cache()
+        memory_guard.check("after-shard-write", shard=fname)
 
     for leftover, arrs in pending.items():  # safety net; unreachable in practice
         # (a base is processed at the FIRST shard holding any of its keys, so
@@ -607,6 +635,8 @@ def main():
     for f in student_root.iterdir():  # config, tokenizer, index, ...
         if f.is_file() and not f.name.endswith(".safetensors"):
             shutil.copy2(f, out / f.name)
+
+    memory_guard.check("before-input-revalidation")
 
     for base, reason in skipped:
         print(f"[clip] skipped {base}: {reason}", file=sys.stderr)
@@ -633,6 +663,7 @@ def main():
         )
 
     _verify_clip_inputs_unchanged(source_root, student_root, input_binding)
+    memory_guard.check("before-receipt-write")
 
     receipt_path = out / "conversion_plan.json"
     receipt = json.loads(receipt_path.read_text()) if receipt_path.is_file() else {}
@@ -657,6 +688,7 @@ def main():
         **evidence,
     })
     receipt_path.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
+    memory_guard.check("before-publish")
     move_no_replace(out, final_out)
     print(f"[clip] completed transactionally (no-clobber) at {final_out}")
 

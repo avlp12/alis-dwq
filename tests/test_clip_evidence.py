@@ -1,13 +1,17 @@
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
+from alis_dwq import clip_quantize
 from alis_dwq.clip_quantize import (
     _clip_evidence,
     _clip_input_binding,
     _verify_clip_inputs_unchanged,
 )
+from alis_dwq.memory_guard import MemoryLimitExceeded
 
 
 class ClipEvidenceTests(unittest.TestCase):
@@ -134,6 +138,86 @@ class ClipEvidenceTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(ValueError, "two pinned conversion plans"):
                 _clip_input_binding(source, student)
+
+    def test_laguna_clip_guards_both_loads_and_retains_partial_on_stop(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = self._input(
+                root / "source", recipe="bf16-mlx-layout", quantized=False
+            )
+            student = self._input(
+                root / "student", recipe="quality-3p7", quantized=True
+            )
+            output = root / "output"
+            sequence = []
+            captured = {}
+
+            class Guard:
+                def __init__(self, phase, recommended, **kwargs):
+                    sequence.append(("guard", phase, recommended))
+                    captured.update(kwargs)
+
+                def start(self):
+                    sequence.append(("start",))
+
+                def check(self, checkpoint, **context):
+                    sequence.append(("check", checkpoint, context))
+                    if checkpoint == "after-bf16-source-load":
+                        raise MemoryLimitExceeded(
+                            {
+                                "event": "memory_stop_gate",
+                                "checkpoint": checkpoint,
+                            }
+                        )
+
+            def load(root_path):
+                role = "source" if Path(root_path) == source else "student"
+                sequence.append(("load", role))
+                return {}, {}
+
+            argv = [
+                "clip_quantize.py",
+                "--source",
+                str(source),
+                "--model",
+                str(student),
+                "--out",
+                str(output),
+            ]
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(clip_quantize, "_load_dir", side_effect=load),
+                mock.patch(
+                    "alis_dwq.memory_guard.configure_recommended_wired_limit",
+                    side_effect=lambda phase, **_kwargs: sequence.append(
+                        ("wired", phase)
+                    )
+                    or 1_000,
+                ),
+                mock.patch("alis_dwq.memory_guard.MemoryGuard", Guard),
+            ):
+                with self.assertRaises(MemoryLimitExceeded):
+                    clip_quantize.main()
+
+            self.assertEqual(
+                sequence,
+                [
+                    ("wired", "clip-requantization"),
+                    ("guard", "clip-requantization", 1_000),
+                    ("start",),
+                    ("check", "before-student-load", {}),
+                    ("load", "student"),
+                    ("check", "after-student-load", {}),
+                    ("check", "before-bf16-source-load", {}),
+                    ("load", "source"),
+                    ("check", "after-bf16-source-load", {}),
+                ],
+            )
+            self.assertTrue(captured["require_recommended_working_set"])
+            self.assertTrue(captured["require_swap_measurement"])
+            self.assertEqual(captured["limits"].max_peak_fraction, 0.90)
+            self.assertFalse(output.exists())
+            self.assertEqual(len(list(root.glob("output.partial-*"))), 1)
 
 
 if __name__ == "__main__":

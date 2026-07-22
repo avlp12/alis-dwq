@@ -126,6 +126,70 @@ class TestMemoryGuard(unittest.TestCase):
         self.assertIsNone(disabled.max_peak_fraction)
         self.assertIsNone(disabled.max_swap_increase_bytes)
 
+    def test_guarded_laguna_limits_cannot_be_disabled_or_loosened(self):
+        limits = MemoryLimits.guarded_laguna(
+            {
+                "ALIS_DWQ_MAX_PEAK_FRACTION": "0",
+                "ALIS_DWQ_MAX_SWAP_INCREASE_GIB": "64",
+            }
+        )
+        self.assertEqual(limits.max_peak_fraction, 0.90)
+        self.assertEqual(limits.max_swap_increase_bytes, 16 * GIB)
+
+        stricter = MemoryLimits.guarded_laguna(
+            {
+                "ALIS_DWQ_MAX_PEAK_FRACTION": "0.75",
+                "ALIS_DWQ_MAX_SWAP_INCREASE_GIB": "4",
+            }
+        )
+        self.assertEqual(stricter.max_peak_fraction, 0.75)
+        self.assertEqual(stricter.max_swap_increase_bytes, 4 * GIB)
+
+    def test_guarded_laguna_fails_closed_when_swap_measurement_is_missing(self):
+        for values in ([None, None], [0, None]):
+            with self.subTest(values=values):
+                events = []
+                readings = iter(values)
+                guard = MemoryGuard(
+                    "laguna",
+                    100,
+                    limits=MemoryLimits.guarded_laguna({}),
+                    mx_module=FakeMX(peak=10, active=10),
+                    swap_reader=lambda: next(readings),
+                    emitter=events.append,
+                    require_recommended_working_set=True,
+                    require_swap_measurement=True,
+                )
+                guard.start()
+                with self.assertRaises(MemoryLimitExceeded) as caught:
+                    guard.check("pre-load")
+                self.assertIn(
+                    "swap_measurement_unavailable",
+                    caught.exception.evidence["reasons"],
+                )
+                self.assertEqual(events[-1]["event"], "memory_stop_gate")
+
+    def test_guarded_laguna_requires_recommended_working_set(self):
+        for recommended in (None, 0):
+            with self.subTest(recommended=recommended):
+                guard = MemoryGuard(
+                    "laguna",
+                    recommended,
+                    limits=MemoryLimits.guarded_laguna({}),
+                    mx_module=FakeMX(peak=10, active=10),
+                    swap_reader=lambda: 0,
+                    emitter=lambda event: event,
+                    require_recommended_working_set=True,
+                    require_swap_measurement=True,
+                )
+                guard.start()
+                with self.assertRaises(MemoryLimitExceeded) as caught:
+                    guard.check("pre-load")
+                self.assertEqual(
+                    caught.exception.evidence["reasons"],
+                    ["recommended_working_set_unavailable"],
+                )
+
     def test_stop_gate_uses_strict_thresholds_and_phase_swap_baseline(self):
         fake = FakeMX(peak=90, active=80, recommended=100)
         swap_values = iter([10 * GIB, 26 * GIB, 26 * GIB + 1])
@@ -378,8 +442,8 @@ class TestMemoryGuard(unittest.TestCase):
         sequence = []
 
         class Guard:
-            def __init__(self, phase, recommended):
-                sequence.append(("guard", phase, recommended))
+            def __init__(self, phase, recommended, **kwargs):
+                sequence.append(("guard", phase, recommended, kwargs))
 
             def start(self):
                 sequence.append(("start",))
@@ -489,6 +553,27 @@ class TestMemoryGuard(unittest.TestCase):
         self.assertIn("configure_recommended_wired_limit(memory_phase)", source)
         self.assertIn("memory_guard.begin_round", source)
         self.assertIn("check_round_or_restore", source)
+        self.assertIn('_ignored.pop("_alis_memory_guard", None)', source)
+
+    def test_run_hands_preload_guard_into_layerwise_quantizer(self):
+        from alis_dwq import run
+
+        sequence = []
+
+        class Guard:
+            def check(self, checkpoint):
+                sequence.append(("check", checkpoint))
+
+        guard = Guard()
+
+        def quantize(*args, **kwargs):
+            sequence.append(("quantize", args, kwargs))
+            return "trained"
+
+        wrapped = run._guarded_dwq_quantizer(quantize, guard)
+        self.assertEqual(wrapped("student", seed=7), "trained")
+        self.assertEqual(sequence[0], ("check", "before-upstream-dwq-training"))
+        self.assertIs(sequence[1][2]["_alis_memory_guard"], guard)
 
 
 if __name__ == "__main__":

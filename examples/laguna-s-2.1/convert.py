@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -339,6 +340,37 @@ def make_conversion_plan(
     }
 
 
+def _guarded_convert(convert_module, memory_guard, **kwargs):
+    """Instrument upstream lazy load and model save without forking mlx-lm."""
+    original_load = convert_module.load
+    original_save = convert_module.save
+
+    def guarded_load(*args, **load_kwargs):
+        memory_guard.check("before-model-load")
+        result = original_load(*args, **load_kwargs)
+        # The upstream load is lazy; later checks cover quantization and save
+        # materialization as well as this mmap/model-construction boundary.
+        memory_guard.check("after-model-load")
+        return result
+
+    def guarded_save(*args, **save_kwargs):
+        memory_guard.check("before-model-write")
+        result = original_save(*args, **save_kwargs)
+        memory_guard.check("after-model-write")
+        return result
+
+    convert_module.load = guarded_load
+    convert_module.save = guarded_save
+    try:
+        memory_guard.check("before-conversion")
+        result = convert_module.convert(**kwargs)
+        memory_guard.check("after-conversion")
+        return result
+    finally:
+        convert_module.load = original_load
+        convert_module.save = original_save
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", type=Path, required=True)
@@ -371,19 +403,40 @@ def main() -> int:
         parser.error(str(exc))
 
     import mlx.core as mx
-    from mlx_lm.convert import convert
+
+    from alis_dwq.memory_guard import (
+        MemoryGuard,
+        MemoryLimits,
+        configure_recommended_wired_limit,
+    )
+
+    convert_module = importlib.import_module("mlx_lm.convert")
 
     device = mx.device_info()
-    wired_limit = int(device["max_recommended_working_set_size"])
-    mx.set_wired_limit(wired_limit)
-    mx.reset_peak_memory()
     created_at = datetime.now(timezone.utc)
     staging = args.out.with_name(
         f"{args.out.name}.partial-{created_at.strftime('%Y%m%dT%H%M%SZ')}-{os.getpid()}"
     )
     quantized = args.recipe != "bf16-mlx-layout"
     try:
-        convert(
+        memory_phase = "laguna-example-conversion"
+        recommended = configure_recommended_wired_limit(
+            memory_phase, mx_module=mx
+        )
+        memory_guard = MemoryGuard(
+            memory_phase,
+            recommended,
+            limits=MemoryLimits.guarded_laguna(),
+            mx_module=mx,
+            require_recommended_working_set=True,
+            require_swap_measurement=True,
+        )
+        memory_guard.start()
+        memory_guard.check("before-conversion-dispatch")
+        wired_limit = int(recommended)
+        _guarded_convert(
+            convert_module,
+            memory_guard,
             hf_path=str(source_root),
             mlx_path=str(staging),
             quantize=quantized,
@@ -394,16 +447,22 @@ def main() -> int:
                 policy(args.recipe, promotions) if quantized else None
             ),
         )
+        memory_guard.check("before-source-reverification")
         source_reverification = verify_source(source_root)
         if source_reverification != source_verification:
             raise ValueError("pinned source changed during conversion")
+        memory_guard.check("after-source-reverification")
+        memory_guard.check("before-tokenizer-write")
         tokenizer_config = staging / "tokenizer_config.json"
         tokenizer = json.loads(tokenizer_config.read_text())
         tokenizer["fix_mistral_regex"] = True
         tokenizer_config.write_text(
             json.dumps(tokenizer, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
         )
+        memory_guard.check("after-tokenizer-write")
+        memory_guard.check("before-notice-write")
         preserve_source_notices(source_root, staging)
+        memory_guard.check("after-notice-write")
         receipt = make_conversion_plan(
             recipe=args.recipe,
             promotions=promotions,
@@ -413,9 +472,11 @@ def main() -> int:
             wired_limit=wired_limit,
             peak_memory=int(mx.get_peak_memory()),
         )
+        memory_guard.check("before-receipt-write")
         (staging / "conversion_plan.json").write_text(
             json.dumps(receipt, indent=2, sort_keys=True) + "\n"
         )
+        memory_guard.check("before-publish")
         move_no_replace(staging, args.out)
     except BaseException:
         print(f"conversion failed; partial retained at {staging}")
