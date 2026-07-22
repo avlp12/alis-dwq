@@ -100,6 +100,7 @@ class RuntimeTokenizerBundle:
 
 
 _TRACKED_ENV = (
+    "PYTHONPATH",
     "ALIS_DWQ_RUN_ID",
     "ALIS_DWQ_DATA_DIR",
     "ALIS_DWQ_NUM_VALID_SAMPLES",

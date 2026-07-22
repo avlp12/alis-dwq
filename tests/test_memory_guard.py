@@ -332,6 +332,7 @@ class TestMemoryGuard(unittest.TestCase):
 
         stream = io.StringIO()
         environ = {
+            "PYTHONPATH": "/runtime/alis:/runtime/mlx-lm",
             "ALIS_DWQ_DATA_DIR": "/data/laguna",
             "ALIS_DWQ_LAYERS_PER_ROUND": "1",
             "HF_TOKEN": "must-not-leak",
@@ -344,6 +345,7 @@ class TestMemoryGuard(unittest.TestCase):
         )
         self.assertEqual(payload["cwd"], "/build")
         self.assertEqual(payload["environment"]["ALIS_DWQ_LAYERS_PER_ROUND"], "1")
+        self.assertEqual(payload["environment"]["PYTHONPATH"], environ["PYTHONPATH"])
         self.assertNotIn("HF_TOKEN", payload["environment"])
         self.assertEqual(environ["ALIS_DWQ_RUN_ID"], payload["run_id"])
         self.assertEqual(

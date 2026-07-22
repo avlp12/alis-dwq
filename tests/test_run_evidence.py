@@ -55,12 +55,13 @@ class RunEvidenceTests(unittest.TestCase):
         return source, targets, contract_path, files, contract
 
     def test_run_started_environment_binds_generated_run_id(self):
-        environ = {}
+        environ = {"PYTHONPATH": "/runtime/alis:/runtime/mlx-lm"}
         with mock.patch.object(run, "_code_provenance", return_value={}):
             payload = run._started_payload(
                 argv=["alis_dwq.run"], environ=environ, cwd="/build"
             )
         self.assertEqual(payload["environment"]["ALIS_DWQ_RUN_ID"], payload["run_id"])
+        self.assertEqual(payload["environment"]["PYTHONPATH"], environ["PYTHONPATH"])
         self.assertEqual(environ["ALIS_DWQ_RUN_ID"], payload["run_id"])
 
     def test_memory_evidence_is_exclusively_reserved_before_append(self):
