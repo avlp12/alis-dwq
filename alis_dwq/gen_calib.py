@@ -25,6 +25,8 @@ from pathlib import Path
 
 import numpy as np
 
+from .slices import lang_slice
+
 DATA = Path(__file__).resolve().parent.parent / "data"
 SLICES = {"EN": "wikitext.txt", "code": "code.txt", "ZH": "zh.txt"}
 
@@ -127,7 +129,11 @@ def main():
         print("[gen] dense model (no MoE hooks): coverage loop disabled, "
               "generating to --samples", file=sys.stderr)
 
-    avail = {k: (DATA / f) for k, f in SLICES.items() if (DATA / f).exists()}
+    slices = dict(SLICES)
+    del slices["ZH"]
+    lbl, lpath = lang_slice()
+    slices[lbl] = lpath
+    avail = {k: (DATA / f) for k, f in slices.items() if (DATA / f).exists()}
     if not avail:
         raise SystemExit(f"[gen] no seed corpora in {DATA}")
     mix = parse_mix(a.mix, set(avail))

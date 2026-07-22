@@ -28,6 +28,8 @@ from pathlib import Path
 
 import numpy as np
 
+from .slices import lang_slice
+
 DATA = Path(__file__).resolve().parent.parent / "data"
 SLICES = [("EN", "wikitext.txt"), ("code", "code.txt"), ("ZH", "zh.txt")]
 _LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
@@ -67,8 +69,18 @@ def _instrument(model, collect_norms=False):
     model.apply_to_modules(tag)
     hooked.sort()
 
-    for cls in classes:
-        if getattr(cls, "_alis_orig_call", None) is not None:
+    # Patch the class that actually OWNS __call__ in each hooked instance's MRO:
+    # a subclass overriding __call__ (e.g. a per-expert-activation SwitchGLU
+    # variant) shadows a patch applied to the base class, so patching the bases
+    # alone would silently miss it. Owner-patching stays type-generic.
+    def _call_owner(cls):
+        for c in cls.__mro__:
+            if "__call__" in c.__dict__:
+                return c
+        return cls
+
+    for cls in {_call_owner(type(m)) for _, _, m in hooked}:
+        if "_alis_orig_call" in cls.__dict__:
             continue  # already patched (idempotent across loads)
         orig = cls.__call__
         cls._alis_orig_call = orig
@@ -139,9 +151,10 @@ def collect(model_path, n, chunk, norms=False):
     print(f"[traffic] hooked {len(hooked)} MoE layers "
           f"(E={hooked[0][2]._alis_num_experts})", file=sys.stderr)
 
-    third = n // len(SLICES)
+    slices = SLICES[:2] + [lang_slice()]
+    third = n // len(slices)
     out, out_n, names = {}, {}, []
-    for sname, fname in SLICES:
+    for sname, fname in slices:
         path = DATA / fname
         if not path.exists():
             print(f"[traffic] {path} missing — skipping slice {sname}", file=sys.stderr)
