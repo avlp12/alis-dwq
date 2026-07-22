@@ -56,6 +56,12 @@ DATA = Path(os.environ.get("ALIS_DWQ_DATA_DIR", "dwq_data")).expanduser()
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _TOKENIZER_RUNTIME_FILES = frozenset(TOKENIZER_FILES)
+_FROZEN_TOKENIZER_CONFIG_NAME = "config.json"
+_FROZEN_TOKENIZER_CONFIG_BYTES = b'{"model_type":"mistral"}\n'
+_FROZEN_TOKENIZER_REQUIRED_OPTIONS = {
+    "fix_mistral_regex": True,
+    "local_files_only": True,
+}
 _TOKENIZER_FILE_FIELDS = frozenset(
     {
         "added_tokens_file",
@@ -270,7 +276,9 @@ def _validate_exact_tokenizer_files(
         and (clean_root or _is_tokenizer_related_name(path.name))
     )
     if apple_double:
-        raise ValueError(f"runtime tokenizer contains AppleDouble files: {apple_double}")
+        raise ValueError(
+            f"runtime tokenizer contains AppleDouble files: {apple_double}"
+        )
     if clean_root:
         observed = {path.name for path in entries}
     else:
@@ -344,9 +352,7 @@ def _load_runtime_tokenizer_bundle(
 
     source_resolved = source.resolve(strict=True)
     contract_resolved = target_contract.resolve(strict=True)
-    files = _validate_exact_tokenizer_files(
-        source_resolved, declared, clean_root=True
-    )
+    files = _validate_exact_tokenizer_files(source_resolved, declared, clean_root=True)
     return RuntimeTokenizerBundle(
         source=source_resolved,
         target_contract=contract_resolved,
@@ -380,17 +386,38 @@ def _fsync_directory(path: Path) -> None:
 def _materialize_frozen_runtime_tokenizer(
     root: Path, bundle: RuntimeTokenizerBundle
 ) -> None:
+    _revalidate_runtime_tokenizer_bundle(bundle)
     for name, raw in bundle.files_bytes.items():
         destination = root / name
         with destination.open("xb") as handle:
             handle.write(raw)
             handle.flush()
             os.fsync(handle.fileno())
+    sentinel = root / _FROZEN_TOKENIZER_CONFIG_NAME
+    with sentinel.open("xb") as handle:
+        handle.write(_FROZEN_TOKENIZER_CONFIG_BYTES)
+        handle.flush()
+        os.fsync(handle.fileno())
     _fsync_directory(root)
+    _revalidate_frozen_runtime_tokenizer(root, bundle)
+
+
+def _revalidate_frozen_runtime_tokenizer(
+    root: Path, bundle: RuntimeTokenizerBundle
+) -> None:
+    _revalidate_runtime_tokenizer_bundle(bundle)
+    expected_bytes = {
+        **bundle.files_bytes,
+        _FROZEN_TOKENIZER_CONFIG_NAME: _FROZEN_TOKENIZER_CONFIG_BYTES,
+    }
+    expected_hashes = {
+        **bundle.files_sha256,
+        _FROZEN_TOKENIZER_CONFIG_NAME: _sha256_bytes(_FROZEN_TOKENIZER_CONFIG_BYTES),
+    }
     _validate_exact_tokenizer_files(
         root,
-        bundle.files_sha256,
-        expected_bytes=bundle.files_bytes,
+        expected_hashes,
+        expected_bytes=expected_bytes,
         clean_root=True,
     )
 
@@ -528,17 +555,14 @@ def _parse_run_context(argv=None, environ=None) -> dict[str, Any]:
         "batch_size": args.batch_size,
         "seed": args.seed,
         "data_dir": Path(environ.get("ALIS_DWQ_DATA_DIR", str(DATA))).expanduser(),
-        "tokenization": environ.get(
-            "ALIS_DWQ_TEXT_TOKENIZATION", "text_dataset"
-        ).strip().lower(),
+        "tokenization": environ.get("ALIS_DWQ_TEXT_TOKENIZATION", "text_dataset")
+        .strip()
+        .lower(),
     }
 
 
 def _target_dir_has_payload(path: Path) -> bool:
-    return all(
-        bool(numeric_target_files(path / split))
-        for split in ("train", "valid")
-    )
+    return all(bool(numeric_target_files(path / split)) for split in ("train", "valid"))
 
 
 def _validate_existing_target_structure(
@@ -556,7 +580,10 @@ def _validate_existing_target_structure(
             f"existing numeric targets lack a regular {CONTRACT_NAME}: {path}"
         )
     contract = load_json(contract_path)
-    if not isinstance(contract, dict) or contract.get("schema") != "alis-dwq.targets/v1":
+    if (
+        not isinstance(contract, dict)
+        or contract.get("schema") != "alis-dwq.targets/v1"
+    ):
         raise ValueError("existing target contract has an unsupported schema")
     teacher = contract.get("teacher")
     if (
@@ -610,9 +637,7 @@ def _validate_existing_target_structure(
             raise ValueError(
                 f"existing target contract {split} counts/rows are inconsistent"
             )
-        expected_names = [
-            f"{index:010d}.safetensors" for index in range(target_count)
-        ]
+        expected_names = [f"{index:010d}.safetensors" for index in range(target_count)]
         actual_names = [item.name for item in numeric_target_files(split_dir)]
         if actual_names != expected_names:
             raise ValueError(
@@ -668,8 +693,7 @@ def _target_dir_state(
         return "new"
     if not path.is_dir() or not _target_dir_has_payload(path):
         raise FileExistsError(
-            "target directory exists but is partial or empty (no-clobber): "
-            f"{path}"
+            f"target directory exists but is partial or empty (no-clobber): {path}"
         )
     _validate_existing_target_structure(
         path,
@@ -681,9 +705,7 @@ def _target_dir_state(
     return "reuse"
 
 
-def _requires_teacher_stability(
-    context: Mapping[str, Any], target_state: str
-) -> bool:
+def _requires_teacher_stability(context: Mapping[str, Any], target_state: str) -> bool:
     quantized_model = context.get("quantized_model")
     distinct_teacher = quantized_model is not None and (
         Path(context["model"]).resolve() != Path(quantized_model).resolve()
@@ -710,9 +732,9 @@ def _load_local(
         train_ds = TextDataset(train_rows, tokenizer)
         valid_ds = TextDataset(valid_rows, tokenizer)
         indices = np.random.permutation(len(train_ds))[:num_samples].tolist()
-        tokenization = os.environ.get(
-            "ALIS_DWQ_TEXT_TOKENIZATION", "text_dataset"
-        ).strip().lower()
+        tokenization = (
+            os.environ.get("ALIS_DWQ_TEXT_TOKENIZATION", "text_dataset").strip().lower()
+        )
 
         def process(dataset, index):
             if tokenization == "preformatted_chat":
@@ -731,7 +753,10 @@ def _load_local(
             requested = len(valid_ds)
         return (
             [process(train_ds, index) for index in indices],
-            [process(valid_ds, index) for index in range(min(requested, len(valid_ds)))],
+            [
+                process(valid_ds, index)
+                for index in range(min(requested, len(valid_ds)))
+            ],
         )
 
     context = _RUN_CONTEXT
@@ -825,9 +850,7 @@ def _distributed_barrier(group) -> None:
         mx.eval(value)
 
 
-def _validate_target_publish_inputs(
-    context: Mapping[str, Any], binding: dict
-) -> None:
+def _validate_target_publish_inputs(context: Mapping[str, Any], binding: dict) -> None:
     """Revalidate lazy target-dump inputs immediately before publication."""
     _validate_live_data_binding(context, binding)
     expected = context.get("teacher_checkpoint_digest")
@@ -892,9 +915,7 @@ def _wired_compute(
         split = "valid" if split_calls == 0 else "train"
         split_calls += 1
         for batch_index, item in enumerate(_orig_iterate_batches(*args, **kwargs)):
-            guard.check(
-                "before-target-batch", split=split, target_index=batch_index
-            )
+            guard.check("before-target-batch", split=split, target_index=batch_index)
             yield item
             # Execution resumes only after upstream has evaluated and, on rank
             # zero, saved this target.  The final yielded batch is also checked.
@@ -1078,9 +1099,7 @@ class _RunEvidenceRecorder:
         if self.final is not None:
             self.final.parent.mkdir(parents=True, exist_ok=True)
             if self.final.exists():
-                raise FileExistsError(
-                    f"run evidence exists (no-clobber): {self.final}"
-                )
+                raise FileExistsError(f"run evidence exists (no-clobber): {self.final}")
             self.staging = self.final.with_name(
                 f"{self.final.name}.partial-{run_id}-{os.getpid()}"
             )
@@ -1247,9 +1266,7 @@ def _reserve_memory_evidence_path(final_path: str | Path | None) -> Path | None:
             handle.flush()
             os.fsync(handle.fileno())
     except FileExistsError as exc:
-        raise FileExistsError(
-            f"memory evidence exists (no-clobber): {final}"
-        ) from exc
+        raise FileExistsError(f"memory evidence exists (no-clobber): {final}") from exc
     return final
 
 
@@ -1297,9 +1314,41 @@ def _upstream_argv(argv: list[str], *, mlx_path: Path | None) -> list[str]:
     return values
 
 
-def _frozen_tokenizer_loader(original, frozen_root: Path):
+def _frozen_tokenizer_options(value: object) -> dict[str, Any]:
+    if value is None:
+        options = {}
+    elif isinstance(value, Mapping):
+        options = dict(value)
+    else:
+        raise TypeError("tokenizer_config_extra must be a mapping or None")
+    for name, required in _FROZEN_TOKENIZER_REQUIRED_OPTIONS.items():
+        if name in options and options[name] is not required:
+            raise ValueError(
+                f"tokenizer_config_extra conflicts with required {name}={required}"
+            )
+        options[name] = required
+    return options
+
+
+def _frozen_tokenizer_loader(
+    original, frozen_root: Path, bundle: RuntimeTokenizerBundle
+):
+    @functools.wraps(original)
     def load(_requested_path, *args, **kwargs):
-        return original(str(frozen_root), *args, **kwargs)
+        if args and "tokenizer_config_extra" in kwargs:
+            raise TypeError(
+                "tokenizer_config_extra cannot be supplied both positionally "
+                "and by keyword"
+            )
+        supplied = args[0] if args else kwargs.pop("tokenizer_config_extra", None)
+        options = _frozen_tokenizer_options(supplied)
+        _revalidate_frozen_runtime_tokenizer(frozen_root, bundle)
+        try:
+            if args:
+                return original(str(frozen_root), options, *args[1:], **kwargs)
+            return original(str(frozen_root), tokenizer_config_extra=options, **kwargs)
+        finally:
+            _revalidate_frozen_runtime_tokenizer(frozen_root, bundle)
 
     return load
 
@@ -1468,9 +1517,7 @@ def main(argv=None) -> None:
     run_id = start["run_id"]
     group = mx.distributed.init()
     recorder = (
-        _RunEvidenceRecorder(
-            os.environ.get("ALIS_DWQ_RUN_EVIDENCE_PATH"), run_id
-        )
+        _RunEvidenceRecorder(os.environ.get("ALIS_DWQ_RUN_EVIDENCE_PATH"), run_id)
         if group.rank() == 0
         else _RunEvidenceRecorder(None, run_id)
     )
@@ -1511,7 +1558,7 @@ def main(argv=None) -> None:
             _RUN_CONTEXT["tokenizer_path"] = frozen_root
             previous_load_tokenizer = D.load_tokenizer
             D.load_tokenizer = _frozen_tokenizer_loader(
-                previous_load_tokenizer, frozen_root
+                previous_load_tokenizer, frozen_root, runtime_tokenizer
             )
         strict_laguna = _is_guarded_laguna_context(_RUN_CONTEXT)
         if (
@@ -1703,9 +1750,7 @@ def main(argv=None) -> None:
             target_contract_digest=target_digest,
         )
         if runtime_tokenizer is not None:
-            _revalidate_installed_runtime_tokenizer(
-                artifact_staging, runtime_tokenizer
-            )
+            _revalidate_installed_runtime_tokenizer(artifact_staging, runtime_tokenizer)
         final_digest = directory_digest(artifact_staging)
         move_no_replace(artifact_staging, _RUN_CONTEXT["mlx_path"])
         recorder.publish(

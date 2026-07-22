@@ -23,9 +23,7 @@ class RunEvidenceTests(unittest.TestCase):
         }
         for name, raw in files.items():
             (source / name).write_bytes(raw)
-        hashes = {
-            name: hashlib.sha256(raw).hexdigest() for name, raw in files.items()
-        }
+        hashes = {name: hashlib.sha256(raw).hexdigest() for name, raw in files.items()}
         contract = {
             "schema": "alis-dwq.targets/v1",
             "tokenizer_files_sha256": hashes,
@@ -99,8 +97,7 @@ class RunEvidenceTests(unittest.TestCase):
                 "data_manifest_kind": "file",
                 "data_manifest_sha256": digest(data / "manifest.json"),
                 "data_files_sha256": {
-                    name: digest(data / name)
-                    for name in ("train.jsonl", "valid.jsonl")
+                    name: digest(data / name) for name in ("train.jsonl", "valid.jsonl")
                 },
                 "tokenizer_files_sha256": {
                     "tokenizer.json": digest(model / "tokenizer.json")
@@ -157,9 +154,7 @@ class RunEvidenceTests(unittest.TestCase):
                 ["alis_dwq.run", "--model", "/model", "--mlx-path", str(final)],
                 mlx_path=staging,
             )
-            self.assertEqual(
-                rewritten[rewritten.index("--mlx-path") + 1], str(staging)
-            )
+            self.assertEqual(rewritten[rewritten.index("--mlx-path") + 1], str(staging))
 
             final.mkdir()
             (final / "sentinel").write_text("preserve\n")
@@ -178,9 +173,7 @@ class RunEvidenceTests(unittest.TestCase):
             "7",
         ]
         with self.assertRaisesRegex(ValueError, "must be supplied together"):
-            run._parse_run_context(
-                [*base, "--runtime-tokenizer-source", "/tokenizer"]
-            )
+            run._parse_run_context([*base, "--runtime-tokenizer-source", "/tokenizer"])
         with self.assertRaisesRegex(ValueError, "exactly --target-dir"):
             run._parse_run_context(
                 [
@@ -225,15 +218,35 @@ class RunEvidenceTests(unittest.TestCase):
             frozen = root / "frozen"
             frozen.mkdir()
             run._materialize_frozen_runtime_tokenizer(frozen, bundle)
+            self.assertEqual(
+                (frozen / "config.json").read_bytes(),
+                b'{"model_type":"mistral"}\n',
+            )
             calls = []
 
-            def fake_loader(path, **kwargs):
-                calls.append((Path(path), kwargs))
+            def fake_loader(path, tokenizer_config_extra=None, **kwargs):
+                calls.append((Path(path), tokenizer_config_extra, kwargs))
                 return "tokenizer"
 
-            loader = run._frozen_tokenizer_loader(fake_loader, frozen)
-            self.assertEqual(loader("ignored", local_files_only=True), "tokenizer")
-            self.assertEqual(calls, [(frozen, {"local_files_only": True})])
+            loader = run._frozen_tokenizer_loader(fake_loader, frozen, bundle)
+            self.assertEqual(
+                loader("ignored", tokenizer_config_extra={"backend": "tokenizers"}),
+                "tokenizer",
+            )
+            self.assertEqual(
+                calls,
+                [
+                    (
+                        frozen,
+                        {
+                            "backend": "tokenizers",
+                            "fix_mistral_regex": True,
+                            "local_files_only": True,
+                        },
+                        {},
+                    )
+                ],
+            )
 
             output = root / "owned.partial-run"
             output.mkdir()
@@ -252,13 +265,85 @@ class RunEvidenceTests(unittest.TestCase):
             self.assertFalse((output / "._tokenizer.json").exists())
             self.assertTrue((output / "model.safetensors").is_file())
             self.assertTrue((output / "config.json").is_file())
+            self.assertEqual((output / "config.json").read_bytes(), b"{}\n")
 
             (source / "tokenizer.json").write_bytes(b"mutated")
             with self.assertRaisesRegex(ValueError, "hash mismatch|bytes changed"):
                 run._revalidate_runtime_tokenizer_bundle(bundle)
 
+    def test_frozen_runtime_tokenizer_rejects_tamper_and_option_conflicts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, _, contract_path, _, _ = self._runtime_tokenizer_fixture(root)
+            bundle = run._load_runtime_tokenizer_bundle(source, contract_path)
+            frozen = root / "frozen"
+            frozen.mkdir()
+            run._materialize_frozen_runtime_tokenizer(frozen, bundle)
+            calls = []
+
+            def fake_loader(path, tokenizer_config_extra=None):
+                calls.append((Path(path), tokenizer_config_extra))
+                return "tokenizer"
+
+            loader = run._frozen_tokenizer_loader(fake_loader, frozen, bundle)
+            self.assertEqual(loader("ignored", {"local_files_only": True}), "tokenizer")
+            self.assertEqual(
+                calls[0][1],
+                {"fix_mistral_regex": True, "local_files_only": True},
+            )
+
+            conflicts = (
+                {"fix_mistral_regex": False},
+                {"fix_mistral_regex": 1},
+                {"local_files_only": False},
+            )
+            for options in conflicts:
+                with (
+                    self.subTest(options=options),
+                    self.assertRaisesRegex(ValueError, "conflicts with required"),
+                ):
+                    loader("ignored", tokenizer_config_extra=options)
+            with self.assertRaisesRegex(TypeError, "mapping or None"):
+                loader("ignored", tokenizer_config_extra=True)
+            with self.assertRaisesRegex(TypeError, "both positionally and by keyword"):
+                loader(
+                    "ignored",
+                    {},
+                    tokenizer_config_extra={},
+                )
+
+            (frozen / "config.json").write_bytes(b'{"model_type":"llama"}\n')
+            with self.assertRaisesRegex(ValueError, "hash mismatch|bytes changed"):
+                loader("ignored")
+            self.assertEqual(len(calls), 1)
+
+    def test_frozen_runtime_tokenizer_is_revalidated_after_load(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, _, contract_path, _, _ = self._runtime_tokenizer_fixture(root)
+            bundle = run._load_runtime_tokenizer_bundle(source, contract_path)
+            frozen = root / "frozen"
+            frozen.mkdir()
+            run._materialize_frozen_runtime_tokenizer(frozen, bundle)
+
+            def tampering_loader(path, tokenizer_config_extra=None):
+                del tokenizer_config_extra
+                (Path(path) / "tokenizer.json").write_bytes(b"tampered")
+                return "must not escape validation"
+
+            loader = run._frozen_tokenizer_loader(tampering_loader, frozen, bundle)
+            with self.assertRaisesRegex(ValueError, "hash mismatch|bytes changed"):
+                loader("ignored")
+
     def test_runtime_tokenizer_preflight_rejects_ambiguous_inputs(self):
-        cases = ("duplicate-contract", "nonfinite-contract", "symlink", "appledouble", "extra", "dependency")
+        cases = (
+            "duplicate-contract",
+            "nonfinite-contract",
+            "symlink",
+            "appledouble",
+            "extra",
+            "dependency",
+        )
         for case in cases:
             with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
@@ -287,9 +372,9 @@ class RunEvidenceTests(unittest.TestCase):
                     (source / "tokenizer_config.json").write_bytes(config)
                     digest = hashlib.sha256(config).hexdigest()
                     contract["tokenizer_files_sha256"]["tokenizer_config.json"] = digest
-                    contract["tokenizer_equivalence"][
-                        "runtime_tokenizer_files_sha256"
-                    ]["tokenizer_config.json"] = digest
+                    contract["tokenizer_equivalence"]["runtime_tokenizer_files_sha256"][
+                        "tokenizer_config.json"
+                    ] = digest
                     contract_path.write_text(json.dumps(contract) + "\n")
                 with self.assertRaises(ValueError):
                     run._load_runtime_tokenizer_bundle(source, contract_path)
@@ -360,7 +445,9 @@ class RunEvidenceTests(unittest.TestCase):
                 self.assertFalse(
                     any("runtime-tokenizer-source" in value for value in run.sys.argv)
                 )
-                self.assertFalse(any("target-contract" in value for value in run.sys.argv))
+                self.assertFalse(
+                    any("target-contract" in value for value in run.sys.argv)
+                )
                 staging = Path(run.sys.argv[run.sys.argv.index("--mlx-path") + 1])
                 (staging / "model.safetensors").write_bytes(b"dwq")
                 (staging / "config.json").write_text("{}\n")
@@ -391,8 +478,12 @@ class RunEvidenceTests(unittest.TestCase):
                 mock.patch.object(run.D, "load_tokenizer", fake_tokenizer_loader),
                 mock.patch.object(run.D, "main", side_effect=fake_upstream),
                 mock.patch.object(run, "_target_dir_state", return_value="reuse"),
-                mock.patch.object(run, "_install_runtime_tokenizer", side_effect=ordered_install),
-                mock.patch.object(run, "_validate_completion_inputs", side_effect=validate),
+                mock.patch.object(
+                    run, "_install_runtime_tokenizer", side_effect=ordered_install
+                ),
+                mock.patch.object(
+                    run, "_validate_completion_inputs", side_effect=validate
+                ),
                 mock.patch.object(run, "_RunEvidenceRecorder", return_value=Recorder()),
                 mock.patch.object(
                     run,
@@ -497,7 +588,9 @@ class RunEvidenceTests(unittest.TestCase):
             with (
                 mock.patch.object(run.mx.distributed, "init", return_value=group),
                 mock.patch.object(run.D, "load_data", run._load_local),
-                mock.patch.object(run.D, "load", side_effect=fake_load) as original_load,
+                mock.patch.object(
+                    run.D, "load", side_effect=fake_load
+                ) as original_load,
                 mock.patch.object(run.D, "dwq_quantize") as original_quantizer,
                 mock.patch.object(run.D, "main", side_effect=fake_upstream),
                 mock.patch.object(run, "_target_dir_state", return_value="reuse"),
@@ -510,8 +603,9 @@ class RunEvidenceTests(unittest.TestCase):
                 mock.patch.object(
                     run,
                     "configure_recommended_wired_limit",
-                    side_effect=lambda phase: sequence.append(("wired", phase))
-                    or 1_000,
+                    side_effect=lambda phase: (
+                        sequence.append(("wired", phase)) or 1_000
+                    ),
                 ),
                 mock.patch.object(run, "MemoryGuard", Guard),
             ):
@@ -524,12 +618,8 @@ class RunEvidenceTests(unittest.TestCase):
             self.assertTrue(captured["require_recommended_working_set"])
             self.assertTrue(captured["require_swap_measurement"])
             self.assertEqual(captured["limits"].max_peak_fraction, 0.90)
-            self.assertIn(
-                ("check", "before-upstream-model-load", "student"), sequence
-            )
-            self.assertIn(
-                ("check", "after-upstream-model-load", "student"), sequence
-            )
+            self.assertIn(("check", "before-upstream-model-load", "student"), sequence)
+            self.assertIn(("check", "after-upstream-model-load", "student"), sequence)
             self.assertIn("publish-incomplete", sequence)
             self.assertFalse(output.exists())
             self.assertEqual(
@@ -649,7 +739,9 @@ class RunEvidenceTests(unittest.TestCase):
             self.assertIn("publish-incomplete", sequence)
             self.assertFalse(output.exists())
             partial = root / f"output.partial-save-stop-test-{os.getpid()}"
-            self.assertEqual(list(root.glob("output.partial-save-stop-test-*")), [partial])
+            self.assertEqual(
+                list(root.glob("output.partial-save-stop-test-*")), [partial]
+            )
             self.assertEqual(
                 (partial / "model.safetensors").read_bytes(), b"partial weights"
             )
@@ -878,7 +970,9 @@ class RunEvidenceTests(unittest.TestCase):
             self.assertTrue(state["restored_during_failure"])
             self.assertFalse(output.exists())
             partial = root / f"output.partial-shard-stop-test-{os.getpid()}"
-            self.assertEqual(list(root.glob("output.partial-shard-stop-test-*")), [partial])
+            self.assertEqual(
+                list(root.glob("output.partial-shard-stop-test-*")), [partial]
+            )
             self.assertTrue((partial / "model-00001-of-00003.safetensors").is_file())
             self.assertFalse((partial / "model-00002-of-00003.safetensors").exists())
             checks_and_writes = [
@@ -998,7 +1092,9 @@ class RunEvidenceTests(unittest.TestCase):
             recorder.publish(completed)
 
             lines = [json.loads(line) for line in path.read_text().splitlines()]
-            self.assertEqual([row["event"] for row in lines], ["run_started", "run_completed"])
+            self.assertEqual(
+                [row["event"] for row in lines], ["run_started", "run_completed"]
+            )
             self.assertEqual({row["run_id"] for row in lines}, {"run-1"})
             stderr_events = [
                 json.loads(line.split("[alis-dwq][run] ", 1)[1])
@@ -1050,9 +1146,7 @@ class RunEvidenceTests(unittest.TestCase):
     def test_diagnostic_limits_are_detected(self):
         self.assertFalse(run._diagnostic_enabled({}))
         self.assertTrue(run._diagnostic_enabled({"ALIS_DWQ_MAX_ROUNDS": "1"}))
-        self.assertTrue(
-            run._diagnostic_enabled({"ALIS_DWQ_MAX_STEPS_PER_ROUND": "2"})
-        )
+        self.assertTrue(run._diagnostic_enabled({"ALIS_DWQ_MAX_STEPS_PER_ROUND": "2"}))
         with tempfile.TemporaryDirectory() as directory:
             targets = Path(directory)
             self.assertFalse(run._target_dir_has_payload(targets))
@@ -1090,18 +1184,14 @@ class RunEvidenceTests(unittest.TestCase):
                             {
                                 "target_index": 0,
                                 "batch_position": 0,
-                                "target_file": (
-                                    f"{split}/0000000000.safetensors"
-                                ),
+                                "target_file": (f"{split}/0000000000.safetensors"),
                             }
                         ],
                     }
                     for split in ("train", "valid")
                 },
             }
-            (targets / "target-contract.json").write_text(
-                json.dumps(contract) + "\n"
-            )
+            (targets / "target-contract.json").write_text(json.dumps(contract) + "\n")
             for split in ("train", "valid"):
                 (targets / split / "._0000000000.safetensors").write_bytes(
                     b"macOS AppleDouble metadata"
@@ -1117,16 +1207,12 @@ class RunEvidenceTests(unittest.TestCase):
                 "reuse",
             )
             contract["splits"]["valid"]["target_count"] = 2
-            (targets / "target-contract.json").write_text(
-                json.dumps(contract) + "\n"
-            )
+            (targets / "target-contract.json").write_text(json.dumps(contract) + "\n")
             with self.assertRaisesRegex(ValueError, "counts/rows"):
                 run._target_dir_state(targets)
             self.assertEqual(run._target_dir_state(targets / "fresh"), "new")
         with self.assertRaisesRegex(ValueError, "require --target-dir"):
-            run._parse_run_context(
-                ["alis_dwq.run", "--model", "/model", "--seed", "7"]
-            )
+            run._parse_run_context(["alis_dwq.run", "--model", "/model", "--seed", "7"])
         with self.assertRaisesRegex(ValueError, "do not support --pipeline"):
             run._parse_run_context(
                 [
