@@ -287,6 +287,32 @@ class RunEvidenceTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "hash mismatch|bytes changed"):
                 run._revalidate_runtime_tokenizer_bundle(bundle)
 
+    def test_generated_tokenizer_cleanup_removes_appledouble_first(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            payload = root / "tokenizer.json"
+            sidecar = root / "._tokenizer.json"
+            payload.write_bytes(b"generated")
+            sidecar.write_bytes(b"AppleDouble")
+            removed = []
+            original_unlink = Path.unlink
+
+            def unlink_with_non_apfs_side_effect(path, *args, **kwargs):
+                removed.append(path.name)
+                if path == payload and sidecar.exists():
+                    original_unlink(sidecar)
+                return original_unlink(path, *args, **kwargs)
+
+            with (
+                mock.patch.object(
+                    Path, "iterdir", return_value=iter([payload, sidecar])
+                ),
+                mock.patch.object(Path, "unlink", new=unlink_with_non_apfs_side_effect),
+            ):
+                run._remove_generated_tokenizer_files(root)
+
+            self.assertEqual(removed, ["._tokenizer.json", "tokenizer.json"])
+
     def test_frozen_runtime_tokenizer_rejects_tamper_and_option_conflicts(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

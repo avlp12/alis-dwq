@@ -465,7 +465,13 @@ def _revalidate_frozen_runtime_tokenizer(
 
 
 def _remove_generated_tokenizer_files(root: Path) -> None:
-    for path in root.iterdir():
+    # On non-APFS volumes macOS may remove ``._name`` as a side effect of
+    # unlinking ``name``. Delete AppleDouble entries first so a later iterator
+    # item cannot disappear with its associated payload file.
+    paths = sorted(
+        root.iterdir(), key=lambda path: (not path.name.startswith("._"), path.name)
+    )
+    for path in paths:
         if not _is_tokenizer_related_name(path.name):
             continue
         if path.is_symlink() or not path.is_file():
