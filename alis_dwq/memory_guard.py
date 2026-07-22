@@ -267,7 +267,7 @@ class MemoryGuard:
         if (
             self.limits.max_swap_increase_bytes is not None
             and evidence["swap_increase_bytes"] is not None
-            and evidence["swap_increase_bytes"] > self.limits.max_swap_increase_bytes
+            and evidence["swap_increase_bytes"] >= self.limits.max_swap_increase_bytes
         ):
             reasons.append("swap_increase")
         if reasons:

@@ -9,6 +9,7 @@ two-event, no-clobber run-evidence JSONL for completed runs.
 from __future__ import annotations
 
 import argparse
+import functools
 import hashlib
 import importlib.metadata
 import json
@@ -1380,6 +1381,74 @@ def _guarded_dwq_quantizer(original, guard: MemoryGuard):
     return quantize
 
 
+def _guarded_model_saver(original, guard: MemoryGuard):
+    """Bracket upstream's whole-checkpoint save with memory stop gates."""
+
+    @functools.wraps(original)
+    def save(dst_path, *args, **kwargs):
+        observed = os.path.abspath(dst_path)
+        guard.check("before-upstream-model-save", model_path=observed)
+        result = original(dst_path, *args, **kwargs)
+        guard.check("after-upstream-model-save", model_path=observed)
+        return result
+
+    return save
+
+
+def _guarded_make_shards(original, guard: MemoryGuard):
+    """Gate the eager full-checkpoint shard-list materialization."""
+
+    @functools.wraps(original)
+    def make_shards(weights, *args, **kwargs):
+        guard.check(
+            "before-upstream-shard-materialization",
+            tensor_count=len(weights),
+        )
+        shards = original(weights, *args, **kwargs)
+        guard.check(
+            "after-upstream-shard-materialization",
+            shard_count=len(shards),
+        )
+        return shards
+
+    return make_shards
+
+
+class _GuardedMlxSaveProxy:
+    """Delegate MLX operations while gating each safetensors shard write."""
+
+    def __init__(self, delegate, guard: MemoryGuard):
+        self._delegate = delegate
+        self._guard = guard
+
+    def __getattr__(self, name):
+        return getattr(self._delegate, name)
+
+    def save_safetensors(self, path, *args, **kwargs):
+        observed = os.path.abspath(path)
+        self._guard.check("before-upstream-shard-save", shard_path=observed)
+        result = self._delegate.save_safetensors(path, *args, **kwargs)
+        self._guard.check("after-upstream-shard-save", shard_path=observed)
+        return result
+
+
+def _upstream_save_runtime(original):
+    """Resolve and validate the module globals used by mlx-lm's save function."""
+
+    module_name = getattr(original, "__module__", None)
+    if not isinstance(module_name, str) or not module_name:
+        raise RuntimeError("upstream model saver has no resolvable module")
+    module = importlib.import_module(module_name)
+    if not callable(getattr(module, "make_shards", None)):
+        raise RuntimeError("upstream model saver module has no callable make_shards")
+    runtime = getattr(module, "mx", None)
+    if runtime is None or not callable(getattr(runtime, "save_safetensors", None)):
+        raise RuntimeError(
+            "upstream model saver module has no callable mx.save_safetensors"
+        )
+    return module
+
+
 def main(argv=None) -> None:
     global _ACTIVE_DATA_BINDING, _RUN_CONTEXT, _RUN_MEMORY_GUARD
     global _TARGET_CONTRACT_DIGEST, _TARGET_CONTRACT_PATH
@@ -1413,6 +1482,10 @@ def main(argv=None) -> None:
     previous_load_tokenizer = None
     previous_model_loader = None
     previous_dwq_quantizer = None
+    previous_model_saver = None
+    upstream_save_runtime = None
+    previous_make_shards = None
+    previous_save_mx = None
     try:
         if group.rank() == 0:
             _reserve_memory_evidence_path(
@@ -1440,6 +1513,18 @@ def main(argv=None) -> None:
             D.load_tokenizer = _frozen_tokenizer_loader(
                 previous_load_tokenizer, frozen_root
             )
+        strict_laguna = _is_guarded_laguna_context(_RUN_CONTEXT)
+        if (
+            strict_laguna
+            and not _RUN_CONTEXT["targets_only"]
+            and _RUN_CONTEXT["quantized_model"] is None
+        ):
+            raise ValueError(
+                "guarded Laguna DWQ runs require --quantized-model from the "
+                "official execution manifest; in-process deepcopy and stock "
+                "quantization are outside the guarded memory contract"
+            )
+
         target_dir = _RUN_CONTEXT["target_dir"]
         target_state = _target_dir_state(
             target_dir,
@@ -1467,7 +1552,6 @@ def main(argv=None) -> None:
             pre_dwq = _RUN_CONTEXT["quantized_model"] or _RUN_CONTEXT["model"]
             pre_digest = directory_digest(pre_dwq)
 
-        strict_laguna = _is_guarded_laguna_context(_RUN_CONTEXT)
         memory_phase = "upstream-dwq-bootstrap"
         recommended = configure_recommended_wired_limit(memory_phase)
         _RUN_MEMORY_GUARD = MemoryGuard(
@@ -1491,6 +1575,18 @@ def main(argv=None) -> None:
         D.dwq_quantize = _guarded_dwq_quantizer(
             previous_dwq_quantizer, _RUN_MEMORY_GUARD
         )
+        if strict_laguna:
+            previous_model_saver = D.save
+            upstream_save_runtime = _upstream_save_runtime(previous_model_saver)
+            previous_make_shards = upstream_save_runtime.make_shards
+            previous_save_mx = upstream_save_runtime.mx
+            upstream_save_runtime.make_shards = _guarded_make_shards(
+                previous_make_shards, _RUN_MEMORY_GUARD
+            )
+            upstream_save_runtime.mx = _GuardedMlxSaveProxy(
+                previous_save_mx, _RUN_MEMORY_GUARD
+            )
+            D.save = _guarded_model_saver(previous_model_saver, _RUN_MEMORY_GUARD)
 
         exit_code = None
         previous_argv = sys.argv
@@ -1516,6 +1612,17 @@ def main(argv=None) -> None:
             if previous_dwq_quantizer is not None:
                 D.dwq_quantize = previous_dwq_quantizer
                 previous_dwq_quantizer = None
+            if previous_model_saver is not None:
+                D.save = previous_model_saver
+                previous_model_saver = None
+            if upstream_save_runtime is not None:
+                if previous_make_shards is not None:
+                    upstream_save_runtime.make_shards = previous_make_shards
+                    previous_make_shards = None
+                if previous_save_mx is not None:
+                    upstream_save_runtime.mx = previous_save_mx
+                    previous_save_mx = None
+                upstream_save_runtime = None
 
         if runtime_tokenizer is not None:
             _revalidate_runtime_tokenizer_bundle(runtime_tokenizer)
@@ -1631,6 +1738,13 @@ def main(argv=None) -> None:
             D.load = previous_model_loader
         if previous_dwq_quantizer is not None:
             D.dwq_quantize = previous_dwq_quantizer
+        if previous_model_saver is not None:
+            D.save = previous_model_saver
+        if upstream_save_runtime is not None:
+            if previous_make_shards is not None:
+                upstream_save_runtime.make_shards = previous_make_shards
+            if previous_save_mx is not None:
+                upstream_save_runtime.mx = previous_save_mx
         _RUN_MEMORY_GUARD = None
         if frozen_tokenizer_dir is not None:
             frozen_tokenizer_dir.cleanup()

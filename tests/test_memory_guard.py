@@ -192,7 +192,7 @@ class TestMemoryGuard(unittest.TestCase):
 
     def test_stop_gate_uses_strict_thresholds_and_phase_swap_baseline(self):
         fake = FakeMX(peak=90, active=80, recommended=100)
-        swap_values = iter([10 * GIB, 26 * GIB, 26 * GIB + 1])
+        swap_values = iter([10 * GIB, 26 * GIB])
         events = []
         guard = MemoryGuard(
             "training",
@@ -202,18 +202,13 @@ class TestMemoryGuard(unittest.TestCase):
             emitter=events.append,
         )
         guard.start()
-        # Equality with both defaults is allowed: gates are strictly greater-than.
-        sample = guard.check("at-limit")
-        self.assertEqual(sample["peak_fraction"], 0.9)
-        self.assertEqual(sample["swap_increase_bytes"], 16 * GIB)
-        self.assertEqual(events[-1]["event"], "memory_sample")
-
-        fake.peak = 91
+        # Peak equality is allowed, but the plan requires a stop at a swap
+        # increase of 16 GiB or greater.
         with self.assertRaises(MemoryLimitExceeded) as caught:
-            guard.check("over-limit", iteration=3)
+            guard.check("at-swap-limit", iteration=3)
         self.assertEqual(
             set(caught.exception.evidence["reasons"]),
-            {"peak_working_set", "swap_increase"},
+            {"swap_increase"},
         )
         self.assertEqual(caught.exception.evidence["iteration"], 3)
         self.assertEqual(events[-1]["event"], "memory_stop_gate")

@@ -295,6 +295,8 @@ class RunEvidenceTests(unittest.TestCase):
                     run._load_runtime_tokenizer_bundle(source, contract_path)
 
     def test_fake_upstream_output_is_replaced_before_digest_and_completion(self):
+        import mlx_lm.utils as mlx_utils
+
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source, targets, contract_path, files, _ = self._runtime_tokenizer_fixture(
@@ -307,6 +309,10 @@ class RunEvidenceTests(unittest.TestCase):
             student.mkdir()
             (teacher / "model.safetensors").write_bytes(b"teacher")
             (student / "model.safetensors").write_bytes(b"student")
+            for checkpoint in (teacher, student):
+                (checkpoint / "config.json").write_text(
+                    json.dumps({"model_type": "laguna"}) + "\n"
+                )
             argv = [
                 "alis_dwq.run",
                 "--model",
@@ -327,6 +333,9 @@ class RunEvidenceTests(unittest.TestCase):
             sequence = []
             loaded_from = []
             target_digest = hashlib.sha256(contract_path.read_bytes()).hexdigest()
+            original_save = run.D.save
+            original_make_shards = mlx_utils.make_shards
+            original_mx = mlx_utils.mx
 
             class Recorder:
                 def record(self, payload):
@@ -345,6 +354,9 @@ class RunEvidenceTests(unittest.TestCase):
 
             def fake_upstream():
                 sequence.append("upstream")
+                self.assertIsNot(run.D.save, original_save)
+                self.assertIsNot(mlx_utils.make_shards, original_make_shards)
+                self.assertIsNot(mlx_utils.mx, original_mx)
                 self.assertFalse(
                     any("runtime-tokenizer-source" in value for value in run.sys.argv)
                 )
@@ -394,6 +406,9 @@ class RunEvidenceTests(unittest.TestCase):
                 sequence,
                 ["record", "upstream", "validate", "install", "publish"],
             )
+            self.assertIs(run.D.save, original_save)
+            self.assertIs(mlx_utils.make_shards, original_make_shards)
+            self.assertIs(mlx_utils.mx, original_mx)
             self.assertEqual(len(loaded_from), 1)
             self.assertNotEqual(loaded_from[0], source)
             self.assertFalse(loaded_from[0].exists())
@@ -521,6 +536,445 @@ class RunEvidenceTests(unittest.TestCase):
                 list(root.glob("output.partial-memory-stop-test-*")),
                 [root / f"output.partial-memory-stop-test-{os.getpid()}"],
             )
+
+    def test_laguna_model_save_stop_retains_partial_and_restores_patches(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            teacher = root / "teacher"
+            student = root / "student"
+            targets = root / "targets"
+            output = root / "output"
+            for checkpoint in (teacher, student):
+                checkpoint.mkdir()
+                (checkpoint / "model.safetensors").write_bytes(b"weights")
+                (checkpoint / "config.json").write_text(
+                    json.dumps({"model_type": "laguna"}) + "\n"
+                )
+            targets.mkdir()
+            sequence = []
+            state = {}
+
+            class Recorder:
+                def record(self, _payload):
+                    sequence.append("record")
+
+                def publish(self, _payload):
+                    raise AssertionError("a stopped save must not publish completion")
+
+                def publish_incomplete(self, _payload):
+                    sequence.append("publish-incomplete")
+                    state["restored_during_failure"] = (
+                        run.D.load is state["original_load"]
+                        and run.D.dwq_quantize is state["original_quantizer"]
+                        and run.D.save is state["original_save"]
+                    )
+
+            class Guard:
+                def __init__(self, _phase, _recommended, **_kwargs):
+                    pass
+
+                def start(self):
+                    sequence.append("start")
+
+                def check(self, checkpoint, **_context):
+                    sequence.append(("check", checkpoint))
+                    if checkpoint == "after-upstream-model-save":
+                        raise MemoryLimitExceeded(
+                            {"event": "memory_stop_gate", "checkpoint": checkpoint}
+                        )
+
+            def fake_save(path, *_args, **_kwargs):
+                sequence.append("save")
+                destination = Path(path)
+                (destination / "model.safetensors").write_bytes(b"partial weights")
+
+            fake_save.__module__ = "mlx_lm.utils"
+
+            def fake_upstream():
+                sequence.append("upstream")
+                staging = Path(run.sys.argv[run.sys.argv.index("--mlx-path") + 1])
+                run.D.save(staging, student, object(), object(), {})
+                self.fail("post-save stop must prevent final publication")
+
+            argv = [
+                "alis_dwq.run",
+                "--model",
+                str(teacher),
+                "--quantized-model",
+                str(student),
+                "--target-dir",
+                str(targets),
+                "--mlx-path",
+                str(output),
+                "--seed",
+                "7",
+            ]
+            group = mock.Mock()
+            group.rank.return_value = 0
+            group.size.return_value = 1
+            with (
+                mock.patch.object(run.mx.distributed, "init", return_value=group),
+                mock.patch.object(run.D, "load_data", run._load_local),
+                mock.patch.object(run.D, "load") as original_load,
+                mock.patch.object(run.D, "dwq_quantize") as original_quantizer,
+                mock.patch.object(run.D, "save", fake_save),
+                mock.patch.object(run.D, "main", side_effect=fake_upstream),
+                mock.patch.object(run, "_target_dir_state", return_value="reuse"),
+                mock.patch.object(run, "_RunEvidenceRecorder", return_value=Recorder()),
+                mock.patch.object(
+                    run,
+                    "_started_payload",
+                    return_value={"run_id": "save-stop-test"},
+                ),
+                mock.patch.object(
+                    run, "configure_recommended_wired_limit", return_value=1_000
+                ),
+                mock.patch.object(run, "MemoryGuard", Guard),
+            ):
+                state["original_load"] = original_load
+                state["original_quantizer"] = original_quantizer
+                state["original_save"] = fake_save
+                with self.assertRaises(MemoryLimitExceeded):
+                    run.main(argv)
+
+            self.assertTrue(state["restored_during_failure"])
+            self.assertLess(
+                sequence.index(("check", "before-upstream-model-save")),
+                sequence.index("save"),
+            )
+            self.assertLess(
+                sequence.index("save"),
+                sequence.index(("check", "after-upstream-model-save")),
+            )
+            self.assertIn("publish-incomplete", sequence)
+            self.assertFalse(output.exists())
+            partial = root / f"output.partial-save-stop-test-{os.getpid()}"
+            self.assertEqual(list(root.glob("output.partial-save-stop-test-*")), [partial])
+            self.assertEqual(
+                (partial / "model.safetensors").read_bytes(), b"partial weights"
+            )
+
+    def test_non_laguna_run_does_not_patch_model_or_shard_savers(self):
+        import mlx_lm.utils as mlx_utils
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            teacher = root / "teacher"
+            student = root / "student"
+            targets = root / "targets"
+            output = root / "output"
+            for checkpoint in (teacher, student):
+                checkpoint.mkdir()
+                (checkpoint / "model.safetensors").write_bytes(b"weights")
+                (checkpoint / "config.json").write_text(
+                    json.dumps({"model_type": "llama"}) + "\n"
+                )
+            targets.mkdir()
+
+            class Recorder:
+                def record(self, _payload):
+                    pass
+
+                def publish(self, _payload):
+                    raise AssertionError("the synthetic run must fail")
+
+                def publish_incomplete(self, _payload):
+                    pass
+
+            class Guard:
+                def __init__(self, _phase, _recommended, **_kwargs):
+                    pass
+
+                def start(self):
+                    pass
+
+                def check(self, _checkpoint, **_context):
+                    pass
+
+            def sentinel_save(*_args, **_kwargs):
+                raise AssertionError("the synthetic run does not save")
+
+            original_make_shards = mlx_utils.make_shards
+            original_mx = mlx_utils.mx
+
+            def fake_upstream():
+                self.assertIs(run.D.save, sentinel_save)
+                self.assertIs(mlx_utils.make_shards, original_make_shards)
+                self.assertIs(mlx_utils.mx, original_mx)
+                raise RuntimeError("synthetic upstream stop")
+
+            argv = [
+                "alis_dwq.run",
+                "--model",
+                str(teacher),
+                "--quantized-model",
+                str(student),
+                "--target-dir",
+                str(targets),
+                "--mlx-path",
+                str(output),
+                "--seed",
+                "7",
+            ]
+            group = mock.Mock()
+            group.rank.return_value = 0
+            group.size.return_value = 1
+            with (
+                mock.patch.object(run.mx.distributed, "init", return_value=group),
+                mock.patch.object(run.D, "load_data", run._load_local),
+                mock.patch.object(run.D, "save", sentinel_save),
+                mock.patch.object(run.D, "main", side_effect=fake_upstream),
+                mock.patch.object(run, "_target_dir_state", return_value="reuse"),
+                mock.patch.object(run, "_RunEvidenceRecorder", return_value=Recorder()),
+                mock.patch.object(
+                    run,
+                    "_started_payload",
+                    return_value={"run_id": "non-laguna-test"},
+                ),
+                mock.patch.object(
+                    run, "configure_recommended_wired_limit", return_value=1_000
+                ),
+                mock.patch.object(run, "MemoryGuard", Guard),
+                mock.patch.object(run, "_upstream_save_runtime") as save_runtime,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "synthetic upstream stop"):
+                    run.main(argv)
+
+            save_runtime.assert_not_called()
+            self.assertIs(mlx_utils.make_shards, original_make_shards)
+            self.assertIs(mlx_utils.mx, original_mx)
+
+    def test_laguna_mid_shard_stop_retains_written_shards_and_restores_all_patches(
+        self,
+    ):
+        import mlx_lm.utils as mlx_utils
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            teacher = root / "teacher"
+            student = root / "student"
+            targets = root / "targets"
+            output = root / "output"
+            for checkpoint in (teacher, student):
+                checkpoint.mkdir()
+                (checkpoint / "model.safetensors").write_bytes(b"weights")
+                (checkpoint / "config.json").write_text(
+                    json.dumps({"model_type": "laguna"}) + "\n"
+                )
+            targets.mkdir()
+            sequence = []
+            state = {}
+
+            class Weight:
+                nbytes = 1
+
+            class FakeMx:
+                def save_safetensors(self, path, _shard, **_kwargs):
+                    sequence.append(("write", Path(path).name))
+                    Path(path).write_bytes(b"written")
+
+            class Recorder:
+                def record(self, _payload):
+                    sequence.append("record")
+
+                def publish(self, _payload):
+                    raise AssertionError("a stopped shard save must not complete")
+
+                def publish_incomplete(self, _payload):
+                    sequence.append("publish-incomplete")
+                    state["restored_during_failure"] = (
+                        run.D.load is state["original_load"]
+                        and run.D.dwq_quantize is state["original_quantizer"]
+                        and run.D.save is state["original_save"]
+                        and mlx_utils.make_shards is state["original_make_shards"]
+                        and mlx_utils.mx is state["original_mx"]
+                    )
+
+            class Guard:
+                def __init__(self, _phase, _recommended, **_kwargs):
+                    pass
+
+                def start(self):
+                    sequence.append("start")
+
+                def check(self, checkpoint, **context):
+                    shard_name = (
+                        Path(context["shard_path"]).name
+                        if "shard_path" in context
+                        else None
+                    )
+                    sequence.append(("check", checkpoint, shard_name))
+                    if (
+                        checkpoint == "before-upstream-shard-save"
+                        and shard_name == "model-00002-of-00003.safetensors"
+                    ):
+                        raise MemoryLimitExceeded(
+                            {"event": "memory_stop_gate", "checkpoint": checkpoint}
+                        )
+
+            def fake_make_shards(_weights, *_args, **_kwargs):
+                sequence.append("make-shards")
+                return [{"one": Weight()}, {"two": Weight()}, {"three": Weight()}]
+
+            def fake_save(path, *_args, **_kwargs):
+                destination = Path(path)
+                shards = mlx_utils.make_shards({"weight": Weight()})
+                for index, shard in enumerate(shards, 1):
+                    name = f"model-{index:05d}-of-{len(shards):05d}.safetensors"
+                    mlx_utils.mx.save_safetensors(destination / name, shard)
+
+            fake_save.__module__ = "mlx_lm.utils"
+
+            def fake_upstream():
+                staging = Path(run.sys.argv[run.sys.argv.index("--mlx-path") + 1])
+                run.D.save(staging, student, object(), object(), {})
+
+            argv = [
+                "alis_dwq.run",
+                "--model",
+                str(teacher),
+                "--quantized-model",
+                str(student),
+                "--target-dir",
+                str(targets),
+                "--mlx-path",
+                str(output),
+                "--seed",
+                "7",
+            ]
+            group = mock.Mock()
+            group.rank.return_value = 0
+            group.size.return_value = 1
+            fake_mx = FakeMx()
+            with (
+                mock.patch.object(run.mx.distributed, "init", return_value=group),
+                mock.patch.object(run.D, "load_data", run._load_local),
+                mock.patch.object(run.D, "load") as original_load,
+                mock.patch.object(run.D, "dwq_quantize") as original_quantizer,
+                mock.patch.object(run.D, "save", fake_save),
+                mock.patch.object(mlx_utils, "make_shards", fake_make_shards),
+                mock.patch.object(mlx_utils, "mx", fake_mx),
+                mock.patch.object(run.D, "main", side_effect=fake_upstream),
+                mock.patch.object(run, "_target_dir_state", return_value="reuse"),
+                mock.patch.object(run, "_RunEvidenceRecorder", return_value=Recorder()),
+                mock.patch.object(
+                    run,
+                    "_started_payload",
+                    return_value={"run_id": "shard-stop-test"},
+                ),
+                mock.patch.object(
+                    run, "configure_recommended_wired_limit", return_value=1_000
+                ),
+                mock.patch.object(run, "MemoryGuard", Guard),
+            ):
+                state["original_load"] = original_load
+                state["original_quantizer"] = original_quantizer
+                state["original_save"] = fake_save
+                state["original_make_shards"] = fake_make_shards
+                state["original_mx"] = fake_mx
+                with self.assertRaises(MemoryLimitExceeded):
+                    run.main(argv)
+
+            self.assertTrue(state["restored_during_failure"])
+            self.assertFalse(output.exists())
+            partial = root / f"output.partial-shard-stop-test-{os.getpid()}"
+            self.assertEqual(list(root.glob("output.partial-shard-stop-test-*")), [partial])
+            self.assertTrue((partial / "model-00001-of-00003.safetensors").is_file())
+            self.assertFalse((partial / "model-00002-of-00003.safetensors").exists())
+            checks_and_writes = [
+                entry for entry in sequence if isinstance(entry, tuple)
+            ]
+            first_save_gate = checks_and_writes.index(
+                ("check", "before-upstream-model-save", None)
+            )
+            self.assertEqual(
+                checks_and_writes[first_save_gate:],
+                [
+                    ("check", "before-upstream-model-save", None),
+                    ("check", "before-upstream-shard-materialization", None),
+                    ("check", "after-upstream-shard-materialization", None),
+                    (
+                        "check",
+                        "before-upstream-shard-save",
+                        "model-00001-of-00003.safetensors",
+                    ),
+                    ("write", "model-00001-of-00003.safetensors"),
+                    (
+                        "check",
+                        "after-upstream-shard-save",
+                        "model-00001-of-00003.safetensors",
+                    ),
+                    (
+                        "check",
+                        "before-upstream-shard-save",
+                        "model-00002-of-00003.safetensors",
+                    ),
+                ],
+            )
+            self.assertIn("publish-incomplete", sequence)
+
+    def test_guarded_laguna_requires_manifest_quantized_model_before_upstream(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            teacher = root / "teacher"
+            targets = root / "targets"
+            output = root / "output"
+            teacher.mkdir()
+            targets.mkdir()
+            (teacher / "model.safetensors").write_bytes(b"weights")
+            (teacher / "config.json").write_text(
+                json.dumps({"model_type": "laguna"}) + "\n"
+            )
+            incomplete = []
+
+            class Recorder:
+                def record(self, _payload):
+                    pass
+
+                def publish(self, _payload):
+                    raise AssertionError("a rejected run must not publish completion")
+
+                def publish_incomplete(self, payload):
+                    incomplete.append(payload)
+
+            argv = [
+                "alis_dwq.run",
+                "--model",
+                str(teacher),
+                "--target-dir",
+                str(targets),
+                "--mlx-path",
+                str(output),
+                "--seed",
+                "7",
+            ]
+            group = mock.Mock()
+            group.rank.return_value = 0
+            group.size.return_value = 1
+            with (
+                mock.patch.object(run.mx.distributed, "init", return_value=group),
+                mock.patch.object(run.D, "load_data", run._load_local),
+                mock.patch.object(run.D, "main") as upstream,
+                mock.patch.object(run, "_target_dir_state") as target_state,
+                mock.patch.object(run, "configure_recommended_wired_limit") as wired,
+                mock.patch.object(run, "_RunEvidenceRecorder", return_value=Recorder()),
+                mock.patch.object(
+                    run,
+                    "_started_payload",
+                    return_value={"run_id": "missing-student-test"},
+                ),
+            ):
+                with self.assertRaisesRegex(
+                    ValueError, "require --quantized-model.*official execution manifest"
+                ):
+                    run.main(argv)
+
+            upstream.assert_not_called()
+            target_state.assert_not_called()
+            wired.assert_not_called()
+            self.assertFalse(output.exists())
+            self.assertEqual(len(incomplete), 1)
+            self.assertEqual(incomplete[0]["event"], "run_failed")
 
     def test_completed_evidence_is_exactly_two_no_clobber_events(self):
         with tempfile.TemporaryDirectory() as directory:
