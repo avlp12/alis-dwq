@@ -136,6 +136,96 @@ class TargetContractTests(unittest.TestCase):
         encoded += b" " * (-len(encoded) % 8)
         path.write_bytes(len(encoded).to_bytes(8, "little") + encoded + logits + indices)
 
+    def _laguna_data_fixture(
+        self,
+        root: Path,
+        *,
+        file_identity: bool = False,
+        split_counts: dict[str, int] | None = None,
+    ):
+        data_dir = root / "laguna-data"
+        tokenizer_dir = root / "runtime-tokenizer"
+        data_dir.mkdir()
+        tokenizer_dir.mkdir()
+        runtime_bytes = b'{"runtime": "fixed-mistral-regex"}\n'
+        (tokenizer_dir / "tokenizer.json").write_bytes(runtime_bytes)
+        runtime_hash = hashlib.sha256(runtime_bytes).hexdigest()
+        source_hash = (
+            runtime_hash
+            if file_identity
+            else hashlib.sha256(b"source tokenizer bytes").hexdigest()
+        )
+        split_counts = split_counts or {"train": 80, "valid": 40, "heldout": 100}
+        summaries = {}
+        for split, count in split_counts.items():
+            rows = []
+            ordered_hashes = []
+            for index in range(count):
+                text = f"{split}-{index:03d}"
+                token_ids = [ord(character) for character in text]
+                token_hash = hashlib.sha256(
+                    canonical_json_bytes(token_ids)
+                ).hexdigest()
+                rows.append(
+                    {
+                        "text": text,
+                        "raw_sha256": hashlib.sha256(text.encode()).hexdigest(),
+                        "eval_sequence_tokens": len(token_ids),
+                        "token_ids_sha256": token_hash,
+                    }
+                )
+                ordered_hashes.append(token_hash)
+            (data_dir / f"{split}.jsonl").write_text(
+                "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows)
+            )
+            summaries[split] = {
+                "row_count": count,
+                "ordered_token_ids_sha256": hashlib.sha256(
+                    canonical_json_bytes(ordered_hashes)
+                ).hexdigest(),
+            }
+        manifest = {
+            "format_version": 2,
+            "chat_template": "Laguna-S-2.1 local tokenizer",
+            "tokenizer_files_sha256": {"tokenizer.json": source_hash},
+            "tokenizer_options": {"fix_mistral_regex": True},
+            "tokenization_contract": {
+                "name": "ALIS_DWQ_TEXT_TOKENIZATION=preformatted_chat",
+                "preformatted_chat": True,
+                "add_special_tokens": False,
+                "append_eos": False,
+            },
+            "token_id_hashes": {
+                "schema": "sha256-canonical-json-token-ids/v1",
+                "field": "token_ids_sha256",
+                "tokenization": {
+                    "name": "ALIS_DWQ_TEXT_TOKENIZATION=preformatted_chat",
+                    "preformatted_chat": True,
+                    "add_special_tokens": False,
+                    "append_eos": False,
+                },
+                "all_rows_verified": True,
+                "splits": summaries,
+            },
+        }
+        (data_dir / "manifest.json").write_text(
+            json.dumps(manifest, sort_keys=True) + "\n"
+        )
+        return data_dir, tokenizer_dir, manifest
+
+    def _prepare_laguna(self, data_dir: Path, tokenizer_dir: Path):
+        return prepare_local_data(
+            FakeTokenizer(),
+            data_dir,
+            tokenizer_path=tokenizer_dir,
+            num_samples=1,
+            num_valid_samples=1,
+            max_seq_length=32,
+            seed=7,
+            tokenization="preformatted_chat",
+            text_dataset_factory=FakeTextDataset,
+        )
+
     def _fixture(self, root: Path):
         data_dir = root / "data"
         tokenizer_dir = root / "tokenizer"
@@ -149,7 +239,7 @@ class TargetContractTests(unittest.TestCase):
         }
         (data_dir / "manifest.json").write_text(
             json.dumps(
-                {"format_version": 2, "tokenizer_files_sha256": tokenizer_hashes},
+                {"format_version": 1, "tokenizer_files_sha256": tokenizer_hashes},
                 sort_keys=True,
             )
             + "\n"
@@ -201,6 +291,213 @@ class TargetContractTests(unittest.TestCase):
                     split_dir / f"{index:010d}.safetensors", split, index
                 )
         return data_dir, tokenizer_dir, targets, binding
+
+    def test_laguna_source_runtime_tokenizer_equivalence_is_bound(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data, tokenizer, manifest = self._laguna_data_fixture(root)
+            _, _, binding = self._prepare_laguna(data, tokenizer)
+            equivalence = binding["tokenizer_equivalence"]
+            self.assertEqual(
+                set(equivalence),
+                {
+                    "schema",
+                    "mode",
+                    "source_tokenizer_files_sha256",
+                    "source_tokenizer_options",
+                    "runtime_tokenizer_files_sha256",
+                    "verified_splits",
+                    "all_rows_verified",
+                },
+            )
+            self.assertEqual(
+                equivalence["schema"], "alis-dwq.tokenizer-equivalence/v1"
+            )
+            self.assertEqual(
+                equivalence["mode"], "all-declared-row-token-ids"
+            )
+            self.assertEqual(
+                equivalence["source_tokenizer_files_sha256"],
+                manifest["tokenizer_files_sha256"],
+            )
+            self.assertEqual(
+                equivalence["source_tokenizer_options"],
+                {"fix_mistral_regex": True},
+            )
+            self.assertEqual(
+                equivalence["runtime_tokenizer_files_sha256"],
+                binding["tokenizer_files_sha256"],
+            )
+            self.assertEqual(
+                equivalence["verified_splits"],
+                manifest["token_id_hashes"]["splits"],
+            )
+            self.assertEqual(
+                {
+                    split: row["row_count"]
+                    for split, row in equivalence["verified_splits"].items()
+                },
+                {"train": 80, "valid": 40, "heldout": 100},
+            )
+            self.assertTrue(equivalence["all_rows_verified"])
+
+            targets = root / "targets"
+            for split in ("train", "valid"):
+                split_dir = targets / split
+                split_dir.mkdir(parents=True, exist_ok=True)
+                self._write_target(
+                    split_dir / "0000000000.safetensors",
+                    split,
+                    0,
+                    sequence_length=31,
+                )
+            contract = build_target_contract(
+                binding,
+                targets,
+                run_id="runtime-tokenizer-equivalence",
+                teacher_identity="teacher",
+                teacher_revision="revision",
+                teacher_checkpoint_digest="a" * 64,
+                max_seq_length=32,
+                batch_size=1,
+                top_k=1024,
+                seed=7,
+            )
+            self.assertEqual(contract["tokenizer_equivalence"], equivalence)
+            self.assertEqual(
+                contract["tokenizer_files_sha256"],
+                equivalence["runtime_tokenizer_files_sha256"],
+            )
+
+    def test_laguna_matching_tokenizer_files_uses_identity_mode(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data, tokenizer, _ = self._laguna_data_fixture(
+                Path(directory), file_identity=True
+            )
+            _, _, binding = self._prepare_laguna(data, tokenizer)
+            equivalence = binding["tokenizer_equivalence"]
+            self.assertEqual(equivalence["mode"], "file-identity")
+            self.assertEqual(
+                equivalence["source_tokenizer_files_sha256"],
+                equivalence["runtime_tokenizer_files_sha256"],
+            )
+
+    def test_laguna_equivalence_requires_exact_release_split_counts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data, tokenizer, _ = self._laguna_data_fixture(
+                Path(directory),
+                split_counts={"train": 1, "valid": 1, "heldout": 1},
+            )
+            with self.assertRaisesRegex(
+                ValueError, "exactly 80 train, 40 valid, and 100 heldout"
+            ):
+                self._prepare_laguna(data, tokenizer)
+
+    def test_laguna_tokenizer_options_are_exact_and_boolean(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data, tokenizer, manifest = self._laguna_data_fixture(Path(directory))
+            cases = (
+                None,
+                {"fix_mistral_regex": False},
+                {"fix_mistral_regex": 1},
+                {"fix_mistral_regex": True, "extra": False},
+            )
+            for options in cases:
+                with self.subTest(options=options):
+                    changed = dict(manifest)
+                    if options is None:
+                        changed.pop("tokenizer_options")
+                    else:
+                        changed["tokenizer_options"] = options
+                    (data / "manifest.json").write_text(
+                        json.dumps(changed, sort_keys=True) + "\n"
+                    )
+                    with self.assertRaisesRegex(ValueError, "tokenizer_options"):
+                        self._prepare_laguna(data, tokenizer)
+
+    def test_laguna_source_tokenizer_hashes_are_required_and_well_formed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data, tokenizer, manifest = self._laguna_data_fixture(Path(directory))
+            cases = (None, {}, {"tokenizer.json": "not-a-sha256"})
+            for source_hashes in cases:
+                with self.subTest(source_hashes=source_hashes):
+                    changed = dict(manifest)
+                    if source_hashes is None:
+                        changed.pop("tokenizer_files_sha256")
+                    else:
+                        changed["tokenizer_files_sha256"] = source_hashes
+                    (data / "manifest.json").write_text(
+                        json.dumps(changed, sort_keys=True) + "\n"
+                    )
+                    with self.assertRaisesRegex(
+                        ValueError, "invalid source tokenizer hashes"
+                    ):
+                        self._prepare_laguna(data, tokenizer)
+
+    def test_laguna_all_splits_and_unselected_rows_are_retokenized(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data, tokenizer, _ = self._laguna_data_fixture(Path(directory))
+            originals = {
+                split: (data / f"{split}.jsonl").read_text()
+                for split in ("train", "valid", "heldout")
+            }
+            for split in ("train", "valid", "heldout"):
+                with self.subTest(split=split):
+                    path = data / f"{split}.jsonl"
+                    rows = [json.loads(line) for line in originals[split].splitlines()]
+                    rows[-1]["token_ids_sha256"] = "0" * 64
+                    path.write_text(
+                        "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows)
+                    )
+                    with self.assertRaisesRegex(
+                        ValueError, f"{split} row .* token_ids_sha256 mismatch"
+                    ):
+                        self._prepare_laguna(data, tokenizer)
+                    path.write_text(originals[split])
+
+            heldout = data / "heldout.jsonl"
+            rows = [json.loads(line) for line in originals["heldout"].splitlines()]
+            rows[-1]["eval_sequence_tokens"] += 1
+            heldout.write_text(
+                "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows)
+            )
+            with self.assertRaisesRegex(
+                ValueError, "heldout row .* eval_sequence_tokens mismatch"
+            ):
+                self._prepare_laguna(data, tokenizer)
+
+    def test_format_v2_cannot_downgrade_to_generic_validation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data, tokenizer, manifest = self._laguna_data_fixture(Path(directory))
+            for chat_template in (None, "wrong-template"):
+                with self.subTest(chat_template=chat_template):
+                    changed = dict(manifest)
+                    if chat_template is None:
+                        changed.pop("chat_template")
+                    else:
+                        changed["chat_template"] = chat_template
+                    (data / "manifest.json").write_text(
+                        json.dumps(changed, sort_keys=True) + "\n"
+                    )
+                    with self.assertRaisesRegex(ValueError, "chat_template"):
+                        self._prepare_laguna(data, tokenizer)
+
+    def test_non_laguna_tokenizer_hash_mismatch_stays_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data, tokenizer, _, _ = self._fixture(Path(directory))
+            (tokenizer / "tokenizer.json").write_text('{"changed": true}\n')
+            with self.assertRaisesRegex(ValueError, "differs from live tokenizer"):
+                prepare_local_data(
+                    FakeTokenizer(),
+                    data,
+                    tokenizer_path=tokenizer,
+                    num_samples=4,
+                    num_valid_samples=2,
+                    max_seq_length=8,
+                    seed=7,
+                    tokenization="preformatted_chat",
+                    text_dataset_factory=FakeTextDataset,
+                )
 
     def test_contract_binds_actual_order_tokens_and_target_bytes(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -531,6 +828,7 @@ class TargetContractTests(unittest.TestCase):
                                 tokenizer / "tokenizer.json"
                             )
                         },
+                        "tokenizer_options": {"fix_mistral_regex": True},
                         "tokenization_contract": {
                             "name": (
                                 "ALIS_DWQ_TEXT_TOKENIZATION=preformatted_chat"

@@ -38,6 +38,9 @@ _PREFORMATTED_CONTRACT = {
     "append_eos": False,
 }
 _TOKEN_ID_HASH_SCHEMA = "sha256-canonical-json-token-ids/v1"
+_TOKENIZER_EQUIVALENCE_SCHEMA = "alis-dwq.tokenizer-equivalence/v1"
+_LAGUNA_SOURCE_TOKENIZER_OPTIONS = {"fix_mistral_regex": True}
+_LAGUNA_SPLIT_COUNTS = {"train": 80, "valid": 40, "heldout": 100}
 _TARGET_PAD_TO = 32
 _SAFETENSOR_DTYPES = {
     "F16": (2, "<u2"),
@@ -363,8 +366,12 @@ def _validate_declared_token_bindings(
     tokenizer,
     *,
     tokenization: str,
-) -> None:
+) -> dict[str, dict[str, Any]]:
     """Fail early for Laguna manifests whose persisted token claims drift."""
+    if manifest.get("chat_template") != "Laguna-S-2.1 local tokenizer":
+        raise ValueError(
+            "Laguna format-v2 manifest has an unexpected chat_template"
+        )
     declared_contract = manifest.get("tokenization_contract")
     if declared_contract != _PREFORMATTED_CONTRACT:
         raise ValueError(
@@ -374,6 +381,30 @@ def _validate_declared_token_bindings(
     if tokenization != "preformatted_chat":
         raise ValueError(
             "data manifest requires ALIS_DWQ_TEXT_TOKENIZATION=preformatted_chat"
+        )
+    tokenizer_options = manifest.get("tokenizer_options")
+    if (
+        not isinstance(tokenizer_options, dict)
+        or set(tokenizer_options) != {"fix_mistral_regex"}
+        or tokenizer_options["fix_mistral_regex"] is not True
+    ):
+        raise ValueError(
+            "Laguna format-v2 manifest tokenizer_options must be exactly "
+            "{'fix_mistral_regex': true}"
+        )
+    declared_tokenizer = manifest.get("tokenizer_files_sha256")
+    if (
+        not isinstance(declared_tokenizer, dict)
+        or not declared_tokenizer
+        or any(
+            name not in TOKENIZER_FILES
+            or not isinstance(digest, str)
+            or _SHA256_RE.fullmatch(digest) is None
+            for name, digest in declared_tokenizer.items()
+        )
+    ):
+        raise ValueError(
+            "Laguna format-v2 manifest has invalid source tokenizer hashes"
         )
     summary = manifest.get("token_id_hashes")
     if (
@@ -389,6 +420,13 @@ def _validate_declared_token_bindings(
             "preformatted Laguna manifest lacks complete token_id_hashes evidence; "
             "rebuild the calibration data"
         )
+    actual_counts = {split: len(source[split]) for split in _LAGUNA_SPLIT_COUNTS}
+    if actual_counts != _LAGUNA_SPLIT_COUNTS:
+        raise ValueError(
+            "Laguna format-v2 data must contain exactly 80 train, 40 valid, "
+            "and 100 heldout rows"
+        )
+    verified_splits = {}
     for split in ("train", "valid", "heldout"):
         ordered_hashes = []
         for data_index, entry in enumerate(source[split]):
@@ -413,13 +451,12 @@ def _validate_declared_token_bindings(
         }
         if summary["splits"].get(split) != expected:
             raise ValueError(f"data manifest {split} token_id_hashes mismatch")
+        verified_splits[split] = expected
+    return verified_splits
 
 
 def _is_laguna_format_v2_manifest(manifest: dict[str, Any]) -> bool:
-    return (
-        manifest.get("format_version") == 2
-        and manifest.get("chat_template") == "Laguna-S-2.1 local tokenizer"
-    )
+    return type(manifest.get("format_version")) is int and manifest["format_version"] == 2
 
 
 def prepare_local_data(
@@ -451,9 +488,11 @@ def prepare_local_data(
         split: _read_jsonl(data_dir / f"{split}.jsonl")
         for split in ("train", "valid")
     }
-    if _is_laguna_format_v2_manifest(manifest["manifest"]):
+    laguna_format_v2 = _is_laguna_format_v2_manifest(manifest["manifest"])
+    verified_token_splits = None
+    if laguna_format_v2:
         source["heldout"] = _read_jsonl(data_dir / "heldout.jsonl")
-        _validate_declared_token_bindings(
+        verified_token_splits = _validate_declared_token_bindings(
             manifest["manifest"], source, tokenizer, tokenization=tokenization
         )
     datasets = {
@@ -511,7 +550,11 @@ def prepare_local_data(
 
     tokenizer_hashes = tokenizer_files_sha256(tokenizer_path)
     declared_tokenizer = manifest["manifest"].get("tokenizer_files_sha256")
-    if declared_tokenizer is not None and declared_tokenizer != tokenizer_hashes:
+    if (
+        declared_tokenizer is not None
+        and declared_tokenizer != tokenizer_hashes
+        and not laguna_format_v2
+    ):
         raise ValueError("data manifest tokenizer_files_sha256 differs from live tokenizer")
     binding = {
         "data_manifest_kind": manifest["data_manifest_kind"],
@@ -522,6 +565,20 @@ def prepare_local_data(
         "tokenization": tokenization,
         "splits": split_bindings,
     }
+    if laguna_format_v2:
+        binding["tokenizer_equivalence"] = {
+            "schema": _TOKENIZER_EQUIVALENCE_SCHEMA,
+            "mode": (
+                "file-identity"
+                if declared_tokenizer == tokenizer_hashes
+                else "all-declared-row-token-ids"
+            ),
+            "source_tokenizer_files_sha256": dict(declared_tokenizer),
+            "source_tokenizer_options": dict(_LAGUNA_SOURCE_TOKENIZER_OPTIONS),
+            "runtime_tokenizer_files_sha256": dict(tokenizer_hashes),
+            "verified_splits": verified_token_splits,
+            "all_rows_verified": True,
+        }
     return output["train"], output["valid"], binding
 
 
@@ -639,7 +696,7 @@ def build_target_contract(
             "targets_sha256": _targets_digest(files),
             "rows": rows,
         }
-    return {
+    contract = {
         "schema": SCHEMA,
         "run_id": run_id,
         "data_manifest_kind": binding["data_manifest_kind"],
@@ -659,6 +716,9 @@ def build_target_contract(
         "tokenization": binding["tokenization"],
         "splits": split_contracts,
     }
+    if "tokenizer_equivalence" in binding:
+        contract["tokenizer_equivalence"] = binding["tokenizer_equivalence"]
+    return contract
 
 
 def write_contract_no_replace(target_dir: Path, contract: dict[str, Any]) -> Path:

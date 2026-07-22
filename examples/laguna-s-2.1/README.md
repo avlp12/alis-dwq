@@ -198,6 +198,17 @@ data, teacher checkpoint, and target checksums. The launcher verifies that
 identity/order contract before loading any model; it does not replace the
 numeric-tensor validator.
 
+The format-v2 data manifest records the pinned source-tokenizer file hashes,
+while conversion saves the runtime tokenizer after applying
+`fix_mistral_regex=true`; those file hashes may therefore differ. This exception
+is Laguna-only and fail-closed: the option map must contain exactly that boolean
+setting, and the runtime tokenizer must reproduce every declared token hash and
+count across all 80 train, 40 valid, and 100 held-out rows. The target contract
+keeps the live runtime hashes in `tokenizer_files_sha256` and records the source
+and runtime maps, exact option, per-split ordered token digests/counts, and
+identity-or-all-row equivalence mode in `tokenizer_equivalence`. The unchanged
+data-manifest hash continues to bind the source-tokenizer provenance.
+
 For the already-complete historical `teacher-targets-v2`, create the same
 contract deterministically without replacing any numeric file:
 

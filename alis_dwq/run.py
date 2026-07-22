@@ -47,6 +47,7 @@ TARGET_TOP_K = 1024
 DATA = Path(os.environ.get("ALIS_DWQ_DATA_DIR", "dwq_data")).expanduser()
 
 _TRACKED_ENV = (
+    "ALIS_DWQ_RUN_ID",
     "ALIS_DWQ_DATA_DIR",
     "ALIS_DWQ_NUM_VALID_SAMPLES",
     "ALIS_DWQ_LAYERS_PER_ROUND",

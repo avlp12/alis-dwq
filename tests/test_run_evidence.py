@@ -12,6 +12,15 @@ from alis_dwq.memory_guard import emit_evidence
 
 
 class RunEvidenceTests(unittest.TestCase):
+    def test_run_started_environment_binds_generated_run_id(self):
+        environ = {}
+        with mock.patch.object(run, "_code_provenance", return_value={}):
+            payload = run._started_payload(
+                argv=["alis_dwq.run"], environ=environ, cwd="/build"
+            )
+        self.assertEqual(payload["environment"]["ALIS_DWQ_RUN_ID"], payload["run_id"])
+        self.assertEqual(environ["ALIS_DWQ_RUN_ID"], payload["run_id"])
+
     def test_memory_evidence_is_exclusively_reserved_before_append(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

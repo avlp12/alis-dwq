@@ -287,6 +287,9 @@ class TestMemoryGuard(unittest.TestCase):
         self.assertEqual(payload["environment"]["ALIS_DWQ_LAYERS_PER_ROUND"], "1")
         self.assertNotIn("HF_TOKEN", payload["environment"])
         self.assertEqual(environ["ALIS_DWQ_RUN_ID"], payload["run_id"])
+        self.assertEqual(
+            payload["environment"]["ALIS_DWQ_RUN_ID"], payload["run_id"]
+        )
         self.assertEqual(payload["schema"], "alis-dwq.run/v2")
         self.assertEqual(payload["event"], "run_started")
         self.assertEqual(
