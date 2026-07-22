@@ -1,9 +1,12 @@
 import importlib.util
 import hashlib
 import json
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 def load_converter():
@@ -127,6 +130,172 @@ class TestLagunaExampleConverter(unittest.TestCase):
                     expected_shard_manifest_sha256=root_digest,
                     expected_small_files_sha256=small_hashes,
                 )
+
+    def test_source_verifier_rejects_every_unexpected_model_weight(self):
+        for name in ("model.safetensors", "model-extra.safetensors"):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                source, revision, root_digest, total_size, small_hashes = (
+                    self._source_fixture(Path(directory))
+                )
+                (source / name).write_bytes(b"unverified weight")
+                with self.assertRaisesRegex(ValueError, "source shard set mismatch"):
+                    self.converter.verify_source(
+                        source,
+                        expected_revision=revision,
+                        expected_key_count=46,
+                        expected_total_size=total_size,
+                        expected_shard_manifest_sha256=root_digest,
+                        expected_small_files_sha256=small_hashes,
+                    )
+
+    def test_source_verifier_rejects_root_symlink_before_resolution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, revision, root_digest, total_size, small_hashes = (
+                self._source_fixture(root)
+            )
+            source_link = root / "source-link"
+            source_link.symlink_to(source, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "source root.*symlink"):
+                self.converter.verify_source(
+                    source_link,
+                    expected_revision=revision,
+                    expected_key_count=46,
+                    expected_total_size=total_size,
+                    expected_shard_manifest_sha256=root_digest,
+                    expected_small_files_sha256=small_hashes,
+                )
+
+    def _fake_mlx_modules(self, convert):
+        mlx_core = types.ModuleType("mlx.core")
+        mlx_core.device_info = lambda: {
+            "max_recommended_working_set_size": 1_000,
+            "device_name": "fake-device",
+        }
+        mlx_core.set_wired_limit = lambda _value: None
+        mlx_core.reset_peak_memory = lambda: None
+        mlx_core.get_peak_memory = lambda: 100
+        mlx_package = types.ModuleType("mlx")
+        mlx_package.__path__ = []
+        mlx_package.core = mlx_core
+        mlx_lm_package = types.ModuleType("mlx_lm")
+        mlx_lm_package.__path__ = []
+        convert_module = types.ModuleType("mlx_lm.convert")
+        convert_module.convert = convert
+        return {
+            "mlx": mlx_package,
+            "mlx.core": mlx_core,
+            "mlx_lm": mlx_lm_package,
+            "mlx_lm.convert": convert_module,
+        }
+
+    def test_cli_uses_one_resolved_root_and_reverifies_before_publish(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            source_argument = source / ".." / "source"
+            resolved = source.resolve()
+            output = root / "output"
+            evidence = {
+                "shard_manifest_sha256": "a" * 64,
+                "small_files_sha256": {},
+            }
+            sequence = []
+
+            def verify(path):
+                sequence.append(("verify", Path(path)))
+                return dict(evidence)
+
+            def convert(**kwargs):
+                sequence.append(("convert", Path(kwargs["hf_path"])))
+                staging = Path(kwargs["mlx_path"])
+                staging.mkdir()
+                (staging / "tokenizer_config.json").write_text("{}\n")
+
+            def preserve(path, _staging):
+                sequence.append(("preserve", Path(path)))
+
+            real_publish = self.converter.move_no_replace
+
+            def publish(staging, destination):
+                sequence.append(("publish", Path(destination)))
+                return real_publish(staging, destination)
+
+            argv = [
+                "convert.py",
+                "--source",
+                str(source_argument),
+                "--out",
+                str(output),
+                "--recipe",
+                "bf16-mlx-layout",
+            ]
+            with (
+                mock.patch.dict(sys.modules, self._fake_mlx_modules(convert)),
+                mock.patch.object(self.converter, "verify_source", side_effect=verify),
+                mock.patch.object(
+                    self.converter, "preserve_source_notices", side_effect=preserve
+                ),
+                mock.patch.object(
+                    self.converter, "move_no_replace", side_effect=publish
+                ),
+                mock.patch.object(sys, "argv", argv),
+            ):
+                self.assertEqual(self.converter.main(), 0)
+
+            self.assertEqual(
+                sequence,
+                [
+                    ("verify", resolved),
+                    ("convert", resolved),
+                    ("verify", resolved),
+                    ("preserve", resolved),
+                    ("publish", output),
+                ],
+            )
+            self.assertTrue(output.is_dir())
+
+    def test_cli_reverification_failure_retains_partial_and_does_not_publish(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            output = root / "output"
+            before = {"shard_manifest_sha256": "a" * 64}
+            after = {"shard_manifest_sha256": "b" * 64}
+
+            def convert(**kwargs):
+                staging = Path(kwargs["mlx_path"])
+                staging.mkdir()
+                (staging / "tokenizer_config.json").write_text("{}\n")
+
+            argv = [
+                "convert.py",
+                "--source",
+                str(source),
+                "--out",
+                str(output),
+                "--recipe",
+                "bf16-mlx-layout",
+            ]
+            with (
+                mock.patch.dict(sys.modules, self._fake_mlx_modules(convert)),
+                mock.patch.object(
+                    self.converter, "verify_source", side_effect=[before, after]
+                ) as verify,
+                mock.patch.object(self.converter, "preserve_source_notices") as preserve,
+                mock.patch.object(self.converter, "move_no_replace") as publish,
+                mock.patch.object(sys, "argv", argv),
+            ):
+                with self.assertRaisesRegex(ValueError, "changed during conversion"):
+                    self.converter.main()
+
+            self.assertEqual(verify.call_count, 2)
+            preserve.assert_not_called()
+            publish.assert_not_called()
+            self.assertFalse(output.exists())
+            self.assertEqual(len(list(root.glob("output.partial-*"))), 1)
 
     def test_source_revision_and_exact_index_count_are_enforced(self):
         with tempfile.TemporaryDirectory() as directory:

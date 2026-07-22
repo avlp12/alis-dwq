@@ -85,6 +85,20 @@ def _load_json(path: Path):
     )
 
 
+def resolve_source_root(source: Path) -> Path:
+    """Resolve one non-symlink source root for verification and conversion."""
+    source = Path(source).expanduser()
+    if source.is_symlink():
+        raise ValueError(f"source root is missing or a symlink: {source}")
+    try:
+        resolved = source.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError(f"source root is missing or inaccessible: {source}") from exc
+    if not resolved.is_dir():
+        raise ValueError(f"source root is missing or not a directory: {source}")
+    return resolved
+
+
 def verify_source(
     source: Path,
     *,
@@ -96,14 +110,14 @@ def verify_source(
     expected_small_files_sha256: dict[str, str] = SOURCE_SMALL_FILES_SHA256,
 ) -> dict:
     """Verify the exact pinned HF bytes before MLX or a model is imported."""
-    source = Path(source).expanduser().resolve()
+    source = resolve_source_root(source)
     expected_names = [
         f"model-{index:05d}-of-{expected_shard_count:05d}.safetensors"
         for index in range(1, expected_shard_count + 1)
     ]
-    actual_names = sorted(
-        path.name for path in source.glob("model-*-of-*.safetensors")
-    )
+    # mlx-lm loads every top-level model*.safetensors file, so verification
+    # must reject every extra file matching that broader runtime inventory.
+    actual_names = sorted(path.name for path in source.glob("model*.safetensors"))
     if actual_names != expected_names:
         raise ValueError(
             f"source shard set mismatch: expected {expected_shard_count} exact shards"
@@ -345,7 +359,8 @@ def main() -> int:
     if args.out.exists():
         parser.error(f"output exists (no-clobber): {args.out}")
     try:
-        source_verification = verify_source(args.source)
+        source_root = resolve_source_root(args.source)
+        source_verification = verify_source(source_root)
         promotions = parse_promotions(args.promote_routed_module)
         if promotions and args.recipe != "quality-3p7":
             raise ValueError(
@@ -369,7 +384,7 @@ def main() -> int:
     quantized = args.recipe != "bf16-mlx-layout"
     try:
         convert(
-            hf_path=str(args.source),
+            hf_path=str(source_root),
             mlx_path=str(staging),
             quantize=quantized,
             q_group_size=64,
@@ -379,13 +394,16 @@ def main() -> int:
                 policy(args.recipe, promotions) if quantized else None
             ),
         )
+        source_reverification = verify_source(source_root)
+        if source_reverification != source_verification:
+            raise ValueError("pinned source changed during conversion")
         tokenizer_config = staging / "tokenizer_config.json"
         tokenizer = json.loads(tokenizer_config.read_text())
         tokenizer["fix_mistral_regex"] = True
         tokenizer_config.write_text(
             json.dumps(tokenizer, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
         )
-        preserve_source_notices(args.source, staging)
+        preserve_source_notices(source_root, staging)
         receipt = make_conversion_plan(
             recipe=args.recipe,
             promotions=promotions,
