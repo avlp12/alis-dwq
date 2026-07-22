@@ -70,4 +70,24 @@ The serialized loop allocates and frees thousands of short-lived buffers. MLX's 
 - **Sample the process, don't theorize.** Every wrong hypothesis in this campaign (QoS throttling, cache-key misses, hashing) died to `/usr/bin/sample <pid>` + `lsof` snapshots in minutes. The laws above came out of five focused probes, not from reading kernel code.
 - The reference implementation (capture/replay, hybrid passes, cache ceiling, eligibility incl. shared-only) lives in the Inkling pipeline's `layerlocal_trainer._streamed_experts_value_and_grad`; the probes are ~80-line standalone scripts and reproduce on any quantized SwitchLinear bank.
 
+## What it bought — two full schedules, and where the bits actually recovered
+
+The streamed backward was not a probe; it certified the scales for two shipped quantizations of this model, each run as a full 66-layer sealed schedule (do-no-harm acceptance: a layer's tuned scales are kept only if held-out boundary NMSE does not regress *at all* — allowed regression 0.0 — else it rolls back byte-exact).
+
+| tier | routed-expert width | layers tuned | **accepted improvements** | which layers |
+|---|---|---|---|---|
+| quality (3.71 bpw) | 3-bit g128 | 63 | **1** | 40 |
+| capacity (2.72 bpw) | 2-bit g128 floor | 66 | **7** | 0, 4, 6, 9, 10, 11, 12 |
+
+The asymmetry is the interesting part: **the 2-bit build accepted 7× more layers than the 3-bit build, and every accepted layer sits early (0–12).** Quantization error is larger at a 2-bit floor, so there is simply more for the do-no-harm pass to recover — and it concentrates where early-layer error compounds through the most downstream depth. At 3-bit the conversion is already close enough that only one layer had a boundary-NMSE gap worth committing. Same optimizer, same contract, same streamed gradients; the bit width decides how much headroom exists to claw back. If you run this pass at 3-bit and see mostly neutral certifications, that is the expected outcome, not a dead optimizer — drop the floor and the accepts appear.
+
+**Does per-layer do-no-harm hold end-to-end?** The contract is enforced on *boundary* NMSE, one layer at a time. To check it survives composition, we ran teacher-forced NLL on 32 held-out text batches (5,926 scored tokens) through the fully merged 2.7 bpw model versus the raw baseline conversion it was built from:
+
+| | aggregate NLL | better on |
+|---|---|---|
+| baseline conversion | 3.20269 | 13/32 batches |
+| **DWQ-certified (merged)** | **3.20349** | **19/32 batches** |
+
+A **+0.0008-nat** difference (≈0.03%) — parity inside the batch-to-batch noise, candidate ahead on more batches than not. Exactly what a do-no-harm pass should produce end-to-end: the seven committed layer deltas neither visibly help nor hurt the composed logits, while the streamed backward's per-layer certification is what *guarantees* nothing regressed. The point of the exact decomposition was never a benchmark bump; it was the right to say "provably not worse, with improvements where they existed" and have the end-to-end numbers agree.
+
 **Takeaway.** MLX's quantized-gather autograd has a simple cost model — *full differentiated extent + one expert matrix per assignment, and fp32-in-module breaks the fused kernels* — and once you shape the backward to that model, a 975B MoE's layer-local DWQ fits in ~25 GiB with gradients you can trust. The 150 GiB "requirement" was never about the model; it was about the op.
