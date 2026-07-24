@@ -98,6 +98,20 @@ Corroboration from our own telemetry: F's worst-utilization tensors (L0 `g_a_pro
 Runbook lesson: the F recipe *intended* "experts 2-bit, attention/shared higher" — a comment the 2-rule
 predicate could not express. **Recipe intent must live in the predicate, not the docs.**
 
+### Fix shipped (2026-07-25): the predicate now expresses the recipe
+
+The port's 2-rule `quant_predicate` (router 8b; everything else inherits the CLI global) is replaced by
+`quant_predicate_builder(group_size, bits)`, wired through a new `quantize_model` hook in the fork: the
+CLI global now applies to **routed experts only**; router + KDA chokepoints → 8b/g64; embed/head → 6b/g64
+(8b when the global is 8); attention q/k/v/o + GQA elementwise gate (`g_proj`) + shared expert →
+global + 2, capped at 8. At 8b/g64 the resulting map is uniform — the T-q8 reference build reproduces
+byte-identically, so the change is a no-op for it. Verified against the real weight map (722 quantizable
+tensors): Q/M recipes put 350 tensors at 6b and 228 at 8b with only the 144 expert projections on the
+global; F v2 puts 348 at 4b, 228 at 8b, embed/head at 6b — experts alone at 2b/g128 → ≈ 73 GB estimated
+(F-base measured 70.5 GB + ≈ 2.5 GB), in budget. One catch the audit itself produced: GQA's
+elementwise-gate `g_proj` (12 tensors) matched no pattern in the first draft — **enumerate module paths
+against the real weight map, never from memory.**
+
 ## Landmines found (patched or documented)
 
 - `mx.split` on >2³¹-element tensors silently corrupts ([mlx#3836](https://github.com/ml-explore/mlx/issues/3836)).
@@ -114,7 +128,8 @@ predicate could not express. **Recipe intent must live in the predicate, not the
   targets: EN loop len23 fix. *(in flight)*
 - F-dwq (legacy gate, Q teacher, LoRA rank 8): valid 1.0348 → 0.5111 through round 4 — retained as the
   legacy-gate control arm. *(in flight)*
-- Pending: F-clipped baseline eval; F v2 = predicate-promoted requant (+slice gate + T-q8 teacher);
+- Pending: F-clipped baseline eval; F v2 = predicate-promoted requant (**predicate fix shipped**
+  2026-07-25 — requant is now a CLI invocation away; remaining: slice gate + T-q8 teacher DWQ);
   M v2 pilots (T-q8 teacher × K8/K4/extras-only × stock/promoted base) under the slice gate after
   no-train gate qualification; head-to-head vs Motif-3-Beta (comparability contract: `mlx_lm.server`
   serving, own chat template, KL(own-8bit‖build) disclosed per tier).
