@@ -33,6 +33,7 @@ import mlx_lm.quant.dwq as D
 from mlx_lm.tuner.losses import kl_div_loss
 from mlx_lm.tuner.trainer import grad_checkpoint, iterate_batches
 
+from . import gate
 from . import losses
 
 _LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
@@ -167,6 +168,21 @@ def layerwise_dwq_quantize(
         losses.banner(loss_kind, loss_topk)
     need_labels = loss_kind == "cakld"
 
+    # Opt-in per-slice valid gate (see alis_dwq.gate). Env pair unset ->
+    # gate_cfg is None and everything below behaves exactly as before.
+    # Any inconsistency raises here, before the first training step.
+    gate_cfg = gate.load_gate(batch_size, max_seq_length, seed,
+                              len(valid_data), target_fn)
+    gate_entries, en_eps = gate_cfg if gate_cfg is not None else (None, None)
+    if gate_entries is not None:
+        print(f"[alis-dwq][EXPERIMENTAL] per-slice valid gate: "
+              f"manifest={os.environ[gate.MANIFEST_ENV]} "
+              f"EN eps={en_eps} — strict overall gate + EN ceiling "
+              f"({sum(1 for e in gate_entries if e['slice'] == 'EN')} EN / "
+              f"{len(gate_entries)} valid ordinals, hashes verified). Unset "
+              f"{gate.MANIFEST_ENV}/{gate.EPS_ENV} for legacy behavior.",
+              file=sys.stderr)
+
     lora_cfg = None
     if lora_rank > 0:
         print(f"[alis-dwq][EXPERIMENTAL] ALIS_DWQ_LORA_RANK={lora_rank}: LoRA "
@@ -243,25 +259,69 @@ def layerwise_dwq_quantize(
         return (mask * per_tok).sum() / ntoks, ntoks
 
     def validate(tag):
-        v_loss, v_tok = 0.0, 0
+        if gate_entries is None:
+            # legacy single-scalar path — byte-identical pre-gate behavior
+            v_loss, v_tok = 0.0, 0
+            params = model.trainable_parameters()
+            for i, (batch, lengths) in enumerate(
+                iterate_batches(valid_data, batch_size, max_seq_length, seed=seed)
+            ):
+                labels = batch[:, 1:] if need_labels else None
+                batch = batch[:, :-1]
+                targets = target_fn(batch, i, split="valid")
+                mx.eval(targets)
+                loss, ntoks = loss_fn(params, batch, targets, lengths, labels)
+                mx.eval(loss, ntoks)
+                v_tok += ntoks.item()
+                v_loss += loss.item() * ntoks.item()
+            loss = v_loss / v_tok
+            print(f"[alis-dwq][valid] {tag}: {loss:.4f}", file=sys.stderr)
+            return loss
+
+        # gate path: verify per-ordinal input hash BEFORE trusting the
+        # ordinal-bound target file, then accumulate token-weighted per-slice
+        # losses (overall + one entry per manifest slice label)
+        sums, toks = {"overall": 0.0}, {"overall": 0}
         params = model.trainable_parameters()
+        seen = 0
         for i, (batch, lengths) in enumerate(
             iterate_batches(valid_data, batch_size, max_seq_length, seed=seed)
         ):
             labels = batch[:, 1:] if need_labels else None
             batch = batch[:, :-1]
+            entry = gate_entries[i]
+            gate.check_ordinal_input(i, entry, batch)
             targets = target_fn(batch, i, split="valid")
             mx.eval(targets)
             loss, ntoks = loss_fn(params, batch, targets, lengths, labels)
             mx.eval(loss, ntoks)
-            v_tok += ntoks.item()
-            v_loss += loss.item() * ntoks.item()
-        loss = v_loss / v_tok
-        print(f"[alis-dwq][valid] {tag}: {loss:.4f}", file=sys.stderr)
-        return loss
+            lv, nv = float(loss.item()), int(ntoks.item())
+            gate.check_loss_finite(i, lv, nv)
+            sums["overall"] += lv * nv
+            toks["overall"] += nv
+            s = entry["slice"]
+            sums[s] = sums.get(s, 0.0) + lv * nv
+            toks[s] = toks.get(s, 0) + nv
+            seen += 1
+        if seen != len(gate_entries):
+            raise ValueError("slice gate: manifest iterator count mismatch "
+                             f"({seen} batches vs {len(gate_entries)} entries)")
+        metrics = {k: sums[k] / toks[k] for k in sums}
+        rendered = " ".join(f"{k}={v:.6f}" for k, v in metrics.items())
+        print(f"[alis-dwq][valid] {tag}: {rendered}", file=sys.stderr)
+        return metrics
 
     model.freeze()
-    best = init = validate("initial")
+    best = init = None
+    init_metrics = best_metrics = en_limit = None
+    if gate_entries is None:
+        best = init = validate("initial")
+    else:
+        init_metrics = validate("initial")
+        best_metrics = dict(init_metrics)
+        # EN ceiling: a round may improve overall yet still regress EN beyond
+        # eps of the initial (pre-round) EN loss -> REVERT (see alis_dwq.gate)
+        en_limit = init_metrics["EN"] * (1.0 + en_eps)
 
     cka_prev = None
     if cka_mon:
@@ -341,20 +401,41 @@ def layerwise_dwq_quantize(
                       "inversion signature", file=sys.stderr)
 
         rv = validate(f"round {r + 1}")
-        if rv > best:
-            model.update(snapshot)
-            print(f"[alis-dwq][round {r + 1}/{len(rounds)}] REVERTED"
-                  f" ({rv:.4f} > best {best:.4f})", file=sys.stderr)
-            # cka_prev unchanged: the rollback restored exactly that state
+        if gate_entries is None:
+            # legacy keep-best: revert only when strictly worse (tie accepts)
+            if not gate.legacy_accept(rv, best):
+                model.update(snapshot)
+                print(f"[alis-dwq][round {r + 1}/{len(rounds)}] REVERTED"
+                      f" ({rv:.4f} > best {best:.4f})", file=sys.stderr)
+                # cka_prev unchanged: the rollback restored exactly that state
+            else:
+                best = rv
+                print(f"[alis-dwq][round {r + 1}/{len(rounds)}] ACCEPTED {rv:.4f}",
+                      file=sys.stderr)
+                if cka_post is not None:
+                    cka_prev = cka_post  # next round drifts against the kept state
         else:
-            best = rv
-            print(f"[alis-dwq][round {r + 1}/{len(rounds)}] ACCEPTED {rv:.4f}",
-                  file=sys.stderr)
-            if cka_post is not None:
-                cka_prev = cka_post  # next round drifts against the kept state
+            ok, reasons = gate._accept(rv, best_metrics, en_limit)
+            if not ok:
+                model.update(snapshot)
+                print(f"[alis-dwq][round {r + 1}/{len(rounds)}] REVERTED "
+                      + "; ".join(reasons), file=sys.stderr)
+                # cka_prev unchanged: the rollback restored exactly that state
+            else:
+                best_metrics = rv
+                print(f"[alis-dwq][round {r + 1}/{len(rounds)}] ACCEPTED "
+                      + " ".join(f"{k}={v:.6f}" for k, v in rv.items()),
+                      file=sys.stderr)
+                if cka_post is not None:
+                    cka_prev = cka_post  # next round drifts against the kept state
 
     model.freeze()
-    print(f"[alis-dwq] valid {init:.4f} -> {best:.4f}", file=sys.stderr)
+    if gate_entries is None:
+        print(f"[alis-dwq] valid {init:.4f} -> {best:.4f}", file=sys.stderr)
+    else:
+        print(f"[alis-dwq] valid {init_metrics['overall']:.6f} -> "
+              f"{best_metrics['overall']:.6f} (EN {init_metrics['EN']:.6f} -> "
+              f"{best_metrics['EN']:.6f})", file=sys.stderr)
     if lora_cfg is not None:
         _save_adapters(model, lora_cfg,
                        os.environ.get("ALIS_DWQ_ADAPTER_DIR", "alis_adapters"))
