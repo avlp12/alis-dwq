@@ -323,6 +323,16 @@ def layerwise_dwq_quantize(
         # eps of the initial (pre-round) EN loss -> REVERT (see alis_dwq.gate)
         en_limit = init_metrics["EN"] * (1.0 + en_eps)
 
+    if os.environ.get("ALIS_DWQ_VALIDATE_ONLY", "") == "1":
+        # No-train driver: print the initial valid metrics and exit before any
+        # round runs. Used for gate qualification on known builds — the exact
+        # same validate() path as training, so ACCEPT/REVERT decisions can be
+        # replayed offline against these numbers.
+        print("[alis-dwq][EXPERIMENTAL] ALIS_DWQ_VALIDATE_ONLY=1: initial "
+              "valid only — no training rounds, model left untouched",
+              file=sys.stderr)
+        return
+
     cka_prev = None
     if cka_mon:
         for batch, _lengths in iterate_batches(valid_data, batch_size,
