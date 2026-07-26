@@ -206,9 +206,52 @@ pip install git+https://github.com/avlp12/mlx-lm.git@motif
 Operational asides that carried over from the GLM campaigns and paid off again here:
 offload the big intermediate builds to an external SSD via a **non-destructive symlink**;
 publish the HF repos **public from the first commit** to sidestep the private-storage cap
-entirely (see the HF-publishing notes in the main README); and remember that every
-correctness fix in Part 1 was a **forward-math** change, so none of them cost a
-re-quantization — the shipped weights are the ones the quant produced.
+entirely (see the HF-publishing notes in the main README).
+
+## The one that got away — a shipped 8-bit build was corrupt
+
+Four days after release a user reported the 8-bit tier producing collapsing text and
+infinite repetition. It reproduced on a fresh download, **at greedy decoding**, so it was
+not sampling. The 2.3 bpw tier from the *same checkpoint* was fine.
+
+**Root cause: the build predated its own fix.** The fused `moe.experts.gate_up_proj` is
+`384 × 4096 × 2560 = 4.03e9` elements — **1.88× the 2³¹ limit** where `mx.split` silently
+returns corrupted data past the 4 GiB offset ([ml-explore/mlx#3836](https://github.com/ml-explore/mlx/issues/3836)).
+`sanitize()` was later changed to strided slices, and every build after that is clean. The
+Q8 was converted *before* it and was never re-made, because of the rule in Finding 5 —
+which is true for forward-math fixes and **false for this one**.
+
+**Confirmation.** The rebuilt Q8 fixed generation (same greedy prompt: the old build ran
+`대한민국의 수도 and double-checking and double-checking…` forever, the new one answers
+`서울특별시` in 74 tokens). Comparing a preserved sample of the old build against the new one,
+experts 0–3 of a layer are **byte-identical** — the two builds agree below the corruption
+offset and diverge only past it. Exactly the mx.split signature.
+
+### What this costs downstream — the reference poisons its own metrics
+The Q8 was the **KL reference** for the whole ladder. Every `KL vs Q8` number, and the
+"DWQ cut KL 58–72%" claim, was measured against a corrupted baseline and had to be
+withdrawn from the published cards. The models themselves were fine; the *measurements*
+were not. Port parity (`KL ≈1e-7` vs the fixed torch reference) was unaffected because it
+never went through Q8.
+
+### Rules taken from this
+1. **Generation-verify every shipped tier, not just the headline one.** The floor build was
+   probed exhaustively; the reference build shipped on a smoke test run before the fixes.
+2. **A KL anchor must be generation-verified before anything is measured against it.**
+   An anchor is load-bearing for every number in the family.
+3. **When a weight-materialization fix lands, list every artifact built before it and
+   re-make or re-verify each.** Nothing else catches this — the corrupt build loads,
+   passes shape and index checks, has healthy per-tensor statistics, and quantizes to
+   byte-identical size.
+4. **Sample forensics where the bug is, not where it is convenient.** First-pass statistics
+   over experts 0–3 looked perfectly healthy; the corruption started at expert 205.
+
+### Conversion gotcha (transformers ≥5.14)
+`AutoTokenizer` resolves through `AutoConfig`, whose rope standardization does
+`rope_parameters.setdefault("original_max_position_embeddings", self.max_position_embeddings)`
+and raises `AttributeError` on Motif's config. Removing `rope_scaling` from the source
+config clears it — which is also what the known-good shipped builds already carry
+(`rope_scaling: null`), so this restores the established shape rather than deviating from it.
 
 ## Findings
 
@@ -222,5 +265,9 @@ re-quantization — the shipped weights are the ones the quant produced.
 4. **Clip and DWQ fix different things.** Clip bought back the degeneration
    (generation-space), DWQ bought back the KL (distribution-space); neither alone would
    have shipped this floor build.
-5. **Forward-math fixes are free of re-quantization.** Every correctness fix was verified
-   by hot-patching the existing Q8 — the weights never moved.
+5. **Forward-math fixes are free of re-quantization — *weight-materialization* fixes are not.**
+   Most correctness fixes here were forward-math and were verified by hot-patching the
+   existing Q8; the weights never moved. But a fix that changes how weights are *produced*
+   — `sanitize()`, the tensor split, the predicate — invalidates every build made before it.
+   Sorting fixes into these two buckets is not bookkeeping: getting it wrong is how this
+   campaign shipped a broken 8-bit build (§ *The one that got away*).
