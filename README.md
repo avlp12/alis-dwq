@@ -211,6 +211,11 @@ Publishing the quant is its own minefield — HF's card renderer and badge logic
 
 ### From a 2.8T ternary-codebook student (Kimi-K3 v3, 2026-08-02)
 
+> The complete Kimi-K3 lesson set — architecture porting, campaign mechanics, custom Metal
+> kernels, evaluation infrastructure, 2-box EP serving, and the operational pitfall catalog —
+> lives in [docs/kimi-k3-mlx-port.md](docs/kimi-k3-mlx-port.md). The optimizer-arithmetic
+> lessons below are the DWQ-relevant subset.
+
 Four of eight 12-layer blocks diverged (train nMSE 3× within 24 steps, val +80…+500%) under a trainer we rewrote for a custom architecture. Five hypotheses were acquitted one by one — router training, codebook-scale training, a distribution-alignment loss term, the custom backward kernels (verified cos 0.99998 vs a chunked autograd reference at production shapes), the eval path (bit-stable across repeated evals) — before the real causes turned out to be two lines of optimizer arithmetic:
 
 - **MLX `optim.Adam` defaults to `bias_correction=False`.** Effective lr is nominal × `(1−β₁ᵗ)/√(1−β₂ᵗ)`: peaks **6.6× at step 12**, still 3.3× at step 96. Our nominal 3e-6 was really ~2e-5 — exactly the value our own earlier sweep had recorded as "diverges". The amplification profile (max at ~step 12, slow decay) *is* the "fast spike, partial recovery" signature. Upstream `mlx_lm/quant/dwq.py` sets `bias_correction=True` explicitly; any fork must too, or no lr number is comparable to anything.
