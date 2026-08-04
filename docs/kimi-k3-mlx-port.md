@@ -186,3 +186,37 @@ timestamps** (append to a list, never print); a single-real-layer microbench dec
 into kernel/projection/glue in minutes; and `mx.compile(shapeless=True)` is unsafe where the
 traced function reshapes with `-1` (a trace specialized on one source count died on another —
 per-shape compile caches are the safe form).
+
+## 9. Writing custom Metal kernels that match MLX eager ops bit-for-bit
+
+Fusing MLX's small glue ops (conv/silu/rms_norm/sigmoid chains) into one custom kernel is the
+right lever on dispatch-bound decode — but "mathematically identical" is not "bit-identical",
+and on a 93-layer recurrent model 1-ULP glue drift compounds into measurable logit drift.
+Three MLX semantics we had to pin down *empirically* (each verified to 0 mismatches on 8k
+random samples before adoption):
+
+- **Eager `mx.sigmoid` is NOT `1/(1+exp(-x))` in fp32.** The Metal kernel
+  (`unary_ops.h::Sigmoid`) computes `y = 1/(1+exp(|x|)); x<0 ? y : 1-y` **in the tensor's own
+  dtype** — for bf16 inputs every intermediate (exp, add, divide, subtract) rounds to bf16.
+  Emulation that matches exactly: round each step through bf16, compute the transcendental in
+  fp32. Note `mx.compile`d graphs promote the same chain to fp32 — so a compiled reference and
+  an eager reference disagree with *each other*; match whichever path you are replacing.
+- **Python-scalar × bf16-array pre-rounds the scalar to bf16** (weak promotion), then multiplies.
+  Passing the exact fp32 scalar into a custom kernel produced 222/8192 mismatches; pre-rounding
+  it to bf16 reproduced MLX exactly. Applies to patterns like `(head_dim**-0.5) * x`.
+- **`mx.fast.rms_norm` rounds once without weight, twice with weight**: `bf16(x·rsqrt(mean+eps))`
+  then `bf16(norm × w)`. Fusing normalize-and-scale into one round is a 1-ULP mismatch on ~26%
+  of elements.
+
+Payoff profile for the fusion itself (Kimi K3, KDA layer, M3 Ultra): packing 6 same-input
+projections into one QMM (row-concat of 6-bit weights is bit-exact; slice back on the output
+axis) gave a measured e2e win; the glue kernel (24 dispatches → 2, threadgroup-per-head with
+simd_sum reductions) then reduced per-layer isolated time by a further ~4%. After matching the
+three semantics above: conv states bit-exact, recurrent state at 1e-8 (fp32 noise), greedy
+generations identical with fusion on/off.
+
+Two operational traps from the same session: (1) output-axis packing and tensor-parallel
+head-slicing touch the same modules — they compose into shape mismatches at runtime; make them
+explicitly mutually exclusive. (2) A smoke launcher that shares the production port *and* uses a
+broad `pkill -f` cleanup pattern will take down the production server when the bind fails —
+isolate smoke runs by port and narrow the kill pattern to the smoke's own arguments.
