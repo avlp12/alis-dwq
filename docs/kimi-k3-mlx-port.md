@@ -293,3 +293,22 @@ isolation carries ~190µs of `mx.eval` fixed cost, which completely masks a 15µ
 improvement. Chain ~16 dependent calls inside one graph and divide — our row-parallel decode
 variant (8 rows/simdgroup, after llama.cpp's low-bit N_R0=8 convention) measured 1.01× naively
 but is a real 1.14× at the shapes that matter, bit-identical, and is now the default engine.
+
+## 12. Speculative decoding on a sparse MoE, revisited — the premium was kernel accounting
+
+Section 8 reported speculative decoding as a 0.58× net loss on this rig. That number deserved
+an autopsy, and the autopsy changed the conclusion: the verify forward (T=2..4) was expensive
+mostly because every decode-path fusion we had built was gated `T==1` — the verify tokens fell
+off the fast path entirely. Extending the fused KDA glue kernel to T≤4 (the causal-conv taps
+become a sliding window over [state, raw inputs]; the last position's threads write the new
+state) and the fused router to T≤8 kept everything bit-exact at T=2/3 and cut the measured
+verify-2 premium from 1.38× to ~1.28×.
+
+Live result with an n-gram (prompt-lookup) drafter, greedy, 192-token generations:
+draft k=2 is still a net loss on all domains (accept 33-51%); draft k=1 is break-even —
++2.5% on repetitive code (72% accept), neutral on prose, −1.5% on step-by-step math. We ship
+it default-off. The honest summary: **the verify-cost half of the speculation problem is now
+solved on this stack; the drafter half is not.** Any drafter with >70% acceptance across
+domains (a learned per-layer draft expert, MTP-style heads) would flip this positive
+immediately. One API trap for reproducers: our `K3_SPEC_K` is a *total feed budget* — the
+draft count is `K3_SPEC_K − 2`, so setting it to 2 silently disables drafting entirely.
