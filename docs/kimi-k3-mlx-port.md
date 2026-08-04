@@ -230,3 +230,43 @@ head-slicing touch the same modules — they compose into shape mismatches at ru
 explicitly mutually exclusive. (2) A smoke launcher that shares the production port *and* uses a
 broad `pkill -f` cleanup pattern will take down the production server when the bind fails —
 isolate smoke runs by port and narrow the kill pattern to the smoke's own arguments.
+
+## 10. MoE decode restructuring on MLX — what moved the needle and what didn't
+
+Measured on the same rig (92 MoE layers, 896 experts top-16, batch-1, 2-box EP), after the
+KDA fusion work brought the step to ~179ms. Stage-decomposed the ~90ms MoE region first
+(isolated stage benches inflate by ~190µs of per-eval overhead each — subtract it or you will
+chase phantoms; the full-call time is the honest denominator).
+
+**Adopted (all bit-exact, each behind a killswitch):**
+- **Fused router kernel** — the sigmoid→bias→top-16-of-896→normalize→group-map→hi-top-4 chain
+  (~18 small dispatches) as ONE single-threadgroup kernel doing sequential max-extraction.
+  Selection set, weights, and hi choices matched the argpartition reference bit-for-bit on
+  32/32 trials; only the emission *order* differs (score-descending vs argpartition's arbitrary
+  order), which shifts downstream weighted sums by ~1 ULP. Biggest single e2e win of the phase.
+- **Shared-experts GLU packing + fused SiTU** — gate+up row-concat into one QMM (bit-exact for
+  uniform quant) plus a one-dispatch SiTU elementwise kernel replacing ~8 glue ops.
+- **Activation-at-store fusion** — inlining the SiTU nonlinearity into the up-projection
+  kernel's store site (round the accumulator to bf16 *first* to preserve the reference's
+  rounding point, then apply the fp32 nonlinearity, round once at output). Zero mismatches over
+  860k elements. In-pipeline gain exceeded the isolated estimate — removing glue ops also
+  removes command-buffer pressure, so glue elimination compounds.
+
+**Rejected, with numbers:**
+- **Tensor-parallel on the dense/shared blocks**: halving a 107MB-per-layer weight stream
+  changed decode time by ~0%. At batch 1 these QMMs are latency-bound, not bandwidth-bound —
+  *every* bytes-reduction lever we tried on this rig (attention TP, dense TP, absorb-matrix
+  bf16) was speed-neutral. Measure one before building more.
+- **Raising MLX command-buffer budgets** (`MLX_MAX_OPS_PER_BUFFER`/`MLX_MAX_MB_PER_BUFFER` to
+  effectively-infinite): a 5% *regression*. The per-op commits those budgets force are not pure
+  overhead — they are what lets the CPU encode ahead while the GPU drains. Also note the
+  budget math: one stacked expert tensor binds ~1.2GB, so any budget between 50MB and ~1GB
+  yields the *same* commit pattern; there is no useful intermediate point.
+- (Earlier, same theme) **speculative decoding** loses 0.58× here — but external data
+  (Cohere's published MoE profile) reframes this as kernel accounting, not physics: where
+  routed-expert bytes are a small fraction of step time, a second token riding the *same*
+  gather kernels should cost ~1.05–1.25×. The loss came from doubling kernel count, not bytes.
+  A `gather_qmv`-style kernel that amortizes weight loads across 2 tokens reopens the door.
+
+Net for the day across both phases (KDA + MoE): 5.41 → ~5.95 tok/s, every adopted change
+bit-exact or ULP-bounded with a killswitch, greedy outputs stable throughout.
