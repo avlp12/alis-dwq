@@ -152,3 +152,37 @@ the [README](../README.md) ("From a 2.8T ternary-codebook student"); this file i
   protocol smoke, an env killswitch, and an e2e stats measurement. Three of seven candidates in
   our last batch were *rejected* by these gates (one numerically, two by measurement) — the gates
   are the method.
+
+## 8. Serving speed: what worked, what the literature got wrong for MoE
+
+Second optimization round took decode 4.61 → 5.41 tok/s and roughly halved prefill. Ranked by
+what actually paid:
+
+- **Delete the per-collective `mx.eval`.** MLX's own sharded-decode path leaves collectives in the
+  lazy graph and syncs once per token; our per-layer hard flush (92/step) was a watchdog defense
+  from before we had a GPU heartbeat thread, and it was serializing the entire step. Removing it
+  was the single biggest win — and it was found by a first-principles pass, not a profiler:
+  weight-read + ring-latency + dispatch floors summed to ~90–100 ms against 217 ms measured, which
+  said "the gap is an assumption, not physics."
+- **`MLX_METAL_FAST_SYNCH=1`** on every rank (upstream measures ~12× on collective sync).
+- **Vectorized loads in the codebook kernel** (8 bf16 as one `uint4`): bit-exact 1.25×. Notably an
+  fp16-dot variant and a δ-term-precompute variant landed on the *same* time, and combining all
+  three gained nothing further — the kernel is load-latency bound, not ALU bound. When three
+  unrelated optimizations converge to one floor, stop optimizing that axis.
+- **Speculative decoding is a *loss* on a sparse-MoE-over-EP rig.** n-gram/prompt-lookup drafting
+  reached a real 1.37 accepted tokens per round — and still cut throughput to 0.58× (5.36 → 3.13
+  tok/s), because every draft token routes to *different* experts: verify cost scales with draft
+  length (measured ~2.4× per round at k≤13) instead of amortizing a fixed cost. The published
+  "speculation is nearly free at batch 1" results assume dense weights shared across the batch.
+  For MoE, break-even acceptance is the verify-cost multiplier, not ~1.3. Keep the code behind a
+  killswitch; default it off.
+- **Chat-template caching**: see §5 — session-based glue-token appending, not history re-render.
+- Two more rejections worth stating: a hand-written T=1 depthwise conv (bf16 rounding drifted 2e-2
+  from `nn.Conv1d`'s fp32 accumulation) and a fused w1+w3 kernel (bit-exact, 1.02× — the two
+  dispatches already overlapped).
+
+Profiling notes that generalize: the forced collective evals double as **free per-layer
+timestamps** (append to a list, never print); a single-real-layer microbench decomposes a layer
+into kernel/projection/glue in minutes; and `mx.compile(shapeless=True)` is unsafe where the
+traced function reshapes with `-1` (a trace specialized on one source count died on another —
+per-shape compile caches are the safe form).
