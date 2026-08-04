@@ -270,3 +270,26 @@ chase phantoms; the full-call time is the honest denominator).
 
 Net for the day across both phases (KDA + MoE): 5.41 → ~5.95 tok/s, every adopted change
 bit-exact or ULP-bounded with a killswitch, greedy outputs stable throughout.
+
+## 11. Router mass tells you whether top-k reduction is on the table (novel data)
+
+Nobody had published the router probability-mass profile for a k=16-of-896 fine-grained MoE,
+so we measured it: 45k layer-samples across prose/Korean/code/math on Kimi K3. Result: the
+sorted, normalized top-16 weights have a **flat tail** — ranks 13-16 each carry ~3% (about a
+fifth of the top expert, not a hundredth), cumulative mass at rank 12 is only 86.6% on average
+(75.5% worst layer). This is the opposite of the "confident about 2-4, rest indistinguishable"
+profile reported for coarse-grained models, and it corroborates the DeepSeekMoE claim that
+shared-expert + fine-grained designs make routed experts *less* redundant per-expert.
+
+Consequence, measured end-to-end: k=16→12 bought +5% decode speed but shifted greedy outputs
+within 44-190 characters on all four test domains — a real distribution change, not rounding
+noise. We shipped it as an opt-in flag, default off. If you are considering top-k reduction on
+a fine-grained MoE: dump the mass profile first (it costs a few hundred tokens of serving with
+a 10-line hook), and gate any adoption on a real code benchmark — perplexity and short-form
+math stay green far past the point where code generation collapses (see OEA Table 7).
+
+One measurement pitfall from the same night: a single custom-kernel dispatch benched in
+isolation carries ~190µs of `mx.eval` fixed cost, which completely masks a 15µs/call kernel
+improvement. Chain ~16 dependent calls inside one graph and divide — our row-parallel decode
+variant (8 rows/simdgroup, after llama.cpp's low-bit N_R0=8 convention) measured 1.01× naively
+but is a real 1.14× at the shapes that matter, bit-identical, and is now the default engine.
