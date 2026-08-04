@@ -215,7 +215,17 @@ simd_sum reductions) then reduced per-layer isolated time by a further ~4%. Afte
 three semantics above: conv states bit-exact, recurrent state at 1e-8 (fp32 noise), greedy
 generations identical with fusion on/off.
 
-Two operational traps from the same session: (1) output-axis packing and tensor-parallel
+One more compounding pair from the fusion session: a launcher "memory gate" that refuses to
+start when wired memory is high cannot distinguish *a healthy server still running* from *a
+post-crash wired leak* — ours saw the live server's 400GB, refused silently, and exited. The
+readiness watcher then matched the **previous boot's** "server up" line in the un-truncated log,
+so the operator believed the new build was live and benchmarked the old one (an entire A/B round
+was invalid). Fixes: the gate first SIGTERMs stragglers and re-checks before declaring a leak;
+the launcher truncates its log as its first action; and after any deploy, verify the *running
+process's env* (`ps eww <pid>`) rather than trusting log lines. Deployment checks must probe the
+process, not the logs.
+
+Two more operational traps from the same session: (1) output-axis packing and tensor-parallel
 head-slicing touch the same modules — they compose into shape mismatches at runtime; make them
 explicitly mutually exclusive. (2) A smoke launcher that shares the production port *and* uses a
 broad `pkill -f` cleanup pattern will take down the production server when the bind fails —
