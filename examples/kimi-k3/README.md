@@ -50,3 +50,15 @@ is recorded with numbers. Highlights (full narrative in the docs file):
 The serving runtime (fusion kernels, EP harness, web chat, 2-box launcher) ships in the
 HF repo with an install guide (including a note addressed to AI coding agents). The
 quantization pipeline is this repo's `alis_dwq` + the campaign notes in the docs file.
+
+## Addendum: expert-placement balancing is a dead lever here (measured)
+
+With per-token expert-ID samples (26.6k routing sets per layer, 92 layers), the best static
+2-way partition found by direct E[max] minimization improves the straggler expectation only
+from 9.561 to 9.182 active-experts-per-box (floor 8.0) — a ~4% MoE-latency potential. The
+telling number: the naive index split (9.561) already sits at the uncorrelated-routing
+expectation (9.571), i.e. **K3's fine-grained routing shows no exploitable co-activation or
+frequency skew at the box-partition level**, and three quarters of the 19.5% straggler excess
+is irreducible per-token variance. Static placement optimization is not worth the reshard on
+this class of model; only dynamic (per-token) dispatch could recover it, at protocol
+complexity far exceeding the ~3ms prize. Raw optimizer + data hooks in the serving repo.
