@@ -312,3 +312,30 @@ solved on this stack; the drafter half is not.** Any drafter with >70% acceptanc
 domains (a learned per-layer draft expert, MTP-style heads) would flip this positive
 immediately. One API trap for reproducers: our `K3_SPEC_K` is a *total feed budget* — the
 draft count is `K3_SPEC_K − 2`, so setting it to 2 silently disables drafting entirely.
+
+## 13. An EAGLE-style draft head on a fine-grained-MoE trunk: a measured negative
+
+To reopen speculative decoding (whose verify cost we had already halved via T≤4 bit-exact
+fusion), we trained EAGLE-1-style draft heads (~230M params: fuse + 1 transformer block,
+frozen trunk embed/lm_head) on a 6M-token pilot of trunk hidden states (wiki-EN/KO/code mix,
+dumped at 62 tok/s via the expert-major prefill path). Two recipes, 3000 steps each:
+
+- CE-only: holdout trunk-greedy agreement α plateaued at **0.134**
+- + feature regression (smooth-L1 to the next hidden, EAGLE's core loss, weight 1.0 vs CE 0.1):
+  slower start, late crossover, final **0.141** — the celebrated ingredient bought +5% here.
+
+Both are a factor ~4 below the acceptance needed (α≈0.55 break-even, α≈0.8 for the 1.6×+
+regime), and the curves' diminishing slopes do not extrapolate to the gate even at 8× data.
+Our working hypothesis for *why*, consistent with the router-mass finding above: a 896-expert
+fine-grained trunk produces hidden dynamics that a small dense head cannot approximate the way
+it can for dense trunks — the same flat-tailed, high-entropy routing that defeats top-k
+reduction also defeats cheap drafting. Practical guidance: on this model class, budget
+drafter-based speculation as a *research project with real failure risk*, not an engineering
+line item — or wait for vendor-trained MTP heads. The verify-side engineering (bit-exact T≤4
+fused paths, synchronized sampling) is model-agnostic and keeps its value regardless.
+
+Bonus negative from the same window: mirroring the dense (non-expert) weights to bf16 for
+prefill GEMMs made long-prompt prefill 25% *slower* — at 16k-token prefill the dense matmuls
+are bandwidth-sensitive, and trading 6-bit reads for bf16 (4.6× bytes) loses despite faster
+math. The winning prefill lever was expert-major dequant-once for the codebook experts
+(long-prompt TTFT 100s→37s, adopted).
