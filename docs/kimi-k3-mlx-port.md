@@ -339,3 +339,73 @@ prefill GEMMs made long-prompt prefill 25% *slower* — at 16k-token prefill the
 are bandwidth-sensitive, and trading 6-bit reads for bf16 (4.6× bytes) loses despite faster
 math. The winning prefill lever was expert-major dequant-once for the codebook experts
 (long-prompt TTFT 100s→37s, adopted).
+
+## 14. EP sharding must reach the kernel: the dummy-row full-compute trap
+
+Expert-parallel sharding here rewrites the routing maps so that non-local experts point at a
+zero-weight dummy row (row 0) — memory is halved per box, outputs stay correct because the
+weighted sum multiplies those rows by zero. What we missed for weeks: the *kernel* still ran a
+full matvec for every dummy row. With two boxes, ~56% of routed-expert rows per rank were
+full-cost zero-contribution work.
+
+The fix is four lines per kernel — read `eidx[r]`, and if it is the dummy, write zeros and
+return before touching weights:
+
+```metal
+uint e = eidx[r];
+if (e == 0u) { if (lane == 0u) { /* write NR zeros */ } return; }
+```
+
+Measured: **+0.48 tok/s live (6.04→6.52)**, greedy transcripts unchanged (the elided work was
+exactly the zero-weight rows). Two portable lessons. First, *sharding a tensor is not sharding
+the compute* — any indirection that remaps "not mine" to "cheap placeholder" needs an explicit
+kernel-side elision, or you pay placeholder cost at full rate. Second, this hid for weeks
+because our decomposition microbenches normalized per-call rather than per-useful-byte; an
+external audit (fresh-eyes agent) spotted it from the code, not the numbers. Adversarial
+code-reads of "settled" hot paths are cheap compared to what they find.
+
+## 15. Fusing two matvecs + activation into one dispatch — and the kernel-generation trap
+
+The decode up-projection ran as three dispatches per expert group: w1 matvec → w3 matvec with
+the SwiGLU-variant activation fused at the store → w2 matvec. A w1+w3 fused kernel existed in
+the tree but was never wired — and wiring it as-is would have been a *regression*: it predated
+the current row-parallel kernel generation (1.14× faster) and the dummy-row exit from §14.
+Defined-but-unwired kernels rot. Re-derive them against your current best generation instead
+of resurrecting them.
+
+The rewrite (one dispatch: both matvecs + activation): each simdgroup owns NR=4 output rows ×
+2 weight stacks — same register budget as the single-stack NR=8 kernel — shares the x-block
+loads across both accumulations, applies the activation in-register, and keeps the dummy exit.
+To stay bit-identical to the two-kernel path, round *at the same three points* the split path
+rounds: gate to bf16 (it used to cross device memory as bf16), up to bf16, output once.
+
+Measured (chained, [layer-level]): up-phase 176.7 → 137.3 µs/layer-call (**+22.3%**), bit-equal
+including dummy rows; live serving **6.58-6.60 → 6.64-6.68 tok/s**, full greedy transcripts
+identical with the fusion on/off. The win decomposed: one dispatch fewer, x/codebook
+threadgroup loads amortized once instead of twice, and the gate tensor no longer round-trips
+through device memory.
+
+## 16. Framework upgrades move greedy transcripts; re-certify against the teacher, cheaply
+
+Upgrading MLX 0.31.2→0.32.0 (for its new RDMA collective backend) shifted greedy decoding at
+one near-tie token in one of three fixed probes — transcripts elsewhere byte-identical. Bisect
+discipline: with the new framework fixed, toggle your own change on/off (ours was bit-exact
+either way → framework guilty); never attribute a transcript shift without that split.
+
+A transcript shift is not a quality verdict. The cheap definitive test: recompute a *small
+window subset* of teacher-forced logits under the new framework (same prefill path as the
+original certification) and compare KL(teacher‖build) per window against the certified run:
+
+| window | KL before | KL after |
+|---|---|---|
+| wikitext w000 | 0.2313 | 0.2314 |
+| wikitext w001 | 0.3637 | 0.3633 |
+| korean w000 | 0.1130 | 0.1128 |
+| korean w001 | 0.1169 | 0.1175 |
+
+Identical to the 4th decimal (4 windows, ~20 min including model load) — certification stands
+without rerunning the full 48-window suite. The direct old-vs-new logit KL (2.4-3.6e-3 nats,
+1.3-2.0% argmax flips over all teacher-forced positions) is the framework's rounding footprint:
+real, harmless, and now on file so the next transcript drift has a reference scale. Retire
+transcript baselines recorded under the old framework the moment this lands — stale baselines
+turn every future A/B into a false alarm.

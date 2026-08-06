@@ -62,3 +62,16 @@ frequency skew at the box-partition level**, and three quarters of the 19.5% str
 is irreducible per-token variance. Static placement optimization is not worth the reshard on
 this class of model; only dynamic (per-token) dispatch could recover it, at protocol
 complexity far exceeding the ~3ms prize. Raw optimizer + data hooks in the serving repo.
+
+## Addendum 2: dummy-row elision, single-dispatch GLU fusion, framework re-cert (2026-08-06)
+
+Receipts:
+- [`glu_fusion_bench.txt`](glu_fusion_bench.txt) — chained layer-level A/B of the fused
+  w1+w3+activation kernel vs the two-kernel path: 176.7 → 137.3 µs/layer-call (+22.3%),
+  bit-equal output including EP dummy rows; reproduced identically on MLX 0.31.2 and 0.32.0.
+- [`mlx032_recert_kl.txt`](mlx032_recert_kl.txt) — 4-window teacher-anchored KL smoke after
+  the MLX 0.32 upgrade: per-window KL unchanged to the 4th decimal; the framework's rounding
+  footprint (direct old-vs-new KL 2.4-3.6e-3 nats) documented for future drift triage.
+
+Narrative and portable lessons: docs/kimi-k3-mlx-port.md §14-16. Live serving across the day:
+6.04 → 6.52 (dummy-row early-exit) → 6.64-6.68 tok/s (fusion), greedy-verified at each step.

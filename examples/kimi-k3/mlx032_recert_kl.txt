@@ -1,0 +1,11 @@
+# MLX 0.31.2 -> 0.32.0 re-certification, 4-window teacher-anchored KL smoke (2026-08-06)
+# harness: k3_ppl.py --max-windows 2 --save-logits (PFDENSE=0 = original cert prefill path)
+# compare: kl_window_subset.py <new_dir> --pair <cert_dir> 0 1 24 25
+w000  KL(T||B) 0.2313 -> 0.2314   direct KL(B_old||B_new) 2.426e-03 nats, flip 1.61%
+w001  KL(T||B) 0.3637 -> 0.3633   direct 3.339e-03 nats, flip 1.27%
+w024  KL(T||B) 0.1130 -> 0.1128   direct 2.924e-03 nats, flip 1.95%
+w025  KL(T||B) 0.1169 -> 0.1175   direct 3.583e-03 nats, flip 1.91%
+# verdict: teacher-anchored KL identical to 4th decimal; certification (0.2253) stands.
+# greedy probes: 2/3 prompts byte-identical, 1 diverged at a near-tie 60+ tokens in (ULP class).
+# dummy-row early-exit: +0.48 tok/s (6.04->6.52); GLU v4.5 fusion: +22.3% up-phase,
+# live 6.58-6.60 -> 6.64-6.68 tok/s, bit-exact (greedy transcripts identical fusion on/off).
