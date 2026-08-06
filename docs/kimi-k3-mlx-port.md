@@ -409,3 +409,42 @@ without rerunning the full 48-window suite. The direct old-vs-new logit KL (2.4-
 real, harmless, and now on file so the next transcript drift has a reference scale. Retire
 transcript baselines recorded under the old framework the moment this lands — stale baselines
 turn every future A/B into a false alarm.
+
+## 17. RDMA collectives on a two-Mac TB5 cluster (MLX 0.32 jaccl): +5% e2e, and the topology surgery
+
+MLX 0.32 ships a `jaccl` distributed backend: RDMA over Thunderbolt, no InfiniBand hardware.
+On our 2× M3 Ultra ring it replaced TCP collectives outright — measured on the same chained
+harness (each all_sum consumes the previous result, `mx.eval` per step):
+
+| payload | ring (TCP) | jaccl (RDMA) |
+|---|---|---|
+| [1] f32 | 278.8 µs | 212.8 µs (−24%) |
+| [1, 8192] bf16 | 285.1 µs | 200.5 µs (−30%) |
+| [1, 65536] bf16 | 320.8 µs | 222.7 µs (−31%) |
+
+At 92 per-layer all_sums per decode step that projected to −6~8 ms/step; live serving landed
+exactly there: **6.6 → 6.9-7.1 tok/s**, greedy transcripts bit-identical (a two-rank sum has
+one addition order — switching transports cannot change the arithmetic; still verify).
+
+What it actually takes, beyond `pip install -U mlx`:
+- `rdma_ctl status` must say enabled on every box (ours already were — check before planning
+  recovery-mode work).
+- The Thunderbolt interface carrying the link must own an IP *directly*. macOS puts TB ports
+  in `bridge0` by default, and a bridge member has no address/GID, so jaccl's queue-pair setup
+  dies at RTR with errno 22. The surgery, per box: pull the port out of the bridge and move
+  the existing IP onto it (`ifconfig bridge0 deletem enX` + `ifconfig enX inet <same-ip>
+  netmask ...`) — same addresses, so ssh/hostfiles/launchers survive untouched. It does not
+  persist across reboots.
+- Manual rendezvous without `mlx.launch` (our launchers are hand-rolled ssh): set
+  `MLX_JACCL_COORDINATOR=<rank0-ip:port>` and `MLX_IBV_DEVICES=<file>` holding the device
+  matrix `[[null,"rdma_enX"],["rdma_enX",null]]` — device names are `rdma_` + the *local
+  interface name*, world size is inferred from the matrix, `MLX_RANK` as usual. No hostfile.
+
+Surgery pitfalls that cost us an hour at 1 a.m.: applying it half on one box (port un-bridged
+but IP left on the bridge) severs the link **mid-serving** — the ring dies, the server wedges
+at 100% CPU with the GPU near-idle, and SIGTERM won't land because the ring-blocked thread
+never reaches the graceful handler (verify wired memory has drained, then SIGKILL is safe).
+And on the other box the IP moved but the connected route silently failed to install, so
+replies left via the VPN interface — `route get <peer>` from *both* sides plus a resolved ARP
+entry distinguishes every one of these half-states in under a minute; ping alone distinguishes
+none of them.

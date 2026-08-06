@@ -75,3 +75,10 @@ Receipts:
 
 Narrative and portable lessons: docs/kimi-k3-mlx-port.md §14-16. Live serving across the day:
 6.04 → 6.52 (dummy-row early-exit) → 6.64-6.68 tok/s (fusion), greedy-verified at each step.
+
+## Addendum 3: jaccl (TB5 RDMA) collectives adopted (2026-08-07)
+
+Same-harness collective latency ring vs jaccl and the live outcome (6.6 → 6.9-7.1 tok/s,
+transcripts bit-identical) are in docs §17, with the bridge0 surgery and manual-rendezvous
+recipe. Day arc for the serving campaign: 6.04 → 6.52 (dummy-row elision) → 6.66 (GLU fusion)
+→ 7.0 (RDMA collectives) — +16% in one day, every step transcript- or teacher-anchored.
