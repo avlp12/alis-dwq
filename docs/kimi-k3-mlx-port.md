@@ -448,3 +448,39 @@ And on the other box the IP moved but the connected route silently failed to ins
 replies left via the VPN interface — `route get <peer>` from *both* sides plus a resolved ARP
 entry distinguishes every one of these half-states in under a minute; ping alone distinguishes
 none of them.
+
+## 18. Prefill for codebook experts: token-parallel decode amortization (v5) beats both incumbents in the chat-turn regime
+
+Per-row LUT re-decode is the prefill killer for codebook-quantized experts: at R routed rows
+per layer, the same expert weights get decoded R-ish times. Our first fix (§ earlier,
+"expert-major") dequantizes each expert once into a dense buffer and runs a GEMM — great at
+long prompts, but its fixed dequant cost loses below ~250 tokens, so chat turns stayed on the
+naive path.
+
+The v5 kernel closes that gap without materializing anything: sort rows by expert (host-side
+argsort, one plan shared across w1/w3/w2), tile them (expert × ≤8 tokens), and give each
+simdgroup one output row — each lane decodes its 32-value weight chunk *once* into registers
+and reuses it across the tile's 8 token vectors. Accumulation order is kept identical to the
+decode kernels (lane-strided fp32 + simd_sum), which bought bit-identity with the decode path
+at R=64 and p99 bit-identity with the old prefill path at R=8192.
+
+Measured (M3 Ultra, 3072×3584 stacks, realistic 44%-local EP routing):
+
+| tokens | naive per-row | v5 | expert-major |
+|---|---|---|---|
+| 32 | 5.6 ms | **1.7 ms (3.3×)** | — |
+| 126 | 18.4 ms | **5.6 ms (3.3×)** | — |
+| 512 | 69.4 ms | **50.7 ms/3-mat best** | 59 ms/3-mat |
+| 2048 | 271.9 ms | 197 ms/3-mat | **65 ms/3-mat** |
+
+Crossover ≈ 650 tokens → gate v5 for 64 < R < 10240, keep expert-major above. Live serving:
+**chat-turn prefill 5.6 → 2.7 s (2.1×)**, long-prompt TTFT 37 → 33.6 s (the latter mostly from
+also extending §14's dummy-row elision to the prefill paths — we had patched only the decode
+kernels; audit *every* path that consumes the sharded maps). Decode throughput unchanged.
+
+Transcript note for adopters: switching the mid-R kernel changes <1% of outputs at the last
+ulp, which flipped exactly one of three fixed greedy probes — the same near-tie "canary"
+prompt that flipped under the MLX 0.31→0.32 upgrade and under speculative verify. Track which
+of your fixed probes are hair-triggers; a canary flipping alone (with kernel-level p99 bit
+identity in hand) is evidence of rounding sensitivity, not regression — but bundle a
+self-consistency PPL check in the relevant window-length regime with the next deploy anyway.
