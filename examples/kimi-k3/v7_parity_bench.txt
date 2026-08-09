@@ -1,0 +1,6 @@
+[청크256] 패리티 v7-bm8 vs v5: rel_max 4.274e-03 (PASS)
+[청크256] 패리티 v7-bm16 vs v5: rel_max 4.274e-03 (PASS)
+[청크256] w1 GEMM (R=4096, 런평균 4.2행): v5 12.60ms · v7-bm8 8.13ms · v7-bm16 11.40ms → 최속 v7-bm8 (1.55× vs v5)
+[비청크2048] 패리티 v7-bm8 vs v5: rel_max 4.149e-03 (PASS)
+[비청크2048] 패리티 v7-bm16 vs v5: rel_max 4.149e-03 (PASS)
+[비청크2048] w1 GEMM (R=32768, 런평균 32.8행): v5 106.09ms · v7-bm8 35.68ms · v7-bm16 29.59ms → 최속 v7-bm16 (3.59× vs v5)

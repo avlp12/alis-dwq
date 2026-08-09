@@ -642,3 +642,43 @@ re-certified the chunked-prefill path itself. Two rules worth exporting:
   A quality gate that shares the serving stack's kernels but not its workarounds will wedge
   exactly when you need it, and with distributed lazy frameworks the failure is a silent
   spin, not an error. Budget one `sample`-based stack signature before declaring any hang.
+
+## 24. The prefill kernel finally uses the matrix unit: an MMA fused-codebook GEMM, and a
+regime map that decides per-call
+
+Our decode-side codebook kernels went through five generations without ever touching
+`simdgroup_matrix` — profiling said prefill was 70% MoE GEMM and roofline said we were
+compute-bound at 24:1, so the missing matrix unit was the whole story (§20's read-bound
+model is a *decode* model; prefill inverts it). v7 is the fix: a tiled GEMM
+(`BM×64×32` tiles, fp32 `simdgroup_float8x8` accumulate — same choice as MLX's steel
+kernels) whose threadgroup loader **dequants the ternary codebook in place** (2 KB LUT in
+registers via a 16 KB device grid, 11-bit indices, per-32-weight scales). That single
+property — dequant fused into the loader — is what beats not just the old token-parallel
+kernel (3.59× unchunked) but also the "dequant whole expert then dense GEMM" path (2.65×):
+the latter pays a 61 MB-per-expert round trip to device memory that the fused loader never
+issues. Tile runs are aligned to expert boundaries by construction (the tiling plan never
+lets a tile straddle two experts' weights), which is the other half of the win.
+
+The regime map matters as much as the kernel. Routed-run length per expert = tokens×top_k
+÷ experts, and MMA tiles starve when runs are shorter than the tile height:
+
+| routed rows R | mean run | winner |
+|---|---|---|
+| 1.8k (chat turn) | 2.2 | old token-parallel kernel (v7 is 0.80×) |
+| 4k (256-chunk) | 4.2 | v7, BM=8 (1.55×) |
+| 8k (512-chunk) | 8.2 | v7, BM=8 (2.11×) |
+| 33k (unchunked 2k) | 33 | v7, BM=16 (3.59×) |
+
+So the dispatch ladder picks per call: below ~3k routed rows keep the old kernel (and with
+it, byte-identical chat-turn transcripts — no re-certification needed for the common case);
+above, v7 with BM auto-selected. This also re-priced the TP prefill chunk size: with the
+per-chunk MoE cost 2× lower, we re-ran the 4-layer bisection harness (§22) at 512-token
+chunks — clears the graph-size wedge — and shipped chunk 512. Net at 2k tokens: prefill
+42.0 → **24.8 s (80 tok/s), now faster than the non-TP path (33.6 s)** that chunking had
+previously traded away; decode unchanged at 8.8 tok/s. The changed-numerics path (long
+prefill only) passed the 4-window teacher-anchored KL gate within 0.0006 nats of baseline —
+and the KL harness itself, which shares the chunked forward, got 3.8× faster as a side
+effect. One exportable rule: **when a quantization format is exotic enough to need custom
+kernels, write the prefill GEMM against the matrix unit from day one** — the scalar-dot
+formulation that decode tolerates (it's bandwidth-bound anyway) silently costs 3× where
+arithmetic dominates.

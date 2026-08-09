@@ -113,3 +113,12 @@ The "conflict" that had shelved shared-expert TP was an install-order bug (fusio
 full-width weights before TP sliced them); shard-then-fuse composes cleanly with zero extra
 collectives. Decode 8.3 → **8.8 tok/s**, 2k-depth decode 7.3 → 8.7. Full story incl. the
 eval-harness wedge saga: docs §23.
+
+## Addendum 7: v7 MMA fused-codebook prefill — 2k prefill 24.8s under full TP (2026-08-09)
+
+Receipts: [`v7_parity_bench.txt`](v7_parity_bench.txt) (parity vs certified kernel 4e-3 =
+bf16 scale; microbench 1.55×/2.11×/3.59× by regime), [`kl_v7_4win.txt`](kl_v7_4win.txt)
+(4-window KL within 0.0006 nats). Ternary-codebook dequant fused into the MMA threadgroup
+loader — beats both the token-parallel kernel (3.6×) and dequant-then-GEMM (2.65×); with
+the per-call regime ladder and 512-token chunks, TP prefill now beats non-TP outright.
+Design + regime map: docs §24.

@@ -1,0 +1,8 @@
+# v7 MMA prefill kernel (K3_CBQ_V7=1, chunk 512) — 4-window teacher-anchored KL gate
+# Reference (baseline, same protocol): 0.2313 / 0.3637 / 0.1130 / 0.1169
+w000  KL(T||B) 0.2307 nats · flip 10.80%
+w001  KL(T||B) 0.3634 nats · flip 13.39%
+w024  KL(T||B) 0.1125 nats · flip 11.53%
+w025  KL(T||B) 0.1167 nats · flip 12.95%
+# Verdict: PASS — every window within 0.0006 nats. Chat-turn greedy transcripts byte-identical
+# (small-R path keeps the prior kernel). e2e: 2k-token prefill 42.0 -> 24.8s (80 tok/s), decode 8.8.
