@@ -557,3 +557,48 @@ projections) at 6 bit recovered almost none of it (0.2587). Two lessons:
 Also on file: a bf16 DSpark-style drafter against this 2.10 bpw target accepts ~1.55
 tokens/round (k=2) versus 3.85-5.4 reported against bf16 targets — the quantized-target
 acceptance degradation is real on this stack, resolving a conflict in the community record.
+
+## 22. Attention TP lands as default: graph-size deadlocks, a 4-layer bisection harness, and
+byte-identity as the closing receipt
+
+Head-sharded attention TP (q/k/v/gate/o split across ranks, fp32 partial sums, one extra
+per-layer all_sum) is the final +12% of the campaign — decode 7.4 → **8.28-8.29 tok/s**
+measured on freshly booted boxes, now the default serving configuration. Three things had to
+be true before we could ship it, and each produced a reusable lesson.
+
+**1. The long-prompt stall was a graph-size problem, not a payload-size problem.** Under TP,
+prefills ≳1.5k tokens wedged the scheduler on *both* backends (RDMA jaccl and TCP ring) —
+so it was never the transport. Chunking only the all_sum payloads (splitting the [1,T,7168]
+tensor along T into 256-token all_sums) did **not** fix it: the deadlock tracks the size of
+the single lazy forward graph containing 93 interleaved collectives, not the size of any one
+collective. The fix that works is chunking the forward itself: under TP the server prefills
+in 256-token forwards (`K3_PREFILL_CHUNK`). Verified end to end with a 2k-token prompt
+(42.6 s prefill, no stall). Cost: ~25% slower long-prompt prefill than non-TP (33.6 s at 2k)
+— an acceptable trade against +0.9 tok/s decode; prefill-heavy batch workloads can keep
+`K3_ATTN_TP=0`.
+
+**2. Bisect deadlocks with a partial-load mini harness, never the full model.** Each wedged
+full-scale attempt cost a 395 GB wired-memory leak and a reboot (§21's kill-discipline rules
+exist because of this). The decisive experiment loaded **4 layers (~15 GB)**: chunked
+prefill (256×8) completed in 1.9 s where the single T=1993 forward wedged even at 4 layers —
+root cause confirmed and fix validated in one run, with nothing at risk. If a distributed
+hang reproduces at all, reproduce it at the smallest layer count that still shows it.
+
+**3. Certify TP by construction + identity, not by re-running the quality battery.**
+Head-TP is algebraically the same sum in a different accumulation order. So certification is
+(a) single-box numerical parity — shard the same weights into both ranks in one process, sum
+the partial outputs locally, compare against non-TP: rel_max ≈5e-3 on KDA and MLA layers,
+bf16 rounding scale, with partial sums accumulated in fp32 before the all_sum — and
+(b) **byte-identical greedy transcripts** vs the non-TP configuration (3 prompts × 96 tokens,
+reasoning traces included). Together these are strictly stronger than a PPL smoke, and
+cheaper: no 4-window KL run needed for a numerically-equivalent rewiring. (The KL battery
+remains the gate for anything that changes *values*, per §16.)
+
+Operational footnote: the TB5 point-to-point link that jaccl needs (bridge0 dismantled,
+static IPs on the raw interface) does not survive a reboot on macOS — a LaunchDaemon that
+re-applies interface config at boot (with retry, since interfaces come up late) makes the
+RDMA topology surgery permanent. Wired-leak recovery without a reboot: six candidate paths
+(memory-pressure eviction, GPU-restart trigger, IOKit user clients, purge calls, kext-level
+resets, sysctl VM knobs) all fail against IOGPU non-reclaimable pages from a killed process
+— prevention (never SIGKILL a loaded rank; chunked graphs so collectives can't hang) is the
+only strategy that works.
