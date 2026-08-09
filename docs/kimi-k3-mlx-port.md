@@ -602,3 +602,43 @@ RDMA topology surgery permanent. Wired-leak recovery without a reboot: six candi
 resets, sysctl VM knobs) all fail against IOGPU non-reclaimable pages from a killed process
 — prevention (never SIGKILL a loaded rank; chunked graphs so collectives can't hang) is the
 only strategy that works.
+
+## 23. Two optimizations that "conflict" usually just have an install-order bug — and your
+harness inherits your deadlocks
+
+Shared-expert TP (gate/up column-split, down row-split, partial sums riding the existing
+per-layer expert all_sum as a concatenated payload = **zero extra collectives**) had been
+shelved as "conflicts with the shared-expert fusion" after it killed the server at boot.
+The real bug was **install order**: fusion ran first and packed the full-width gate+up
+(6144 rows) into its fused weight; TP then sliced only the originals, so the forward mixed a
+full-width packed projection into a half-width down projection. Reordered (shard first, then
+fuse), the fusion packs the *sliced* weights — row-concat is bit-exact on the sliced
+subproblem and the fusion's own width bookkeeping follows automatically. The two
+optimizations were never mutually exclusive; the exclusivity guard itself was the bug.
+Composition certified single-box (sliced-then-packed fused path rel_max ≈1e-3, bf16 scale),
+then end-to-end: decode 8.3 → **8.8 tok/s** (fresh-boot 8.79-8.81), and decode at 2k-token
+depth improved 7.3 → 8.7.
+
+The certification run then taught a second lesson the hard way. Greedy transcripts moved on
+1 of 3 prompts (a ULP-class flip from the bf16 partial-sum ride-along — unlike attention
+TP's fp32 partial sums, the shared partial sums share the existing bf16 collective), so by
+our own §16 rule the change needed the teacher-anchored KL gate, not the cheap identity
+check. That KL harness promptly deadlocked for 33 minutes: it still ran unchunked T≈2k
+forwards, and §22's graph-size wedge applies to *any* forward-path entry point with TP
+collectives in the graph — the serving fix didn't protect the eval harness. A stack sample
+(`/usr/bin/sample`) gave the definitive wedge signature — main thread parked in
+`eval_impl` cond-wait, ring socket threads idle, collectives never dispatched. Killing the
+wedged 393 GB pair leaked wired memory on both boxes (the §21/§22 kill-discipline cost,
+paid knowingly) and forced a reboot. After porting the same 256-token chunked-forward fix
+into the eval harness (mathematically identical logits — caches make chunked prefill exact),
+the 4-window KL completed first try: **0.2303/0.3626/0.1112/0.1170 nats vs baseline
+0.2313/0.3637/0.1130/0.1169** — within noise on every window, which simultaneously
+re-certified the chunked-prefill path itself. Two rules worth exporting:
+
+- **A "conflict" between two independently-correct optimizations is an integration bug until
+  proven otherwise.** Check install order and shared bookkeeping before accepting
+  exclusivity. The −5 ms this "conflict" had shelved was recovered with a two-line reorder.
+- **Deadlock fixes must reach every forward entry point** — server, eval harness, probes.
+  A quality gate that shares the serving stack's kernels but not its workarounds will wedge
+  exactly when you need it, and with distributed lazy frameworks the failure is a silent
+  spin, not an error. Budget one `sample`-based stack signature before declaring any hang.

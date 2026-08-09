@@ -1,0 +1,5 @@
+A T=1: 비융합 TP rel_max bf16합 1.572e-03 · f32합 1.572e-03
+A T=8: 비융합 TP rel_max bf16합 3.546e-03 · f32합 3.546e-03
+C: 비-TP 융합 vs 비융합 rel_max 5.388e-04 (비트-정확 기대)
+B: 융합×TP 합성 vs 비-TP 융합 rel_max bf16합 1.078e-03
+판정(≤1e-2 bf16 반올림급): PASS

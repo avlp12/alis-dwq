@@ -103,3 +103,13 @@ chunking the forward graph itself (256-token prefill chunks — chunking only th
 payloads does not help; the deadlock tracks lazy-graph size, not payload size), verified with
 a 2k-token prompt (42.6 s, no stall). Root cause isolated with a 4-layer partial-load
 bisection harness (~15 GB at risk instead of 395 GB). Full story: docs §22.
+
+## Addendum 6: shared-expert TP composes with fusion — 8.8 tok/s (2026-08-09)
+
+Receipts: [`dense_tp_parity.txt`](dense_tp_parity.txt) (single-box parity incl. the
+sliced-then-packed fused path, rel_max ≈1e-3), [`kl_densetp_4win.txt`](kl_densetp_4win.txt)
+(4-window teacher-anchored KL — every window within 0.002 nats of the non-TP baseline).
+The "conflict" that had shelved shared-expert TP was an install-order bug (fusion packed
+full-width weights before TP sliced them); shard-then-fuse composes cleanly with zero extra
+collectives. Decode 8.3 → **8.8 tok/s**, 2k-depth decode 7.3 → 8.7. Full story incl. the
+eval-harness wedge saga: docs §23.
