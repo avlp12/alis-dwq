@@ -82,3 +82,12 @@ Same-harness collective latency ring vs jaccl and the live outcome (6.6 → 6.9-
 transcripts bit-identical) are in docs §17, with the bridge0 surgery and manual-rendezvous
 recipe. Day arc for the serving campaign: 6.04 → 6.52 (dummy-row elision) → 6.66 (GLU fusion)
 → 7.0 (RDMA collectives) — +16% in one day, every step transcript- or teacher-anchored.
+
+## Addendum 4: read-bound model, revived attention-TP (+9%), precision-axis closure (2026-08-09)
+
+Receipts: [`topk_probe_corrected.txt`](topk_probe_corrected.txt) (the corrected sweep with
+kernel-side R evidence — top_k=1 is −11.2%, not 0%), [`dspark_alpha_quantized_target.txt`](dspark_alpha_quantized_target.txt)
+(bf16 drafter vs 2.10bpw target: accept-len 1.55). Narrative and rules: docs §19-21.
+Serving arc this week: 6.04 → 7.4 (certified) → **8.1 tok/s** (attention head-TP, final KL
+smoke pending at commit time). 4-bit always-stack rejected on KL (+10%); DWQ-corrected low-bit
+is the priced reopening path.

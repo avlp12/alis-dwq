@@ -484,3 +484,76 @@ prompt that flipped under the MLX 0.31→0.32 upgrade and under speculative veri
 of your fixed probes are hair-triggers; a canary flipping alone (with kernel-level p99 bit
 identity in hand) is evidence of rounding sensitivity, not regression — but bundle a
 self-consistency PPL check in the relevant window-length regime with the next deploy anyway.
+
+## 19. Two invalid experiments, one rule: interventions must print evidence of themselves
+
+Two of our most consequential "findings" this week were artifacts of interventions that never
+actually happened:
+
+- **The phantom top_k result.** "Reducing routed experts 16→1 changes nothing" drove days of
+  prioritization (killed expert-side levers, killed expert-reduction drafting, spawned a wrong
+  "MoE is latency-hidden" theory). In reality our EP installer replaces `layer.mlp` with a
+  lambda closure; the sweep's `isinstance(...)` scan found zero MoE modules and changed
+  nothing. The corrected sweep (recovering modules from `lambda.__defaults__`, printing the
+  kernel-observed row count per setting) shows top_k=1 is **−11.2%** — the original experiment
+  was a no-op, not a discovery.
+- **The phantom TP certification.** Our KL harness accepted `K3_ATTN_TP=1` but never called
+  the TP installer — and produced four windows of KL **identical to six significant digits**
+  with the non-TP run. That impossible-looking agreement was the tell: the intervention wasn't
+  installed. (The perfect reproduction was, at least, a free determinism check of the harness.)
+
+The standing rule we adopted: **an intervention experiment is valid only if it emits evidence
+of its own application** — the kernel-side row count actually dispatched, the number of layers
+actually wrapped, or a measurable divergence from a known-identical baseline. Silence plus a
+plausible number is how no-ops masquerade as physics. Corollary from the same week: eager
+distributed measurement harnesses must include a settle pass before timing (skipping it cost
+us a 3-hour watchdog deadlock that presented as "slow").
+
+## 20. A read-bound decode model, cross-validated by two byte-removal experiments
+
+With the phantom result corrected, two independent experiments that each remove a known number
+of bytes from the per-token read stream agree on one exchange rate:
+
+| experiment | bytes removed / token / rank | measured saving | implied marginal BW |
+|---|---|---|---|
+| top_k 16→1 (corrected) | −11.3 GB | −20.2 ms | 560 GB/s |
+| attention 6→4 bit | −9.4 GB | −14.5 ms | 650 GB/s |
+
+**Decode step ≈ bytes-read ÷ ~550-650 GB/s effective.** The whole step checks out too (62.1 GB
+÷ 460 GB/s ≈ the 135 ms step). The actionable currency: **1 GB removed ≈ 1.8 ms**.
+
+Byte census (per token per rank, batch-1, 2-way EP): attention projections 33.2 GB + shared
+experts 9.8 GB + MoE latent/router ~5 GB + embeddings/head 1.9 GB — the **always-read stack is
+80%** — routed experts only 12.1 GB (20%). Under this model, replicated-weight tensor
+parallelism is the only parallelism that reduces bytes; pipeline parallelism does not (a
+batch-1 token walks the layers serially either way, so PP's gain is only the non-overlapped
+collective time). Flipping the long-rejected `K3_ATTN_TP=1` (head-sharded q/k/v/gate/o,
+−16.6 GB/token/rank, one extra partial-sum all_sum per layer) delivered **7.4 → 8.1 tok/s
+(+9%)** live. The original TP rejection dated from the TCP-ring, pre-fusion era — the same
+vintage as the phantom top_k result, and equally stale.
+
+Operational caveat discovered in the same push: **jaccl (TB5 RDMA) collectives stall on
+large payloads** (tens of MB — e.g. TP partial-sums during a 2k-token prefill, ~59 MB/layer).
+Small decode-time collectives are fine. Until a chunked-collective fix lands, run TP prefill
+over the TCP ring backend or cap chunk sizes.
+
+## 21. The precision axis closes: 4-bit attention fails its KL gate, and sensitivity is not
+where requant error says it is
+
+The read-bound model made the 6-bit always-stack the biggest byte target (6.0 bit stored;
+experts are 2.10 bpw). Speed delivered as predicted (KDA layers −9.6%; MLA layers unchanged —
+their kv_b projection is dequantized **once** into absorb caches, so quantizing it saves
+nothing per-step). Quality did not: teacher-anchored KL rose ~10% (0.2313→0.2586 wt) and a
+selective variant that kept the highest-requant-error tensors (the tiny gate low-rank
+projections) at 6 bit recovered almost none of it (0.2587). Two lessons:
+
+- **Requant rel-error is not a sensitivity proxy.** The tensors with the worst per-tensor
+  reconstruction error (2.4 MB of gate projections) contributed almost nothing to the KL hit;
+  the well-reconstructed large projections carried it. Grade sensitivity by output/KL
+  perturbation, never by weight-space error.
+- The axis reopens only with distillation-corrected low-bit (our DWQ pipeline) — the exchange
+  rate (−17 ms for attention alone) now prices that campaign precisely.
+
+Also on file: a bf16 DSpark-style drafter against this 2.10 bpw target accepts ~1.55
+tokens/round (k=2) versus 3.85-5.4 reported against bf16 targets — the quantized-target
+acceptance degradation is real on this stack, resolving a conflict in the community record.
