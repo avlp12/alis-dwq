@@ -1,0 +1,9 @@
+# TP vs non-TP greedy identity check (2026-08-09)
+# v8 = K3_ATTN_TP=1 (jaccl, chunked prefill 256, fresh boot) · final = K3_ATTN_TP=0 (jaccl)
+# Both 96 tokens greedy, reasoning traces included in comparison
+
+prompt '1+1은?': BYTE-IDENTICAL (405B)
+prompt '가을에 대해 짧은 시를 한 편 써줘.': BYTE-IDENTICAL (471B)
+prompt '파이썬으로 피보나치 수열 함수를 작성해줘.': BYTE-IDENTICAL (381B)
+
+decode: 8.28-8.29 tok/s (TP) vs 7.4 (non-TP) · long-prompt 2k: 42.6s prefill no-stall (TP chunked) vs 33.6s (non-TP)

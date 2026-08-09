@@ -91,3 +91,15 @@ kernel-side R evidence — top_k=1 is −11.2%, not 0%), [`dspark_alpha_quantize
 Serving arc this week: 6.04 → 7.4 (certified) → **8.1 tok/s** (attention head-TP, final KL
 smoke pending at commit time). 4-bit always-stack rejected on KL (+10%); DWQ-corrected low-bit
 is the priced reopening path.
+
+## Addendum 5: TP ships as default — 8.3 tok/s, byte-identity certification (2026-08-09)
+
+Receipts: [`tp_parity.txt`](tp_parity.txt) (single-box head-shard parity, rel_max ≈5e-3 on
+KDA and MLA layers = bf16 rounding scale), [`tp_greedy_identity.txt`](tp_greedy_identity.txt)
+(**byte-identical greedy transcripts** TP vs non-TP, 3 prompts × 96 tokens — the "KL smoke
+pending" note in Addendum 4 is resolved by something strictly stronger: exact output identity).
+Final decode **8.28-8.29 tok/s** on fresh boots; the ≳1.5k-token TP prefill stall is fixed by
+chunking the forward graph itself (256-token prefill chunks — chunking only the collective
+payloads does not help; the deadlock tracks lazy-graph size, not payload size), verified with
+a 2k-token prompt (42.6 s, no stall). Root cause isolated with a 4-layer partial-load
+bisection harness (~15 GB at risk instead of 395 GB). Full story: docs §22.

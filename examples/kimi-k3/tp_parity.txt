@@ -1,0 +1,2 @@
+KDA층50: rel_max 4.695e-03 · rel_평균 2.417e-04 · |ref|max 0.052 · 판정 PASS(≤1e-2)
+MLA층51: rel_max 5.682e-03 · rel_평균 3.782e-04 · |ref|max 1.375 · 판정 PASS(≤1e-2)
