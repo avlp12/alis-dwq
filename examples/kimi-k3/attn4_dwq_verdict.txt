@@ -1,0 +1,12 @@
+# DWQ-corrected 4-bit attention — final measurements (2026-08-10, REJECTED for promotion)
+# Build: KDA q/k/v/g/o + MLA g/o at 4bit gs64, DWQ s/b correction (8 blocks, 96 steps, lr 3e-6,
+#        teacher = original mxfp4 boundary caches, val nMSE recovery -2.5%..-14.8% per block)
+# KL vs original teacher (4-window, production config):
+w000  0.2536 (baseline 0.2313, uncorrected-4bit 0.2587)   +0.0223 over baseline
+w001  0.3885 (baseline 0.3637, uncorrected-4bit 0.3858)   +0.0248
+w024  0.1161 (baseline 0.1130, uncorrected-4bit 0.1193)   +0.0031
+w025  0.1248 (baseline 0.1169, uncorrected-4bit 0.1278)   +0.0079
+# PPL (same 4-window): wt 1.7935 (baseline 1.7403, +3.1%) · ko 3.2763 (+0.6%)
+# Decode measured: 9.09-9.21 tok/s vs 8.8 six-bit = +3.5% (ledger predicted -17ms/+18%:
+#   stale — attention TP had already halved per-rank attention reads)
+# Verdict: rejected — +0.3 tok/s does not justify +6.5% KL. Read axis measured-exhausted.

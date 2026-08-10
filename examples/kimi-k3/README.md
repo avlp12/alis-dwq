@@ -122,3 +122,10 @@ bf16 scale; microbench 1.55×/2.11×/3.59× by regime), [`kl_v7_4win.txt`](kl_v7
 loader — beats both the token-parallel kernel (3.6×) and dequant-then-GEMM (2.65×); with
 the per-call regime ladder and 512-token chunks, TP prefill now beats non-TP outright.
 Design + regime map: docs §24.
+
+## Addendum 8: 4-bit attention + DWQ — a precisely-priced rejection (2026-08-10)
+
+Receipts: [`attn4_dwq_verdict.txt`](attn4_dwq_verdict.txt). DWQ recovery worked
+(KL +12% → +6.5%), but the speed side collapsed: attention TP had already consumed half the
+lever (+0.3 tok/s measured, not +18%). Rejected; artifact preserved. The 13-nats debugging
+saga (grid-scales marriage, recipe lineage, control-experiment-beats-audits) : docs §25.

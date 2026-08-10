@@ -682,3 +682,52 @@ effect. One exportable rule: **when a quantization format is exotic enough to ne
 kernels, write the prefill GEMM against the matrix unit from day one** — the scalar-dot
 formulation that decode tolerates (it's bandwidth-bound anyway) silently costs 3× where
 arithmetic dominates.
+
+## 25. A negative result, priced precisely: DWQ-corrected 4-bit attention is not worth it
+under tensor parallelism — and the debugging saga that proved the build, not the code
+
+We ran the full campaign §21 priced: requantize the always-read attention stack to 4 bit
+(the +10% KL failure documented there), then buy the quality back with the same layerwise
+DWQ machinery that built this model — teacher boundaries from the original mxfp4 checkpoint
+(the X10-archived caches), scales/biases-only training, 8 depth blocks across both boxes,
+monotone rollback. Training worked as designed: every block improved its held-out boundary
+nMSE (−2.5% to −14.8%; the final block, which feeds the logits, recovered −14.3%).
+
+The corrected build measured **KL +6.5% over baseline** (two windows just past our +0.02
+gate, two within it) — a real recovery from the uncorrected +12%. Then the other half of
+the trade collapsed: measured decode gain was **+0.3 tok/s (+3.5%), not the −17 ms the
+ledger promised**. The ledger was stale: §20's exchange rate priced attention reads
+*before* attention TP landed. TP had already halved the per-rank attention traffic, halving
+the 4-bit savings with it (absorb-cached MLA projections dilute it further). +0.3 tok/s for
++6.5% KL is a bad trade; we rejected the swap and kept the 6-bit stack. **Rule: reprice
+every shelved lever after each landed optimization — a composition change silently
+invalidates the ledger entries priced against the old composition.** The read axis on this
+deployment is now measured-exhausted (experts at 2.10 bpw, attention and shared experts
+TP-split, collectives on RDMA); what remains is the token axis (speculative decoding).
+
+Getting that clean measurement cost a debugging saga worth its own receipts. The first
+rebuild produced a model at **13 nats KL / 100% top-1 flip** — total destruction — while
+every file-level audit passed: patched scales matched training output, 4-bit grids matched
+bit-exactly, experts untouched, single-projection forwards showed healthy 4-bit noise.
+Three lessons from the hunt:
+
+- **The control experiment beats five audits.** Running the same harness on the known-good
+  6-bit build (clean baseline reproduced to 5 significant digits) exonerated the code in
+  one run, redirecting the whole investigation to the build bytes.
+- **A per-layer-type full-forward bisection found what file audits could not.** KDA layers
+  were fine; the MLA forward exploded 10× in amplitude. Cause: the preserved 4-bit build
+  followed an older recipe (KDA-only 4 bit, MLA left at 6 bit), while the training builds'
+  substring-matched requant had also converted MLA's g/o projections — so the rebuild
+  grafted 4-bit-trained scales (≈4× larger per step) onto 6-bit weight grids in 24 layers.
+  **Quantization scales are married to their integer grid; a rebuild that transplants
+  scales must first prove grid identity, tensor by tensor — same script is not same
+  artifact lineage.**
+- An independent 22-agent adversarial audit of the codebase confirmed the same verdict
+  from the other direction (timeline forensics on file mtimes and logit dumps), catching a
+  detail the manual hunt had glossed: the over-broad `unfreeze` had also trained the
+  high-sensitivity 6-bit gate projections' scales — benign here (tiny deltas on correct
+  grids), but exactly the class of scope leak worth asserting against.
+
+The repaired build (grids re-derived to match training lineage, trained s/b kept) is what
+produced the honest +6.5%/+3.5% numbers above. The artifact is preserved and bootable — a
+priced option, not a promotion.
