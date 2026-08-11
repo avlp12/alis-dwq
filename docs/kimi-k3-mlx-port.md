@@ -731,3 +731,33 @@ Three lessons from the hunt:
 The repaired build (grids re-derived to match training lineage, trained s/b kept) is what
 produced the honest +6.5%/+3.5% numbers above. The artifact is preserved and bootable — a
 priced option, not a promotion.
+
+## 26. Speed-neutral language specialization: re-tier the mxfp4 experts to the target
+language's routing mass
+
+The MoE precision tiers in this build — which experts are kept mxfp4 (hi) vs ternary-codebook
+(lo) — were assigned by mixed-corpus routing mass at build time. That is the wrong objective
+if you serve mostly one language. Profiling routing on Korean text (16 windows, 3.77M
+top-16 samples) showed the mixed-corpus hi-set covers only **14.7%** of Korean routing mass,
+and overlaps the Korean-oracle top-n_hi set by just **17.7%** — the high-precision experts
+and the experts Korean actually uses are nearly disjoint.
+
+Re-tiering fixes this at **zero speed cost**. For each layer, recompute the hi-set as the
+Korean-oracle top-n_hi (same count as before → per-token weight-read bytes, and therefore
+decode speed, are invariant), then rebuild the two stacks: promoted experts get their mxfp4
+weights (recovered from the original checkpoint — ternary can't be inverted, so this is the
+one thing that must be fetched: ~93 GB via safetensors-header + HTTP Range, vs re-downloading
+the 1.5 TB source), demoted experts are re-encoded to ternary from the build's own mxfp4 hi
+stack. Measured on the 4-window teacher gate: **Korean KL −20% / −30%** (0.1130→0.0905,
+0.1169→0.0824), Korean PPL 3.311 → **3.181 (−3.9%)**, wikitext PPL +0.2% (noise), decode
+**8.8 tok/s unchanged**. 89 of 92 MoE layers were re-tiered; mean Korean coverage 15.7% →
+oracle.
+
+Three things made it cheap and safe: (1) an **in-place rebuild** that consumes each source
+layer and deletes it once written (the full checkpoint is archived externally), so peak disk
+is one layer over the output, not source+output; (2) **bit-exact verification** of a promoted
+expert's mxfp4 (Δ=0 vs the true source) before trusting the whole run; (3) the count-invariant
+constraint as an explicit assert, so "speed-neutral" is enforced by construction rather than
+hoped for. The lever generalizes: route-profile any language or domain, re-tier to its oracle,
+and you buy quality where you use it for free. (Contrast §25's DWQ-4-bit attention: that spent
+read bytes for speed and failed its trade; this spends nothing and improves quality.)

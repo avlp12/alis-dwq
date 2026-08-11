@@ -129,3 +129,10 @@ Receipts: [`attn4_dwq_verdict.txt`](attn4_dwq_verdict.txt). DWQ recovery worked
 (KL +12% → +6.5%), but the speed side collapsed: attention TP had already consumed half the
 lever (+0.3 tok/s measured, not +18%). Rejected; artifact preserved. The 13-nats debugging
 saga (grid-scales marriage, recipe lineage, control-experiment-beats-audits) : docs §25.
+
+## Addendum 9: speed-neutral Korean re-tiering — ko-KL −20/−30% at unchanged speed (2026-08-11)
+
+Receipt: [`ko_retier_kl.txt`](ko_retier_kl.txt). Mixed-corpus hi-tier experts are ~orthogonal
+to Korean routing mass (overlap 17.7%); re-tiering to the Korean oracle (same per-layer count
+→ speed invariant) cuts Korean KL 20-30% and PPL 3.9% for free. Method + disk/verify
+discipline: docs §26.
