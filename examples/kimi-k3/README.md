@@ -136,3 +136,10 @@ Receipt: [`ko_retier_kl.txt`](ko_retier_kl.txt). Mixed-corpus hi-tier experts ar
 to Korean routing mass (overlap 17.7%); re-tiering to the Korean oracle (same per-layer count
 → speed invariant) cuts Korean KL 20-30% and PPL 3.9% for free. Method + disk/verify
 discipline: docs §26.
+
+## Addendum 10: prefill top-k gating promoted (τ=0.90) — prefill −5%, decode untouched (2026-08-11)
+
+Receipt: [`pf_topk_tau_gate.txt`](pf_topk_tau_gate.txt). Cumulative-router-mass gating on
+prefill drops the low-mass expert tail (E[k]≈13 of 16); the tail is ternary-noisy, so quality
+is neutral-to-better (Korean KL −5%) while prefill gains ~5%. Chunk-size 1024 rejected: full-scale
+wedge despite mini-harness clearance — clearance at small scale is not a promotion ticket.
