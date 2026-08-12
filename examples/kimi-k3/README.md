@@ -143,3 +143,13 @@ Receipt: [`pf_topk_tau_gate.txt`](pf_topk_tau_gate.txt). Cumulative-router-mass 
 prefill drops the low-mass expert tail (E[k]≈13 of 16); the tail is ternary-noisy, so quality
 is neutral-to-better (Korean KL −5%) while prefill gains ~5%. Chunk-size 1024 rejected: full-scale
 wedge despite mini-harness clearance — clearance at small scale is not a promotion ticket.
+
+## Addendum 11: on-policy drafter alignment + adaptive speculative decoding (2026-08-12)
+
+Receipt: [`spec_decode_campaign.txt`](spec_decode_campaign.txt). On-policy tap dumps (target
+self-generation) lift offline accept +33% (doc) and close the chat-distribution gap (+59% on
+chat); live spec decode reaches **10.0-10.6 tok/s on code (+15-21%)** — first double-digit on
+this build — with an adaptive accept-gate falling back to plain when drafting loses. Korean
+long-form still nets negative (dump-stack vs serve-stack hidden drift, next campaign). Lessons:
+measure accept on the SERVING distribution and stack, not the training one; a once-only gate
+misses mid-generation collapse — roll it.

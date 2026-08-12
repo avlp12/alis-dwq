@@ -1,0 +1,18 @@
+# DSpark speculative decoding campaign — K3-MLX 2-box (2026-08-12, honest close)
+# Drafter: 2.25B DFlash block-drafter, tap layers [7,23,51,67,83], k=5, on-policy aligned.
+#
+# Offline accept-length (leading-match+1, k=6 blocks, holdout):
+#   round1 (doc teacher-forced):     3.41   (live doc-ish 3.7-3.9)
+#   round3 (+98k doc-seeded on-policy): 4.52 (+33%)
+#   round3 on CHAT holdout:          2.25   <- distribution gap, matches live collapse
+#   round4 (+93k chat-seeded on-policy): 3.58 on chat (+59% over r3-on-chat)
+# Live serving (TP+jaccl stack, adaptive gate final config):
+#   code       10.0-10.6 tok/s (+15-21% vs plain 8.8)  <- first double-digit decode
+#   KO short   8.3-8.9 (par) · KO long-form 7.5-8.4 (net loss -> gate falls back)
+# Round economics (measured): verify T=5-13 round 290-505ms vs plain 113ms/tok;
+#   pending snowball fixed by cap-resync (feed 18 -> <=13); adaptive gate
+#   (rolling accept, fast 8-window <2.4 | fine 16-window <2.8) bounds worst case.
+# Residual gap (KO live 2.1 vs offline 3.58) prime suspect: dump stack (non-TP ring)
+#   vs serve stack (TP f32 partial sums) -> tap hidden + greedy trajectory drift.
+#   Next: serve-native tap dump (round 5) to close it.
+# Verdict: spec = opt-in (K3_SPEC=2) for code/EN workloads; default plain for KO.
