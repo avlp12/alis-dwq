@@ -169,3 +169,26 @@ concat-fusion and expert gather-fusion both measured NULL — launch-count is no
 either; after the dispatch bombs are gone, decode is bound by the serial dependency chain
 (~1k dependent tiny kernels/token), which neither fusion nor mx.compile shortens. Structural
 plateau ≈ 20.2 tok/s; the next real lever is shortening the chain itself (MTP self-spec).
+
+## Addendum 13 (cross-model, Motif-3): acceptance is a *rule*, not a number — and check your metric's denominator (2026-08-14)
+
+Chasing a "38–41% vs vendor 70–80%" MTP draft-acceptance gap produced three portable lessons.
+(1) **Denominator check first**: our "acceptance" was the fraction of *emitted* tokens that came
+from the draft — a/(1+a) for k=1 — not per-draft acceptance. 41% draft-fraction *is* 69%
+acceptance; the measured 1.21× end-to-end was arithmetically impossible under the literal
+reading. Before debugging a cross-stack metric gap, reconcile definitions — vLLM's reported
+rate comes from its RejectionSampler, ours from greedy equality. (2) **Acceptance is a rule**:
+strict sampler-equality discards argmax-mismatched tokens that Leviathan rejection sampling
+(accept draft x w.p. min(1, p(x)/q(x)), resample from (p−q)+ on reject) accepts losslessly.
+Implemented in ~40 lines by reshaping only the verify-side token vector (on rejection the
+residual has zero mass at the draft token, so the existing equality loop needs no changes).
+(3) **On a well-trained native head the two rules converge** (~80% either way at T=0.8 —
+the draft IS the target's own MTP block, p≈q), so rejection buys little there; its value is
+the **mismatch regime** — on a mismatched pair (Beta backbone driving the final-release MTP
+head) it lifted acceptance 52%→85%, +21% end-to-end. Ship it as mismatch insurance with a
+kill switch. Bonus findings: a 300-token NLL probe overstated the 4.5bpw-vs-8bit Korean delta
+3× (+9.9% → +2.4% at 1.5k tokens — size probes before trusting them), and a ladder artifact
+reused across model *generations* must be provenance-checked (shard mtimes + config knobs +
+the bundled card caught a Beta-era build masquerading as current). Speed economics of the
+4.5bpw tier: batch-1 decode is read-bound, so 8.5→4.55 bpw took 24 → ~30 tok/s (+25%) for
++2.4% KO NLL on a 315B MoE.
