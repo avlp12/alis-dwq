@@ -153,3 +153,15 @@ this build — with an adaptive accept-gate falling back to plain when drafting 
 long-form still nets negative (dump-stack vs serve-stack hidden drift, next campaign). Lessons:
 measure accept on the SERVING distribution and stack, not the training one; a once-only gate
 misses mid-generation collapse — roll it.
+
+## Addendum 12 (cross-model, Motif-3): fence profiles lie — ablate for wall shares (2026-08-13)
+
+Motif-3 Q8 decode sat at 14.4 tok/s (25% of BW ceiling). A fence-instrumented profile said
+mHC=15%; compile-fusing all the glue it blamed moved nothing (+0-2%). **Whole-component
+ablation** told the truth: mHC = 43% of wall — its 20-iteration Sinkhorn loop issues ~4,200
+16-element GPU kernels per token, invisible to fences (async dispatch hides under GEMMs) and
+untouched by mx.compile (which cuts CPU graph cost, not GPU kernel count). One
+`mx.fast.metal_kernel` doing the whole loop in registers: **14.4 → 20.2 tok/s (+40%)**,
+KL vs eager 2.2e-3 / 0% top-1 flips. Lessons: (1) fence shares are for hypotheses, ablations
+are for decisions; (2) tiny-op loops are dispatch bombs — single-kernel them; (3) A/B one
+sample lever before building a fusion campaign on a profile.
