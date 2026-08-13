@@ -164,4 +164,8 @@ untouched by mx.compile (which cuts CPU graph cost, not GPU kernel count). One
 `mx.fast.metal_kernel` doing the whole loop in registers: **14.4 → 20.2 tok/s (+40%)**,
 KL vs eager 2.2e-3 / 0% top-1 flips. Lessons: (1) fence shares are for hypotheses, ablations
 are for decisions; (2) tiny-op loops are dispatch bombs — single-kernel them; (3) A/B one
-sample lever before building a fusion campaign on a profile.
+sample lever before building a fusion campaign on a profile. Follow-up (same model): GEMV
+concat-fusion and expert gather-fusion both measured NULL — launch-count is not the wall
+either; after the dispatch bombs are gone, decode is bound by the serial dependency chain
+(~1k dependent tiny kernels/token), which neither fusion nor mx.compile shortens. Structural
+plateau ≈ 20.2 tok/s; the next real lever is shortening the chain itself (MTP self-spec).
