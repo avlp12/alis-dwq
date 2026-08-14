@@ -192,3 +192,23 @@ reused across model *generations* must be provenance-checked (shard mtimes + con
 the bundled card caught a Beta-era build masquerading as current). Speed economics of the
 4.5bpw tier: batch-1 decode is read-bound, so 8.5→4.55 bpw took 24 → ~30 tok/s (+25%) for
 +2.4% KO NLL on a 315B MoE.
+
+## Addendum 14 (cross-model, Motif-3): latency-bound regimes invert vendor speculative-decoding guidance (2026-08-14)
+
+Three results from pushing the same build 24 → 43 tok/s in one day. (1) **Verify width is
+nearly free when decode is latency-bound**: a 4-token verify forward costs ~1.5x a 1-token
+one (46 → 70 ms measured), so chained MTP drafting at k=3 beats k=1 by ~35% on Apple
+silicon — directly inverting the vendor's (compute-bound, vLLM) "1 speculative token is
+optimal" guidance. Check which regime you are in before importing serving folklore.
+(2) **The chain-norm detail is load-bearing**: feeding chained drafts back through the
+backbone's final norm a second time (instead of the MTP block's own output norm) crushed
+chained acceptance enough to make k=2 net-negative (19.3 tok/s); fixing one norm turned the
+same k=2 into +15% (34.6). When a speculative chain underperforms, audit the anchor/chain
+normalization path before blaming the head. (3) **Dispatch-bomb hunting generalizes and
+compounds**: after the Sinkhorn mega-win, compiling the remaining elementwise glue
+(activation polynomials, router, mHC mixes, attention epilogue — all bit-exact, each
+kill-switched) added +5% and then +9-11% on top; plain decode went 20.2 → 24.5 (+21%)
+from fusion alone. The same sweep also produced a clean rejection: a fused rmsnorm→qmv
+Metal kernel passed accuracy but died on regime analysis — with k=3 the hot path runs
+width-4 forwards, and an N=1 GEMV kernel only touches the (tiny) drafting side. Kill the
+lever before integration when its applicability window has already moved.
