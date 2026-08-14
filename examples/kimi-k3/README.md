@@ -229,3 +229,18 @@ postmix into the same kernel measured neutral: removing a dispatch only pays whe
 removed op's lost parallelism is worth less than the inter-kernel gap. Small serial ops
 fold; mid-size parallel ops don't. Also budget for a ±5% acceptance-trajectory noise band
 in MTP end-to-end numbers — adjudicate levers only above it.
+
+## Addendum 16 (cross-model, Motif-3): oracle-first evaluation kills two plausible levers for the price of none (2026-08-14)
+
+Two directed levers died on cheap measurement before any build. (1) *Tree drafting*: a
+768-step oracle probe — just log the verify target's rank in the existing draft logits —
+showed rank-2 coverage of 11.6% (the entire theoretical prize of a second branch) and a
+30% depth-2 conditional on the alternate branch vs ~62% on the argmax branch: this head's
+misses are hard misses, not near-misses. Upper bound +4.7% at zero cost, net negative
+after the tree's real machinery (per-depth rope groups, KV compaction, wider verify).
+Speculative trees only pay when the drafter's rank distribution says so — probe it first
+(half an hour) before building masks and cache surgery. (2) *Fused norm→GEMV at verify
+width*: accuracy-correct, but at N≥2 a hand-rolled per-lane kernel loses 3-5x to the
+library's simdgroup-matrix quantized matmul — a ~14 µs stage-removal target buried under
+a ~170 µs kernel deficit. Custom kernels earn their keep on N=1 GEMVs and non-GEMM
+bookkeeping; past N=1, join the library, don't fight it.
