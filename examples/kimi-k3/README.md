@@ -260,3 +260,13 @@ disconnects everything downstream from the eval target — the "ablated" run mea
 empty graph; ablate with value-preserving dependencies. (2) A benchmark loop without a
 serial dependency between iterations evaluates one iteration out of N — we briefly
 "measured" 178 TFLOPS on a 28-TFLOP GPU. Chain every microbenchmark.
+
+**Addendum 17 postscript (routing skew):** the prefill scatter that first looked like thermal
+throttling or a code regression turned out to be *prompt content*: interleaved same-process
+runs measured 545 tok/s (short repeated sentence), 757 (longer repeated), 790 (varied natural
+text) — a 45% end-to-end swing driven entirely by expert-routing skew fattening the
+small-group tail in `gather_qmm`. Two benchmarking rules follow for MoE prefill: separate
+cold (first-touch residency) from warm — a 312GB build loses ~2.4s to first touch, which
+silently halved one published number — and state the prompt's routing entropy; a
+repeated-sentence benchmark measures the worst case, not the typical one. Both findings are
+now part of the upstream report (ml-explore/mlx#4246).
