@@ -212,3 +212,20 @@ from fusion alone. The same sweep also produced a clean rejection: a fused rmsno
 Metal kernel passed accuracy but died on regime analysis — with k=3 the hot path runs
 width-4 forwards, and an N=1 GEMV kernel only touches the (tiny) drafting side. Kill the
 lever before integration when its applicability window has already moved.
+
+## Addendum 15 (cross-model, Motif-3): the transition mega-kernel — when a mega-kernel finally works (2026-08-14)
+
+Addendum 12 recorded a mega-kernel failure (fusing big GEMMs into one threadgroup serializes
+the memory system). The fix is scope: fuse only the *small-tensor bookkeeping* between
+blocks — here a 16K rmsnorm, a 24-output gate projection, 20 Sinkhorn iterations, the
+residual premix, and the next layernorm, i.e. ~7 serial dispatches per block transition —
+into one threadgroup per position, keeping every large GEMM outside. Result: transition
+latency 175 → 84 µs at verify width 4, end-to-end **+17% (4.5bpw, 50.2 tok/s) / +21%
+(8-bit, 37.1)**. Two corollaries worth keeping: (1) as latency is removed, decode slides
+toward bandwidth-bound and the optimal speculative width *shrinks* for fatter builds —
+the 8-bit optimum moved from k=3 to k=2 while 4.5bpw stayed at k=3; re-tune k after every
+big latency win. (2) A follow-up that folded the (multi-threadgroup-parallel) residual
+postmix into the same kernel measured neutral: removing a dispatch only pays when the
+removed op's lost parallelism is worth less than the inter-kernel gap. Small serial ops
+fold; mid-size parallel ops don't. Also budget for a ±5% acceptance-trajectory noise band
+in MTP end-to-end numbers — adjudicate levers only above it.
