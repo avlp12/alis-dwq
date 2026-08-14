@@ -244,3 +244,19 @@ width*: accuracy-correct, but at N≥2 a hand-rolled per-lane kernel loses 3-5x 
 library's simdgroup-matrix quantized matmul — a ~14 µs stage-removal target buried under
 a ~170 µs kernel deficit. Custom kernels earn their keep on N=1 GEMVs and non-GEMM
 bookkeeping; past N=1, join the library, don't fight it.
+
+## Addendum 17 (cross-model, Motif-3): prefill first-principles — measure the ceiling before chasing it (2026-08-14)
+
+Directed to push prefill "to the hardware limit," the first honest measurement showed we
+were already at 63-70% of it: the fused-kernel stack built for decode had lifted prefill
+from 143 to 575 (2k) / 751 (8k) tok/s as a side effect, and a chained three-way microbench
+(grouped-expert gather_qmm vs dense qmm vs bf16 GEMM at identical FLOPs) located the
+entire remaining gap in one place — sorted `gather_qmm` runs at ~69% of dense throughput
+for MoE-typical ~43-row expert groups (filed upstream: ml-explore/mlx#4246; unsorted
+gather is a further 4.8x cliff, so always sort). Chunk-boundary async: +1% (null);
+chunk-size sweep re-confirmed 1-2k optimal. Two measurement traps caught en route:
+(1) in a lazy framework, an ablation that returns constants (zeroed attention) silently
+disconnects everything downstream from the eval target — the "ablated" run measures an
+empty graph; ablate with value-preserving dependencies. (2) A benchmark loop without a
+serial dependency between iterations evaluates one iteration out of N — we briefly
+"measured" 178 TFLOPS on a 28-TFLOP GPU. Chain every microbenchmark.
