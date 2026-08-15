@@ -225,6 +225,15 @@ moves with it. The same MTP k=2 configuration measured:
 you ship a single-prompt number, say which prompt — a code prompt is the friendliest
 workload speculation has, and quoting it as *the* result overstates by ~30% here.
 
+**And the spread can exceed the levers you are comparing.** After every fix in items 8–10,
+the winning configuration on this model reads **1.91×** on English/code/math and **below
+1.0× on Korean alone** — plain 37.6 vs MTP 34.3 and DSpark 33.3 tok/s, i.e. *both*
+speculative paths lose to plain decoding on that workload (cause not yet decomposed; the
+operational rule is to disable speculation for it). A language slice can invert the sign of
+a lever, so a single-language benchmark is not a result for a multilingual model — the same
+lesson the DWQ side of this repo learned about per-slice quality gates, arriving on the
+speed axis.
+
 ---
 
 ## 7. The reference implementation shipped with a checkpoint may not be its inference path
@@ -240,7 +249,9 @@ wrong loop.**
 
 Wiring the Markov head took acceptance **2.23 → 3.31** on a code prompt and end-to-end
 **0.73× → 1.20×**, landing *above* the model card's own acceptance numbers under the card's
-conditions (average **4.48** vs the card's 3.39).
+conditions (average **4.48** vs the card's 3.39) — and then to **1.91×** once items 8–10
+were fixed, which is how the method went from "rejected" to "the production
+recommendation".
 
 **Fix — a checkpoint's module list is a contract; check the loop against it.** Enumerate
 the top-level modules in the checkpoint and grep the inference loop for each one. Any
@@ -248,13 +259,19 @@ module that is loaded but never called is either dead weight or a missing featur
 difference matters (see the battery). This is a ten-second check that would have saved the
 campaign a day.
 
-**Two corollaries measured here:**
+**Three corollaries measured here:**
 
-- **Winning the drafter metric is not winning.** DSpark's acceptance (4.23) beats MTP's
-  decisively and still loses end-to-end — 1.20× vs **1.32×** — because a separate 1.36B
-  forward pass plus a 248k-vocabulary `lm_head` are charged every step, neither of which an
-  MTP layer reusing the target's hidden state pays. **Judge a speculative scheme on tok/s,
-  never on acceptance length.**
+- **Winning the drafter metric is not winning.** Higher acceptance loses whenever the
+  drafter forward costs more than the extra accepted token returns — measured on this
+  drafter, **block 9 has higher acceptance than block 8 (3.55 vs 3.46) and is slower**
+  (70.4 vs 71.0 tok/s). **Judge a speculative scheme on tok/s, never on acceptance length.**
+  We first wrote this rule pointing at DSpark losing to MTP end-to-end, and *that* example
+  inverted the moment our own integration was fixed (item 8). The rule held; our instance
+  of it was an artifact.
+- **A drafter's trained block width is a reference value, not a ceiling.** This drafter is
+  trained at block 7 and runs fastest at **block 8** (71.0 vs 63.6 tok/s over three
+  prompts). Where verify cost is flat in width, spend the width — sweep it rather than
+  inheriting the card's number.
 - **Reproducing a paper's configuration is not the same as reproducing its result.** Two
   card-specified conditions measured *worse* for us: a bf16 drafter bought nothing over the
   4-bit one (acceptance 4.19 vs 4.23), and the reference's draft-slice convention
@@ -262,6 +279,85 @@ campaign a day.
   `confidence_head` measured **best switched off** (block 6: off 45.0 tok/s vs
   tau 0.10/0.25/0.50 = 37.1/38.5/42.8) — its whole purpose is skipping a wide block when the
   drafter is unsure, and item 5's kernel work removed the cost it was avoiding.
+
+---
+
+## 8. A feature you built but never wired does not exist
+
+**Why.** An optimization usually arrives with its own benchmark script, and the script
+enables it explicitly. That is the *only* place it gets enabled unless someone
+deliberately wires it into a loading path — and nothing detects the omission: no test
+fails, no warning fires, the model runs correctly and merely slowly. Measured case: our
+split-K kernel's `fast_qmm.enable()` had **zero call sites outside the file that defines
+it**. It was live inside the scripts that benchmarked it and nowhere else, so
+`mlx_lm.generate`, the server and both speculative loops ran without it for the rest of the
+campaign — S=8 verification at **70.1 ms instead of 43.1 ms**.
+
+**This was the single largest loss of the campaign**, larger than any bug in this file, and
+it produced something worse than a slow stack: an entire verdict (which speculative method
+to ship) reasoned out on top of a stack that silently lacked the fix, and published.
+
+**Fix.** When you finish an optimization, `grep` for its entry point across the whole repo
+before you benchmark anything downstream of it. **Zero hits outside its own definition means
+it does not exist in production.** Then wire it at the *loading* boundary rather than at
+each call site — ours now goes through `utils.load()` — and give it a killswitch env var so
+the A/B is still one command.
+
+**Corollary — a side optimization can be welded to the main one.** Rounding the `lm_head`
+batch up to the kernel's window is **+5%** with the kernel on and **−2%** with it off. Any
+lever tuned against a feature must be re-measured whenever that feature's status changes,
+including "was never on in the first place".
+
+---
+
+## 9. An optimization with a shape window is a claim about the run-time distribution
+
+**Why.** Kernels, fused paths and fast branches typically win inside a window — a batch
+range, a sequence length, a dtype. Proving the win inside the window says nothing about how
+often the model is *in* it. Measured case: our kernel wins at **M ≤ 8**, and the speculative
+loop it was meant to accelerate ran at **mean verify width 9.50, max 16**:
+
+| verify width | step cost |
+|---|---|
+| ≤ 8 | 54.6 ms |
+| 9–12 | 106.8 ms |
+| 13+ | 142.8 ms |
+
+The loop lived mostly *outside* its own optimization's window, in the regime costing
+2–2.6× more. A one-line clamp holding width inside it (`min(n_spec, 8 - L)`, mean width
+9.50 → 7.10, max 16 → 8) was worth **41.2 → 59.1 tok/s (+43%)**.
+
+**Fix.** Instrument the shape the loop actually runs at — a histogram, not a spot check —
+and either clamp the loop into the window or widen the window. Do this *before* attributing
+any end-to-end result to the optimization, in either direction: outside its window a
+"fast path" is not neutral, it is a regression.
+
+---
+
+## 10. An unaccounted overhead is usually an unmeasured item
+
+**Why.** When a step is slower than the sum of its known parts, the residual is
+overwhelmingly a component nobody has instrumented — not an intrinsic tax of the method.
+Measured case: a ~32 ms per-step residual was rationalized for most of a campaign as
+"the drafter's structural overhead", and used to justify shipping the other method. It was
+items 8 and 9, in a costume. Once both were fixed the accounting closed exactly:
+
+| stage | ms |
+|---|---|
+| verify | 43.06 |
+| draft | 2.75 |
+| `lm_head` | 1.45 |
+| markov | 1.79 |
+| posterior | 0.54 |
+| commit | 0.29 |
+| **sum** | **49.9** |
+| **measured step** | **49.0** |
+
+**Fix.** Require a step budget that closes before publishing any verdict that depends on
+it. If the parts do not sum to the whole, the missing time is a measurement you have not
+taken — name it and instrument it. A residual you have not decomposed is not evidence for
+or against anything, and "structural overhead of method X" is the most expensive way to
+spell "I did not measure that".
 
 ---
 
@@ -326,12 +422,42 @@ across the repo's two source files returns **`dspark.py:42`, `dflash.py:0`** —
 in the modeling file, and the only shipped generation loop is the parent method's and never
 touches them. That is item 7, visible before a single token is generated.
 
-**D. Benchmark protocol** — before quoting any decode-path number:
+**D. Call sites of every optimization you added** — item 8, and the cheapest check in this
+file. For each feature's entry point:
+
+```bash
+grep -rn "fast_qmm" --include='*.py' . | grep -v "/fast_qmm\.py:"   # substitute your own symbol
+```
+
+**Zero lines out means the feature is dead code**, however good its benchmark was. On our
+repo this now returns `mlx_lm/utils.py:530` and `:532` — the wiring at the loading boundary.
+For most of the campaign it returned nothing, and every downstream verdict was wrong
+because of it. (Quote the `--include` glob: unquoted, zsh expands it and the grep silently
+matches nothing — a fitting way to fail this particular check.)
+
+**E. Shape-window residency** — item 9. If any adopted path wins only in a window, log the
+shape every iteration and histogram it before trusting an end-to-end number:
+
+```python
+from collections import Counter
+hist = Counter()          # in the loop:  hist[verify_width] += 1
+# after the run:
+print("mean", sum(k*v for k,v in hist.items())/sum(hist.values()), "max", max(hist))
+```
+
+Ours read **mean 9.50 / max 16** against a kernel window of M ≤ 8. Clamping into the window
+was +43%.
+
+**F. Benchmark protocol** — before quoting any decode-path number:
 
 - kernel numbers reported from a **dependent chain**, not a queue batch (item 4);
-- speculative-decoding numbers averaged over **≥3 dissimilar prompts** (item 6);
-- decode timer started **after the first token**, so prefill is not folded into decode.
+- speculative-decoding numbers averaged over **≥3 dissimilar prompts**, and state which
+  (item 6) — on this model the same configuration reads 1.91× on en/code/math and **below
+  1.0× on Korean alone**;
+- decode timer started **after the first token**, so prefill is not folded into decode;
+- a **step budget that closes** (item 10): if the instrumented stages do not sum to the
+  measured step, do not publish a verdict that rests on the difference.
 
-A build that clears A–D has cleared the failure modes that load cleanly, pass every
+A build that clears A–F has cleared the failure modes that load cleanly, pass every
 structural check, and still ship the wrong thing. It does not check quality — measure that
 separately.
