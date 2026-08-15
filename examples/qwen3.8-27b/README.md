@@ -8,6 +8,11 @@ the same file, and that the decode-speed work which followed found the real reas
 speculative decoding was underperforming on this stack — a small-`M` gap in MLX's
 quantized GEMM, not the algorithm.
 
+- **Reusable rules + runnable oracles**, generalized off this model:
+  [docs/PORTING_INTEGRITY.md](../../docs/PORTING_INTEGRITY.md).
+- **Raw receipts** (measurement records, KV sweep, harness scripts, verdict ledger): this
+  directory — see [Raw receipts](#raw-receipts-this-directory) below.
+
 ## The model
 
 **Qwen/Qwen3.8-27B** — 27B **hybrid**: 48 GatedDeltaNet linear-attention layers +
@@ -247,6 +252,72 @@ pays neither — its extra layer reuses the target's own hidden state.
   peak **20.80 GB** (bf16 KV) → **20.30** (8-bit) → **20.03** (4-bit), **top-1 100%
   preserved in all three**, decode −3%. The cache itself goes 16.8 → 4.2 GB at the full
   262K context — which is where the trade becomes worth making, and nowhere shorter.
+
+## Raw receipts (this directory)
+
+Small files only — no weights, images or raw logs.
+
+| file | what it is |
+|---|---|
+| [`m_bf16.json`](m_bf16.json) | the bf16 source measured by the same harness — the reference every top-1 agreement is computed against |
+| [`m_q8v.json`](m_q8v.json) / [`m_q6v.json`](m_q6v.json) / [`m_q4v.json`](m_q4v.json) | per-build measurement records (`v` = vision-preserving): size, bits/group_size, peak memory, per-prompt decode tok/s, 2048-token prefill tok/s, and the per-slice probe — `nll` plus the **full top-1 id sequence**, which is what makes agreement recomputable without re-running the model |
+| [`kv_q4v.json`](kv_q4v.json) / [`kv_q8v.json`](kv_q8v.json) | the KV-quantization sweep (`kv_bits` ∈ {none, 8, 4}) at 16K context: prefill, decode, peak and top-1 ids per setting |
+| [`measure.py`](measure.py) | produces the `m_*.json` records |
+| [`table2.py`](table2.py) | renders the comparison table from the `m_*.json` files |
+| [`kv_measure.py`](kv_measure.py) | produces the `kv_*.json` sweep |
+| [`DSPARK_FINDINGS.md`](DSPARK_FINDINGS.md) | the campaign's **verdict ledger** (Korean, AIF-structured: information / inference / conflict / decision nodes with IDs). Every number above resolves to a node there — including the ones later overturned: `[CA5]`/`[CA6]` are the two rejections the split-K work forced, and `[I25]` is where the missing DSpark head wiring was found |
+
+Reproduce the table — this is the exact command, run from this directory:
+
+```bash
+python3 table2.py
+```
+
+It reads only the `m_*.json` files and never the build directories, so it works on any
+box. Two AWQ rows are listed in the script but not shipped here; they print `(미측정)`.
+
+`table2.py` also carries the campaign's tripwire: if a build's `ko` NLL exceeds the bf16
+reference's by more than 3×, it warns you to check whether the harness picked up stock
+mlx-lm instead of the fork. That is Finding 2 encoded as a guard.
+
+### The fork pin, verbatim
+
+`measure.py`'s header is the campaign's central lesson expressed as code, so it is worth
+reading rather than summarizing:
+
+```python
+# 포크를 명시적으로 앞세운다. 이걸 안 하면 설치된 스톡 mlx-lm 이 잡히는데,
+# 스톡 qwen3_5.sanitize 는 `has_mtp_weights` 를 raw-HF 판별자로 써서 **이미 시프트된**
+# norm 가중치에 +1.0 을 한 번 더 얹는다(γ 0.944→1.944). 증상은 크래시가 아니라
+# nll 1.7→17 의 조용한 붕괴이고, 하필 MTP 를 보존한 빌드만 골라서 망가져 보인다.
+for _fork in ("/Users/gesicht/glm5.2/mlx-lm", "/Users/m3ms/mlx-lm-fork"):
+    if os.path.isdir(os.path.join(_fork, "mlx_lm")):
+        sys.path.insert(0, _fork)
+        break
+
+import mlx.core as mx
+import mlx_lm
+...
+# 조용히 스톡으로 되돌아가면 수치가 전부 무의미해지므로 여기서 크게 실패한다.
+_used = os.path.dirname(mlx_lm.__file__)
+if "site-packages" in _used:
+    raise SystemExit(f"스톡 mlx-lm 이 잡혔다({_used}) — 포크 경로를 확인하라")
+print(f"[measure] mlx_lm = {_used}", file=sys.stderr)
+```
+
+(The comment says: pin the fork, because stock `qwen3_5.sanitize` uses `has_mtp_weights`
+as a raw-HF discriminator and adds +1.0 to already-shifted norm weights — γ 0.944→1.944 —
+and the symptom is not a crash but a quiet collapse from nll 1.7 to 17, on precisely the
+builds that preserved MTP.)
+
+Two halves, and **both are required**. Putting the fork on `sys.path` is the fix; the
+`site-packages` check is what makes the *absence* of the fix loud. A path insert alone
+fails silently the first time the fork moves, and every number the harness prints is then
+measured against a different library than the one you believe you are testing.
+
+`kv_measure.py` carries the same pin, plus the two timing rules in its docstring: batch the
+`mx.eval` (a per-iteration eval lays down a ~250 µs synchronization floor) and start the
+decode timer **after the first token**, so prefill is not folded into decode.
 
 ## Findings
 
