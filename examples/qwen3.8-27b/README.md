@@ -1,5 +1,7 @@
 # Case study: Qwen3.8-27B — the converter that silently dropped the vision tower
 
+> **Dedicated campaign repo: [avlp12/qwen38_alis_mlx](https://github.com/avlp12/qwen38_alis_mlx)** — the full verdict ledger, topical docs (conversion integrity, kernels, speculative, two-box prefill, methodology, external dossiers), code snapshots, harness, and raw results for this model. This case study is the conversion-integrity cut; that repo is the complete record.
+
 A conversion-integrity and decode case rather than a DWQ one. Nothing here is about
 bits: the three builds are plain uniform quants. What made the campaign worth writing
 down is that the **standard conversion path turned a multimodal model into a text-only
