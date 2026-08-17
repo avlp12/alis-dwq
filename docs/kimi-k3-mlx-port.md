@@ -21,7 +21,7 @@ the [README](../README.md) ("From a 2.8T ternary-codebook student"); this file i
   ml-explore/mlx-lm#1624.
 - **Attention-residual (AttnRes) mixes are position-independent** (learned per-query depth
   softmax over block-boundary states). This matters twice: (a) truncation payloads for
-  layer-parallel training/eval stay small (~143 KB/token); (b) any layerwise training window must
+  layer-parallel training/eval stay small (≈143 KB/token); (b) any layerwise training window must
   align to AttnRes block boundaries (12 layers) or your cache balloons 6×.
 - **MLA absorb is a decode-time win with a load-time cost.** Precomputing
   `W_uk/W_uv` (28× smaller KV at 1M ctx, perf-neutral) is safe — but cache them in bf16, not
@@ -38,10 +38,10 @@ the [README](../README.md) ("From a 2.8T ternary-codebook student"); this file i
 ## 2. Quantization campaign mechanics
 
 - **Sensitivity ladders beat uniform budgets.** Expert-quant error is heavy-tailed: protecting the
-  top ~10–17% most sensitive expert-instances at native mxfp4 while dropping the rest to a
+  top ≈10–17% most sensitive expert-instances at native mxfp4 while dropping the rest to a
   1.5625 bpw ternary codebook beat every uniform config at equal bytes.
 - **Score promotions with Hessian×mass, allocate with clamp-aware waterfilling.** Relative-error
-  scores saturate at the ternary grid floor (~0.45) and carry no signal — use *unnormalized*
+  scores saturate at the ternary grid floor (≈0.45) and carry no signal — use *unnormalized*
   weighted SSE. And when one layer hogs 68% of the mass, naive waterfilling leaves half the budget
   unspent at the per-layer cap: solve τ with the clamps inside the equation.
 - **Per-expert curvature beats per-layer curvature.** Encoding with each expert's own imatrix
@@ -85,7 +85,7 @@ the [README](../README.md) ("From a 2.8T ternary-codebook student"); this file i
   accumulator to 4 decimals — after that, pruning 78 GB of logits mid-campaign was a safe,
   reversible decision instead of a leap.
 - **Cross-harness PPL is not a comparison.** llama-perplexity (BOS per chunk, different
-  boundaries) reads ~0.3–0.4 lower than our windowed harness on the same text. Publish both
+  boundaries) reads ≈0.3–0.4 lower than our windowed harness on the same text. Publish both
   numbers with the caveat; the defensible cross-quant metric is KL-vs-teacher, which only the
   teacher-logit owner can compute.
 - **Audit the audit.** An offset-integrity scan passed a slice directory that was *missing seven
@@ -109,8 +109,8 @@ the [README](../README.md) ("From a 2.8T ternary-codebook student"); this file i
   history with thinking channels *stripped*, so retokenized history never prefix-matches what you
   actually fed the model — template-based prefix caching is structurally dead for thinking models.
   Fix: server-side sessions that append glue tokens (probe-extracted once from the template) +
-  the new user turn; never re-render history. Turn-start latency went from O(history) (~45 s) to
-  ~3 s flat.
+  the new user turn; never re-render history. Turn-start latency went from O(history) (≈45 s) to
+  ≈3 s flat.
 - **Don't store or forward the EOS.** The model's stop token is not part of the canonical
   rendered history; feeding it desyncs your cache from the template's token stream by one.
 - **Recurrent-state caches cannot trim.** KDA state is cumulative — prefix reuse is
@@ -123,7 +123,7 @@ the [README](../README.md) ("From a 2.8T ternary-codebook student"); this file i
 
 ## 6. Operational pitfalls (the expensive ones)
 
-- macOS purges /tmp on a ~3-day cadence: every launcher, hostfile, token dump and audit script
+- macOS purges /tmp on a ≈3-day cadence: every launcher, hostfile, token dump and audit script
   lives in a permanent assets dir and is *copied into* /tmp, never authored there.
 - Logits at [2047×163840] f16 are 670 MB per window. A 142-window sweep is 95 GB — budget disk
   for evaluation artifacts like you budget for weights, and prune windows the protocol doesn't
@@ -141,7 +141,7 @@ the [README](../README.md) ("From a 2.8T ternary-codebook student"); this file i
 ## 7. Performance method (what actually found the wins)
 
 - **First-principles floors before surgery**: weight-read, ring-latency and dispatch budgets put
-  the theoretical step at ~90–100 ms vs. 217 ms measured — proving the gap was overhead, not
+  the theoretical step at ≈90–100 ms vs. 217 ms measured — proving the gap was overhead, not
   physics, and pointing at the eval-serialization assumption as the biggest suspect.
 - **Observer-free profiling**: the 92 forced evals double as free per-layer timestamps — append
   to a list (never print) and you get a full KDA/MLA/MoE cost split with zero graph changes.
@@ -162,9 +162,9 @@ what actually paid:
   lazy graph and syncs once per token; our per-layer hard flush (92/step) was a watchdog defense
   from before we had a GPU heartbeat thread, and it was serializing the entire step. Removing it
   was the single biggest win — and it was found by a first-principles pass, not a profiler:
-  weight-read + ring-latency + dispatch floors summed to ~90–100 ms against 217 ms measured, which
+  weight-read + ring-latency + dispatch floors summed to ≈90–100 ms against 217 ms measured, which
   said "the gap is an assumption, not physics."
-- **`MLX_METAL_FAST_SYNCH=1`** on every rank (upstream measures ~12× on collective sync).
+- **`MLX_METAL_FAST_SYNCH=1`** on every rank (upstream measures ≈12× on collective sync).
 - **Vectorized loads in the codebook kernel** (8 bf16 as one `uint4`): bit-exact 1.25×. Notably an
   fp16-dot variant and a δ-term-precompute variant landed on the *same* time, and combining all
   three gained nothing further — the kernel is load-latency bound, not ALU bound. When three
@@ -172,9 +172,9 @@ what actually paid:
 - **Speculative decoding is a *loss* on a sparse-MoE-over-EP rig.** n-gram/prompt-lookup drafting
   reached a real 1.37 accepted tokens per round — and still cut throughput to 0.58× (5.36 → 3.13
   tok/s), because every draft token routes to *different* experts: verify cost scales with draft
-  length (measured ~2.4× per round at k≤13) instead of amortizing a fixed cost. The published
+  length (measured ≈2.4× per round at k≤13) instead of amortizing a fixed cost. The published
   "speculation is nearly free at batch 1" results assume dense weights shared across the batch.
-  For MoE, break-even acceptance is the verify-cost multiplier, not ~1.3. Keep the code behind a
+  For MoE, break-even acceptance is the verify-cost multiplier, not ≈1.3. Keep the code behind a
   killswitch; default it off.
 - **Chat-template caching**: see §5 — session-based glue-token appending, not history re-render.
 - Two more rejections worth stating: a hand-written T=1 depthwise conv (bf16 rounding drifted 2e-2
@@ -205,13 +205,13 @@ random samples before adoption):
   Passing the exact fp32 scalar into a custom kernel produced 222/8192 mismatches; pre-rounding
   it to bf16 reproduced MLX exactly. Applies to patterns like `(head_dim**-0.5) * x`.
 - **`mx.fast.rms_norm` rounds once without weight, twice with weight**: `bf16(x·rsqrt(mean+eps))`
-  then `bf16(norm × w)`. Fusing normalize-and-scale into one round is a 1-ULP mismatch on ~26%
+  then `bf16(norm × w)`. Fusing normalize-and-scale into one round is a 1-ULP mismatch on ≈26%
   of elements.
 
 Payoff profile for the fusion itself (Kimi K3, KDA layer, M3 Ultra): packing 6 same-input
 projections into one QMM (row-concat of 6-bit weights is bit-exact; slice back on the output
 axis) gave a measured e2e win; the glue kernel (24 dispatches → 2, threadgroup-per-head with
-simd_sum reductions) then reduced per-layer isolated time by a further ~4%. After matching the
+simd_sum reductions) then reduced per-layer isolated time by a further ≈4%. After matching the
 three semantics above: conv states bit-exact, recurrent state at 1e-8 (fp32 noise), greedy
 generations identical with fusion on/off.
 
@@ -234,18 +234,18 @@ isolate smoke runs by port and narrow the kill pattern to the smoke's own argume
 ## 10. MoE decode restructuring on MLX — what moved the needle and what didn't
 
 Measured on the same rig (92 MoE layers, 896 experts top-16, batch-1, 2-box EP), after the
-KDA fusion work brought the step to ~179ms. Stage-decomposed the ~90ms MoE region first
-(isolated stage benches inflate by ~190µs of per-eval overhead each — subtract it or you will
+KDA fusion work brought the step to ≈179ms. Stage-decomposed the ≈90ms MoE region first
+(isolated stage benches inflate by ≈190µs of per-eval overhead each — subtract it or you will
 chase phantoms; the full-call time is the honest denominator).
 
 **Adopted (all bit-exact, each behind a killswitch):**
 - **Fused router kernel** — the sigmoid→bias→top-16-of-896→normalize→group-map→hi-top-4 chain
-  (~18 small dispatches) as ONE single-threadgroup kernel doing sequential max-extraction.
+  (≈18 small dispatches) as ONE single-threadgroup kernel doing sequential max-extraction.
   Selection set, weights, and hi choices matched the argpartition reference bit-for-bit on
   32/32 trials; only the emission *order* differs (score-descending vs argpartition's arbitrary
-  order), which shifts downstream weighted sums by ~1 ULP. Biggest single e2e win of the phase.
+  order), which shifts downstream weighted sums by ≈1 ULP. Biggest single e2e win of the phase.
 - **Shared-experts GLU packing + fused SiTU** — gate+up row-concat into one QMM (bit-exact for
-  uniform quant) plus a one-dispatch SiTU elementwise kernel replacing ~8 glue ops.
+  uniform quant) plus a one-dispatch SiTU elementwise kernel replacing ≈8 glue ops.
 - **Activation-at-store fusion** — inlining the SiTU nonlinearity into the up-projection
   kernel's store site (round the accumulator to bf16 *first* to preserve the reference's
   rounding point, then apply the fp32 nonlinearity, round once at output). Zero mismatches over
@@ -254,28 +254,28 @@ chase phantoms; the full-call time is the honest denominator).
 
 **Rejected, with numbers:**
 - **Tensor-parallel on the dense/shared blocks**: halving a 107MB-per-layer weight stream
-  changed decode time by ~0%. At batch 1 these QMMs are latency-bound, not bandwidth-bound —
+  changed decode time by ≈0%. At batch 1 these QMMs are latency-bound, not bandwidth-bound —
   *every* bytes-reduction lever we tried on this rig (attention TP, dense TP, absorb-matrix
   bf16) was speed-neutral. Measure one before building more.
 - **Raising MLX command-buffer budgets** (`MLX_MAX_OPS_PER_BUFFER`/`MLX_MAX_MB_PER_BUFFER` to
   effectively-infinite): a 5% *regression*. The per-op commits those budgets force are not pure
   overhead — they are what lets the CPU encode ahead while the GPU drains. Also note the
-  budget math: one stacked expert tensor binds ~1.2GB, so any budget between 50MB and ~1GB
+  budget math: one stacked expert tensor binds ≈1.2GB, so any budget between 50MB and ≈1GB
   yields the *same* commit pattern; there is no useful intermediate point.
 - (Earlier, same theme) **speculative decoding** loses 0.58× here — but external data
   (Cohere's published MoE profile) reframes this as kernel accounting, not physics: where
   routed-expert bytes are a small fraction of step time, a second token riding the *same*
-  gather kernels should cost ~1.05–1.25×. The loss came from doubling kernel count, not bytes.
+  gather kernels should cost ≈1.05–1.25×. The loss came from doubling kernel count, not bytes.
   A `gather_qmv`-style kernel that amortizes weight loads across 2 tokens reopens the door.
 
-Net for the day across both phases (KDA + MoE): 5.41 → ~5.95 tok/s, every adopted change
+Net for the day across both phases (KDA + MoE): 5.41 → ≈5.95 tok/s, every adopted change
 bit-exact or ULP-bounded with a killswitch, greedy outputs stable throughout.
 
 ## 11. Router mass tells you whether top-k reduction is on the table (novel data)
 
 Nobody had published the router probability-mass profile for a k=16-of-896 fine-grained MoE,
 so we measured it: 45k layer-samples across prose/Korean/code/math on Kimi K3. Result: the
-sorted, normalized top-16 weights have a **flat tail** — ranks 13-16 each carry ~3% (about a
+sorted, normalized top-16 weights have a **flat tail** — ranks 13-16 each carry ≈3% (about a
 fifth of the top expert, not a hundredth), cumulative mass at rank 12 is only 86.6% on average
 (75.5% worst layer). This is the opposite of the "confident about 2-4, rest indistinguishable"
 profile reported for coarse-grained models, and it corroborates the DeepSeekMoE claim that
@@ -289,8 +289,8 @@ a 10-line hook), and gate any adoption on a real code benchmark — perplexity a
 math stay green far past the point where code generation collapses (see OEA Table 7).
 
 One measurement pitfall from the same night: a single custom-kernel dispatch benched in
-isolation carries ~190µs of `mx.eval` fixed cost, which completely masks a 15µs/call kernel
-improvement. Chain ~16 dependent calls inside one graph and divide — our row-parallel decode
+isolation carries ≈190µs of `mx.eval` fixed cost, which completely masks a 15µs/call kernel
+improvement. Chain ≈16 dependent calls inside one graph and divide — our row-parallel decode
 variant (8 rows/simdgroup, after llama.cpp's low-bit N_R0=8 convention) measured 1.01× naively
 but is a real 1.14× at the shapes that matter, bit-identical, and is now the default engine.
 
@@ -302,7 +302,7 @@ mostly because every decode-path fusion we had built was gated `T==1` — the ve
 off the fast path entirely. Extending the fused KDA glue kernel to T≤4 (the causal-conv taps
 become a sliding window over [state, raw inputs]; the last position's threads write the new
 state) and the fused router to T≤8 kept everything bit-exact at T=2/3 and cut the measured
-verify-2 premium from 1.38× to ~1.28×.
+verify-2 premium from 1.38× to ≈1.28×.
 
 Live result with an n-gram (prompt-lookup) drafter, greedy, 192-token generations:
 draft k=2 is still a net loss on all domains (accept 33-51%); draft k=1 is break-even —
@@ -316,7 +316,7 @@ draft count is `K3_SPEC_K − 2`, so setting it to 2 silently disables drafting 
 ## 13. An EAGLE-style draft head on a fine-grained-MoE trunk: a measured negative
 
 To reopen speculative decoding (whose verify cost we had already halved via T≤4 bit-exact
-fusion), we trained EAGLE-1-style draft heads (~230M params: fuse + 1 transformer block,
+fusion), we trained EAGLE-1-style draft heads (≈230M params: fuse + 1 transformer block,
 frozen trunk embed/lm_head) on a 6M-token pilot of trunk hidden states (wiki-EN/KO/code mix,
 dumped at 62 tok/s via the expert-major prefill path). Two recipes, 3000 steps each:
 
@@ -324,7 +324,7 @@ dumped at 62 tok/s via the expert-major prefill path). Two recipes, 3000 steps e
 - + feature regression (smooth-L1 to the next hidden, EAGLE's core loss, weight 1.0 vs CE 0.1):
   slower start, late crossover, final **0.141** — the celebrated ingredient bought +5% here.
 
-Both are a factor ~4 below the acceptance needed (α≈0.55 break-even, α≈0.8 for the 1.6×+
+Both are a factor ≈4 below the acceptance needed (α≈0.55 break-even, α≈0.8 for the 1.6×+
 regime), and the curves' diminishing slopes do not extrapolate to the gate even at 8× data.
 Our working hypothesis for *why*, consistent with the router-mass finding above: a 896-expert
 fine-grained trunk produces hidden dynamics that a small dense head cannot approximate the way
@@ -345,7 +345,7 @@ math. The winning prefill lever was expert-major dequant-once for the codebook e
 Expert-parallel sharding here rewrites the routing maps so that non-local experts point at a
 zero-weight dummy row (row 0) — memory is halved per box, outputs stay correct because the
 weighted sum multiplies those rows by zero. What we missed for weeks: the *kernel* still ran a
-full matvec for every dummy row. With two boxes, ~56% of routed-expert rows per rank were
+full matvec for every dummy row. With two boxes, ≈56% of routed-expert rows per rank were
 full-cost zero-contribution work.
 
 The fix is four lines per kernel — read `eidx[r]`, and if it is the dummy, write zeros and
@@ -403,7 +403,7 @@ original certification) and compare KL(teacher‖build) per window against the c
 | korean w000 | 0.1130 | 0.1128 |
 | korean w001 | 0.1169 | 0.1175 |
 
-Identical to the 4th decimal (4 windows, ~20 min including model load) — certification stands
+Identical to the 4th decimal (4 windows, ≈20 min including model load) — certification stands
 without rerunning the full 48-window suite. The direct old-vs-new logit KL (2.4-3.6e-3 nats,
 1.3-2.0% argmax flips over all teacher-forced positions) is the framework's rounding footprint:
 real, harmless, and now on file so the next transcript drift has a reference scale. Retire
@@ -422,7 +422,7 @@ harness (each all_sum consumes the previous result, `mx.eval` per step):
 | [1, 8192] bf16 | 285.1 µs | 200.5 µs (−30%) |
 | [1, 65536] bf16 | 320.8 µs | 222.7 µs (−31%) |
 
-At 92 per-layer all_sums per decode step that projected to −6~8 ms/step; live serving landed
+At 92 per-layer all_sums per decode step that projected to −6–8 ms/step; live serving landed
 exactly there: **6.6 → 6.9-7.1 tok/s**, greedy transcripts bit-identical (a two-rank sum has
 one addition order — switching transports cannot change the arithmetic; still verify).
 
@@ -454,7 +454,7 @@ none of them.
 Per-row LUT re-decode is the prefill killer for codebook-quantized experts: at R routed rows
 per layer, the same expert weights get decoded R-ish times. Our first fix (§ earlier,
 "expert-major") dequantizes each expert once into a dense buffer and runs a GEMM — great at
-long prompts, but its fixed dequant cost loses below ~250 tokens, so chat turns stayed on the
+long prompts, but its fixed dequant cost loses below ≈250 tokens, so chat turns stayed on the
 naive path.
 
 The v5 kernel closes that gap without materializing anything: sort rows by expert (host-side
@@ -519,11 +519,11 @@ of bytes from the per-token read stream agree on one exchange rate:
 | top_k 16→1 (corrected) | −11.3 GB | −20.2 ms | 560 GB/s |
 | attention 6→4 bit | −9.4 GB | −14.5 ms | 650 GB/s |
 
-**Decode step ≈ bytes-read ÷ ~550-650 GB/s effective.** The whole step checks out too (62.1 GB
+**Decode step ≈ bytes-read ÷ ≈550-650 GB/s effective.** The whole step checks out too (62.1 GB
 ÷ 460 GB/s ≈ the 135 ms step). The actionable currency: **1 GB removed ≈ 1.8 ms**.
 
 Byte census (per token per rank, batch-1, 2-way EP): attention projections 33.2 GB + shared
-experts 9.8 GB + MoE latent/router ~5 GB + embeddings/head 1.9 GB — the **always-read stack is
+experts 9.8 GB + MoE latent/router ≈5 GB + embeddings/head 1.9 GB — the **always-read stack is
 80%** — routed experts only 12.1 GB (20%). Under this model, replicated-weight tensor
 parallelism is the only parallelism that reduces bytes; pipeline parallelism does not (a
 batch-1 token walks the layers serially either way, so PP's gain is only the non-overlapped
@@ -533,7 +533,7 @@ collective time). Flipping the long-rejected `K3_ATTN_TP=1` (head-sharded q/k/v/
 vintage as the phantom top_k result, and equally stale.
 
 Operational caveat discovered in the same push: **jaccl (TB5 RDMA) collectives stall on
-large payloads** (tens of MB — e.g. TP partial-sums during a 2k-token prefill, ~59 MB/layer).
+large payloads** (tens of MB — e.g. TP partial-sums during a 2k-token prefill, ≈59 MB/layer).
 Small decode-time collectives are fine. Until a chunked-collective fix lands, run TP prefill
 over the TCP ring backend or cap chunk sizes.
 
@@ -543,7 +543,7 @@ where requant error says it is
 The read-bound model made the 6-bit always-stack the biggest byte target (6.0 bit stored;
 experts are 2.10 bpw). Speed delivered as predicted (KDA layers −9.6%; MLA layers unchanged —
 their kv_b projection is dequantized **once** into absorb caches, so quantizing it saves
-nothing per-step). Quality did not: teacher-anchored KL rose ~10% (0.2313→0.2586 wt) and a
+nothing per-step). Quality did not: teacher-anchored KL rose ≈10% (0.2313→0.2586 wt) and a
 selective variant that kept the highest-requant-error tensors (the tiny gate low-rank
 projections) at 6 bit recovered almost none of it (0.2587). Two lessons:
 
@@ -554,7 +554,7 @@ projections) at 6 bit recovered almost none of it (0.2587). Two lessons:
 - The axis reopens only with distillation-corrected low-bit (our DWQ pipeline) — the exchange
   rate (−17 ms for attention alone) now prices that campaign precisely.
 
-Also on file: a bf16 DSpark-style drafter against this 2.10 bpw target accepts ~1.55
+Also on file: a bf16 DSpark-style drafter against this 2.10 bpw target accepts ≈1.55
 tokens/round (k=2) versus 3.85-5.4 reported against bf16 targets — the quantized-target
 acceptance degradation is real on this stack, resolving a conflict in the community record.
 
@@ -573,13 +573,13 @@ tensor along T into 256-token all_sums) did **not** fix it: the deadlock tracks 
 the single lazy forward graph containing 93 interleaved collectives, not the size of any one
 collective. The fix that works is chunking the forward itself: under TP the server prefills
 in 256-token forwards (`K3_PREFILL_CHUNK`). Verified end to end with a 2k-token prompt
-(42.6 s prefill, no stall). Cost: ~25% slower long-prompt prefill than non-TP (33.6 s at 2k)
+(42.6 s prefill, no stall). Cost: ≈25% slower long-prompt prefill than non-TP (33.6 s at 2k)
 — an acceptable trade against +0.9 tok/s decode; prefill-heavy batch workloads can keep
 `K3_ATTN_TP=0`.
 
 **2. Bisect deadlocks with a partial-load mini harness, never the full model.** Each wedged
 full-scale attempt cost a 395 GB wired-memory leak and a reboot (§21's kill-discipline rules
-exist because of this). The decisive experiment loaded **4 layers (~15 GB)**: chunked
+exist because of this). The decisive experiment loaded **4 layers (≈15 GB)**: chunked
 prefill (256×8) completed in 1.9 s where the single T=1993 forward wedged even at 4 layers —
 root cause confirmed and fix validated in one run, with nothing at risk. If a distributed
 hang reproduces at all, reproduce it at the smallest layer count that still shows it.
@@ -669,7 +669,7 @@ The regime map matters as much as the kernel. Routed-run length per expert = tok
 | 8k (512-chunk) | 8.2 | v7, BM=8 (2.11×) |
 | 33k (unchunked 2k) | 33 | v7, BM=16 (3.59×) |
 
-So the dispatch ladder picks per call: below ~3k routed rows keep the old kernel (and with
+So the dispatch ladder picks per call: below ≈3k routed rows keep the old kernel (and with
 it, byte-identical chat-turn transcripts — no re-certification needed for the common case);
 above, v7 with BM auto-selected. This also re-priced the TP prefill chunk size: with the
 per-chunk MoE cost 2× lower, we re-ran the 4-layer bisection harness (§22) at 512-token
@@ -746,7 +746,7 @@ Re-tiering fixes this at **zero speed cost**. For each layer, recompute the hi-s
 Korean-oracle top-n_hi (same count as before → per-token weight-read bytes, and therefore
 decode speed, are invariant), then rebuild the two stacks: promoted experts get their mxfp4
 weights (recovered from the original checkpoint — ternary can't be inverted, so this is the
-one thing that must be fetched: ~93 GB via safetensors-header + HTTP Range, vs re-downloading
+one thing that must be fetched: ≈93 GB via safetensors-header + HTTP Range, vs re-downloading
 the 1.5 TB source), demoted experts are re-encoded to ternary from the build's own mxfp4 hi
 stack. Measured on the 4-window teacher gate: **Korean KL −20% / −30%** (0.1130→0.0905,
 0.1169→0.0824), Korean PPL 3.311 → **3.181 (−3.9%)**, wikitext PPL +0.2% (noise), decode

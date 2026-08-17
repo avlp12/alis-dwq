@@ -137,7 +137,7 @@ which is item 2's signature. Cheap, and it catches the class rather than the ins
 
 ## 4. Queue-batched benchmarks hide latency — measure decode-path kernels on a chain
 
-**Why.** Firing N independent calls and dividing wall clock by N avoids the ~250 µs
+**Why.** Firing N independent calls and dividing wall clock by N avoids the ≈250 µs
 per-call synchronization floor, which is exactly why it is the default technique. It also
 lets the framework **overlap** those calls — so it measures throughput, and a decode loop
 is not made of throughput. Measured on a hand-written quantized-matmul kernel
@@ -223,7 +223,7 @@ moves with it. The same MTP k=2 configuration measured:
 
 **Fix.** Minimum three prompts of genuinely different character, and report the average. If
 you ship a single-prompt number, say which prompt — a code prompt is the friendliest
-workload speculation has, and quoting it as *the* result overstates by ~30% here.
+workload speculation has, and quoting it as *the* result overstates by ≈30% here.
 
 **And the spread can exceed the levers you are comparing.** After every fix in items 8–10,
 the winning configuration on this model reads **1.91×** on English/code/math and **below
@@ -338,7 +338,7 @@ any end-to-end result to the optimization, in either direction: outside its wind
 
 **Why.** When a step is slower than the sum of its known parts, the residual is
 overwhelmingly a component nobody has instrumented — not an intrinsic tax of the method.
-Measured case: a ~32 ms per-step residual was rationalized for most of a campaign as
+Measured case: a ≈32 ms per-step residual was rationalized for most of a campaign as
 "the drafter's structural overhead", and used to justify shipping the other method. It was
 items 8 and 9, in a costume. Once both were fixed the accounting closed exactly:
 
