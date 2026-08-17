@@ -1,0 +1,8 @@
+{
+  "backend": "ring",
+  "size": 2,
+  "allsum_us_S1": 459.34,
+  "allsum_us_S8": 455.01,
+  "step_comm_ms": 56.548,
+  "verdict_hint": "KILL (t_as > 35us — PLAN [PA1]①)"
+}

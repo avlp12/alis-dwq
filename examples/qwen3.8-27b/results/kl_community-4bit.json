@@ -1,0 +1,31 @@
+{
+ "target": "community/Qwen3.8-27B-4bit",
+ "ref": "/Users/m3ms/qwen38/src",
+ "ctx": 2048,
+ "block": 512,
+ "slices": {
+  "en": {
+   "n_tokens": 34816,
+   "mean_kl": 0.04414071887731552,
+   "kl_block_sem": 0.0015369049009550024,
+   "median_kl": 0.0179036445915699,
+   "top1_agree_pct": 90.63361672794117
+  },
+  "ko": {
+   "n_tokens": 34816,
+   "mean_kl": 0.044756364077329636,
+   "kl_block_sem": 0.0008728724272750811,
+   "median_kl": 0.019128531217575073,
+   "top1_agree_pct": 90.04480698529412
+  },
+  "code": {
+   "n_tokens": 30720,
+   "mean_kl": 0.1483774185180664,
+   "kl_block_sem": 0.008411392506890545,
+   "median_kl": 0.0002380091173108667,
+   "top1_agree_pct": 90.986328125
+  }
+ },
+ "mean_kl_overall": 0.07626350383673396,
+ "top1_overall": 90.53730867346938
+}

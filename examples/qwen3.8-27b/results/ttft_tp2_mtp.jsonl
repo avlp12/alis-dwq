@@ -1,0 +1,3 @@
+{"tag": "tp2_mtp_r1", "ttft_s": 12.82, "total_s": 13.146, "keepalives": 5, "usage": {"prompt_tokens": 8381, "completion_tokens": 32, "total_tokens": 8413, "prompt_tokens_details": {"cached_tokens": 0}}}
+{"tag": "tp2_mtp_r2", "ttft_s": 12.817, "total_s": 13.143, "keepalives": 5, "usage": {"prompt_tokens": 8381, "completion_tokens": 32, "total_tokens": 8413, "prompt_tokens_details": {"cached_tokens": 0}}}
+{"tag": "tp2_mtp_r3", "ttft_s": 12.812, "total_s": 13.138, "keepalives": 5, "usage": {"prompt_tokens": 8381, "completion_tokens": 32, "total_tokens": 8413, "prompt_tokens_details": {"cached_tokens": 0}}}

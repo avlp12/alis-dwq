@@ -1,0 +1,8 @@
+{
+  "backend": "jaccl",
+  "size": 2,
+  "allsum_us_S1": 21.87,
+  "allsum_us_S8": 33.92,
+  "step_comm_ms": 2.727,
+  "verdict_hint": "GO next stage"
+}
