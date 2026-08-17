@@ -15,16 +15,15 @@ Usage:
         --model <tokenizer-source> --quantized-model <student> \
         --target-dir <targets> --mlx-path <out> ...
 """
+
 import os
 import re
 import sys
-import time
 
 import json
 from pathlib import Path
 
 import mlx.core as mx
-import mlx.nn as nn
 import mlx.optimizers as optimizers
 from mlx.utils import tree_flatten, tree_map, tree_unflatten
 from tqdm import tqdm
@@ -35,6 +34,11 @@ from mlx_lm.tuner.trainer import grad_checkpoint, iterate_batches
 
 from . import gate
 from . import losses
+from .memory_guard import (
+    MemoryGuard,
+    check_round_or_restore,
+    configure_recommended_wired_limit,
+)
 
 _LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
 # router/gate modules producing expert logits ("mlp.gate", "mlp.router"); the
@@ -42,10 +46,22 @@ _LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
 _ROUTER_RE = re.compile(r"(?:^|\.)(?:gate|router)$")
 
 
+def _format_validation_metric(value):
+    """Format a binary64 validation metric without losing its ordering."""
+
+    # Seventeen significant decimal digits round-trip every finite Python
+    # float.  Receipt tooling uses these stable text lines to independently
+    # re-evaluate the raw ``rv > best`` rollback decision, so this must not be
+    # shortened to the four-decimal progress-display precision.
+    return format(value, ".17g")
+
+
 def _is_router(name, m):
-    return (_ROUTER_RE.search(name) is not None
-            and getattr(m, "weight", None) is not None
-            and not _is_quantized(m))
+    return (
+        _ROUTER_RE.search(name) is not None
+        and getattr(m, "weight", None) is not None
+        and not _is_quantized(m)
+    )
 
 
 def _is_quantized(m):
@@ -88,26 +104,47 @@ def _save_adapters(model, cfg, out_dir):
     by the caller)."""
     model.freeze()
     model.apply_to_modules(
-        lambda n, m: m.unfreeze(keys=[k for k in ("lora_a", "lora_b")
-                                      if getattr(m, k, None) is not None],
-                                recurse=False) if _is_lora(m) else None)
+        lambda n, m: (
+            m.unfreeze(
+                keys=[
+                    k for k in ("lora_a", "lora_b") if getattr(m, k, None) is not None
+                ],
+                recurse=False,
+            )
+            if _is_lora(m)
+            else None
+        )
+    )
     flat = tree_flatten(model.trainable_parameters())
     model.freeze()
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     mx.save_safetensors(str(out / "adapters.safetensors"), dict(flat))
     json.dump(
-        {"fine_tune_type": "lora", "num_layers": len(model.layers),
-         "lora_parameters": cfg},
-        open(out / "adapter_config.json", "w"), indent=2)
-    print(f"[alis-dwq] {len(flat)} adapter tensors -> {out} "
-          "(load with: mlx_lm ... --adapter-path)", file=sys.stderr)
+        {
+            "fine_tune_type": "lora",
+            "num_layers": len(model.layers),
+            "lora_parameters": cfg,
+        },
+        open(out / "adapter_config.json", "w"),
+        indent=2,
+    )
+    print(
+        f"[alis-dwq] {len(flat)} adapter tensors -> {out} "
+        "(load with: mlx_lm ... --adapter-path)",
+        file=sys.stderr,
+    )
 
 
 def _unwrap_lora(model):
     swaps = []
     model.apply_to_modules(
-        lambda n, m: swaps.append((n, m.linear)) if _is_lora(m) and hasattr(m, "linear") else None)
+        lambda n, m: (
+            swaps.append((n, m.linear))
+            if _is_lora(m) and hasattr(m, "linear")
+            else None
+        )
+    )
     if swaps:
         model.update_modules(tree_unflatten(swaps))
     return len(swaps)
@@ -118,6 +155,7 @@ def _capture_hiddens(model, batch):
     Class-level __call__ patch (special methods resolve on the type), keyed
     by block identity so any decoder-layer signature passes through."""
     import numpy as np
+
     blocks = list(model.layers)
     outs = [None] * len(blocks)
     idx = {id(b): i for i, b in enumerate(blocks)}
@@ -139,14 +177,18 @@ def _capture_hiddens(model, batch):
     finally:
         for cls, orig in origs.items():
             cls.__call__ = orig
-    return [None if o is None else
-            np.array(o.astype(mx.float32), copy=True).reshape(-1, o.shape[-1])
-            for o in outs]
+    return [
+        None
+        if o is None
+        else np.array(o.astype(mx.float32), copy=True).reshape(-1, o.shape[-1])
+        for o in outs
+    ]
 
 
 def _cka(x, y):
     """Linear CKA between (tokens, dim) feature matrices (token-space Grams)."""
     import numpy as np
+
     x = (x - x.mean(0)).astype(np.float64)
     y = (y - y.mean(0)).astype(np.float64)
     kx, ky = x @ x.T, y @ y.T
@@ -155,11 +197,30 @@ def _cka(x, y):
 
 
 def layerwise_dwq_quantize(
-    model, target_fn, opt, train_data, valid_data, batch_size, max_seq_length,
-    seed, dtype: mx.Dtype = mx.bfloat16, gradient_checkpoint: bool = False,
-    temperature: float = 2.0, **_ignored,
+    model,
+    target_fn,
+    opt,
+    train_data,
+    valid_data,
+    batch_size,
+    max_seq_length,
+    seed,
+    dtype: mx.Dtype = mx.bfloat16,
+    gradient_checkpoint: bool = False,
+    temperature: float = 2.0,
+    **_ignored,
 ):
     K = int(os.environ.get("ALIS_DWQ_LAYERS_PER_ROUND", "8"))
+    memory_phase = "precomputed-target-training"
+    memory_guard = _ignored.pop("_alis_memory_guard", None)
+    if memory_guard is None:
+        recommended = configure_recommended_wired_limit(memory_phase)
+        memory_guard = MemoryGuard(memory_phase, recommended)
+        memory_guard.start()
+    memory_guard.check("training-entry")
+    extras_mode = os.environ.get("ALIS_DWQ_EXTRAS_MODE", "first").strip().lower()
+    if extras_mode not in {"first", "skip"}:
+        raise ValueError("ALIS_DWQ_EXTRAS_MODE must be 'first' or 'skip'")
     train_routers = os.environ.get("ALIS_DWQ_TRAIN_ROUTERS", "") == "1"
     lora_rank = int(os.environ.get("ALIS_DWQ_LORA_RANK", "0") or 0)
     cka_mon = os.environ.get("ALIS_DWQ_CKA_MONITOR", "") == "1"
@@ -185,23 +246,29 @@ def layerwise_dwq_quantize(
 
     lora_cfg = None
     if lora_rank > 0:
-        print(f"[alis-dwq][EXPERIMENTAL] ALIS_DWQ_LORA_RANK={lora_rank}: LoRA "
-              "error compensators (Recover-LoRA/MiLo style) train alongside "
-              "scales/biases; adapters are saved SEPARATELY (base checkpoint "
-              "stays stock) — load with --adapter-path and verify on-device. "
-              "Unset the env var (or pin branch backup/v0.1-pre-router-kd) for "
-              "scales/biases-only DWQ.", file=sys.stderr)
+        print(
+            f"[alis-dwq][EXPERIMENTAL] ALIS_DWQ_LORA_RANK={lora_rank}: LoRA "
+            "error compensators (Recover-LoRA/MiLo style) train alongside "
+            "scales/biases; adapters are saved SEPARATELY (base checkpoint "
+            "stays stock) — load with --adapter-path and verify on-device. "
+            "Unset the env var (or pin branch backup/v0.1-pre-router-kd) for "
+            "scales/biases-only DWQ.",
+            file=sys.stderr,
+        )
         try:
             lora_cfg = _wrap_lora(model, lora_rank)
             print(f"[alis-dwq] LoRA wrapped keys: {lora_cfg['keys']}", file=sys.stderr)
         except Exception as e:  # abort BEFORE training, not mid-run
-            raise SystemExit(f"[alis-dwq] LoRA wrap failed: {e!r} — rerun without "
-                             "ALIS_DWQ_LORA_RANK") from e
+            raise SystemExit(
+                f"[alis-dwq] LoRA wrap failed: {e!r} — rerun without ALIS_DWQ_LORA_RANK"
+            ) from e
     if cka_mon:
-        print("[alis-dwq][EXPERIMENTAL] ALIS_DWQ_CKA_MONITOR=1: per-round "
-              "layerwise CKA drift report (diagnostic only, no behavior "
-              "change) — targets the valid-vs-held-out inversion pattern.",
-              file=sys.stderr)
+        print(
+            "[alis-dwq][EXPERIMENTAL] ALIS_DWQ_CKA_MONITOR=1: per-round "
+            "layerwise CKA drift report (diagnostic only, no behavior "
+            "change) — targets the valid-vs-held-out inversion pattern.",
+            file=sys.stderr,
+        )
 
     quant_layers, has_extras, router_names = set(), [False], []
 
@@ -217,23 +284,52 @@ def layerwise_dwq_quantize(
 
     model.apply_to_modules(scan)
     ordered = sorted(quant_layers, reverse=True)  # deepest first
-    rounds = [ordered[i:i + K] for i in range(0, len(ordered), K)]
-    print(f"[alis-dwq] {len(ordered)} quant layers -> {len(rounds)} rounds of {K}"
-          f" (extras with round 1: {has_extras[0]})", file=sys.stderr)
+    rounds = [ordered[i : i + K] for i in range(0, len(ordered), K)]
+    max_rounds = int(os.environ.get("ALIS_DWQ_MAX_ROUNDS", "0") or 0)
+    if max_rounds < 0:
+        raise ValueError("ALIS_DWQ_MAX_ROUNDS must be non-negative")
+    if max_rounds:
+        rounds = rounds[:max_rounds]
+        print(
+            f"[alis-dwq][DIAGNOSTIC] limiting this run to {len(rounds)} round(s)",
+            file=sys.stderr,
+        )
+    max_steps_per_round = int(os.environ.get("ALIS_DWQ_MAX_STEPS_PER_ROUND", "0") or 0)
+    if max_steps_per_round < 0:
+        raise ValueError("ALIS_DWQ_MAX_STEPS_PER_ROUND must be non-negative")
+    if max_steps_per_round:
+        print(
+            "[alis-dwq][DIAGNOSTIC] limiting each round to "
+            f"{max_steps_per_round} training step(s)",
+            file=sys.stderr,
+        )
+    print(
+        f"[alis-dwq] {len(ordered)} quant layers -> {len(rounds)} rounds of {K}"
+        f" (non-layer quantized modules: {has_extras[0]}, extras mode: "
+        f"{extras_mode})",
+        file=sys.stderr,
+    )
     if train_routers:
-        print(f"[alis-dwq][EXPERIMENTAL] ALIS_DWQ_TRAIN_ROUTERS=1: {len(router_names)} "
-              "router gate modules will train alongside scales/biases (router-KD "
-              "for quantization, after 0xSero's REAP recovery). Per-round rollback "
-              "still applies. Unset the env var (or pin branch "
-              "backup/v0.1-pre-router-kd) for the previous scales/biases-only "
-              "behavior.", file=sys.stderr)
+        print(
+            f"[alis-dwq][EXPERIMENTAL] ALIS_DWQ_TRAIN_ROUTERS=1: {len(router_names)} "
+            "router gate modules will train alongside scales/biases (router-KD "
+            "for quantization, after 0xSero's REAP recovery). Per-round rollback "
+            "still applies. Unset the env var (or pin branch "
+            "backup/v0.1-pre-router-kd) for the previous scales/biases-only "
+            "behavior.",
+            file=sys.stderr,
+        )
         if router_names:
-            print(f"[alis-dwq] router modules: {router_names[0]} ... {router_names[-1]}",
-                  file=sys.stderr)
+            print(
+                f"[alis-dwq] router modules: {router_names[0]} ... {router_names[-1]}",
+                file=sys.stderr,
+            )
         else:
-            print("[alis-dwq][WARN] no router modules matched (pattern "
-                  "'(gate|router)$' with a weight param) — flag has no effect",
-                  file=sys.stderr)
+            print(
+                "[alis-dwq][WARN] no router modules matched (pattern "
+                "'(gate|router)$' with a weight param) — flag has no effect",
+                file=sys.stderr,
+            )
 
     model.train()
     if gradient_checkpoint:
@@ -251,14 +347,14 @@ def layerwise_dwq_quantize(
         if loss_kind == "kl" and loss_topk is None:  # stock path, untouched
             per_tok = kl_div_loss(scale * logits, scale * targets)
         else:
-            per_tok = losses.per_token_loss(loss_kind, loss_topk, logits,
-                                            targets, scale, labels=labels,
-                                            ids=ids)
+            per_tok = losses.per_token_loss(
+                loss_kind, loss_topk, logits, targets, scale, labels=labels, ids=ids
+            )
         mask = mx.arange(1, 1 + targets.shape[1]) < lengths[:, 1:]
         ntoks = mask.sum()
         return (mask * per_tok).sum() / ntoks, ntoks
 
-    def validate(tag):
+    def validate(tag, memory_check):
         if gate_entries is None:
             # legacy single-scalar path — byte-identical pre-gate behavior
             v_loss, v_tok = 0.0, 0
@@ -272,6 +368,7 @@ def layerwise_dwq_quantize(
                 mx.eval(targets)
                 loss, ntoks = loss_fn(params, batch, targets, lengths, labels)
                 mx.eval(loss, ntoks)
+                memory_check("validation-step", validation_iteration=i + 1)
                 v_tok += ntoks.item()
                 v_loss += loss.item() * ntoks.item()
             loss = v_loss / v_tok
@@ -295,6 +392,7 @@ def layerwise_dwq_quantize(
             mx.eval(targets)
             loss, ntoks = loss_fn(params, batch, targets, lengths, labels)
             mx.eval(loss, ntoks)
+            memory_check("validation-step", validation_iteration=i + 1)
             lv, nv = float(loss.item()), int(ntoks.item())
             gate.check_loss_finite(i, lv, nv)
             sums["overall"] += lv * nv
@@ -315,13 +413,14 @@ def layerwise_dwq_quantize(
     best = init = None
     init_metrics = best_metrics = en_limit = None
     if gate_entries is None:
-        best = init = validate("initial")
+        best = init = validate("initial", memory_guard.check)
     else:
-        init_metrics = validate("initial")
+        init_metrics = validate("initial", memory_guard.check)
         best_metrics = dict(init_metrics)
         # EN ceiling: a round may improve overall yet still regress EN beyond
         # eps of the initial (pre-round) EN loss -> REVERT (see alis_dwq.gate)
         en_limit = init_metrics["EN"] * (1.0 + en_eps)
+    memory_guard.check("after-initial-validation")
 
     if os.environ.get("ALIS_DWQ_VALIDATE_ONLY", "") == "1":
         # No-train driver: print the initial valid metrics and exit before any
@@ -335,20 +434,24 @@ def layerwise_dwq_quantize(
 
     cka_prev = None
     if cka_mon:
-        for batch, _lengths in iterate_batches(valid_data, batch_size,
-                                               max_seq_length, seed=seed):
+        for batch, _lengths in iterate_batches(
+            valid_data, batch_size, max_seq_length, seed=seed
+        ):
             cka_batch = batch[:, :-1]
             cka_prev = _capture_hiddens(model, cka_batch)  # pre-training state
             break
 
     for r, subset in enumerate(rounds):
+        memory_guard.begin_round(r + 1, subset)
         model.freeze()
         sub, first = set(subset), r == 0
 
         def unfreeze(name, m):
             if _is_quantized(m):
                 mm = _LAYER_RE.search(name)
-                if (mm and int(mm.group(1)) in sub) or (mm is None and first and has_extras[0]):
+                if (mm and int(mm.group(1)) in sub) or (
+                    mm is None and first and has_extras[0] and extras_mode == "first"
+                ):
                     m.unfreeze(keys=["scales", "biases"], recurse=False)
             elif train_routers and _is_router(name, m):
                 mm = _LAYER_RE.search(name)
@@ -359,24 +462,44 @@ def layerwise_dwq_quantize(
             elif lora_cfg is not None and _is_lora(m):
                 mm = _LAYER_RE.search(name)
                 if mm and int(mm.group(1)) in sub:
-                    m.unfreeze(keys=[k for k in ("lora_a", "lora_b")
-                                     if getattr(m, k, None) is not None],
-                               recurse=False)
+                    m.unfreeze(
+                        keys=[
+                            k
+                            for k in ("lora_a", "lora_b")
+                            if getattr(m, k, None) is not None
+                        ],
+                        recurse=False,
+                    )
 
         model.apply_to_modules(unfreeze)
         snapshot = tree_map(lambda v: v, model.trainable_parameters())
+        mx.eval(snapshot)
         params = tree_map(lambda v: v.astype(mx.float32), model.trainable_parameters())
         ropt = optimizers.Adam(learning_rate=opt.learning_rate, bias_correction=True)
 
+        def check_round_memory(checkpoint, **context):
+            return check_round_or_restore(
+                memory_guard,
+                model,
+                snapshot,
+                checkpoint,
+                round_index=r + 1,
+                layers=subset,
+                **context,
+            )
+
         def step(inputs, targets, lengths, params, labels=None):
             (loss, ntoks), grads = mx.value_and_grad(loss_fn)(
-                params, inputs, targets, lengths, labels)
+                params, inputs, targets, lengths, labels
+            )
             return loss, ntoks, ropt.apply_gradients(grads, params)
 
         total, tok = 0.0, 0
         for it, (batch, lengths) in (
             pbar := tqdm(
-                enumerate(iterate_batches(train_data, batch_size, max_seq_length, seed=seed)),
+                enumerate(
+                    iterate_batches(train_data, batch_size, max_seq_length, seed=seed)
+                ),
                 total=len(train_data) // batch_size,
                 desc=f"round {r + 1}/{len(rounds)} L{subset[-1]}-{subset[0]}",
             )
@@ -387,6 +510,7 @@ def layerwise_dwq_quantize(
             mx.eval(targets)
             loss, ntoks, params = step(batch, targets, lengths, params, labels)
             mx.eval(loss, params)
+            check_round_memory("training-step", iteration=it + 1)
             tok += ntoks.item()
             total += loss.item() * ntoks.item()
             if (it + 1) % 20 == 0:
@@ -394,23 +518,33 @@ def layerwise_dwq_quantize(
                     f"round {r + 1}/{len(rounds)} loss={total / tok:.4f} "
                     f"peak={mx.get_peak_memory() / 1e9:.0f}GB"
                 )
+            if max_steps_per_round and (it + 1) >= max_steps_per_round:
+                break
 
         model.update(tree_map(lambda v: v.astype(dtype), params))
 
         cka_post = None
         if cka_prev is not None:
             cka_post = _capture_hiddens(model, cka_batch)
-            sims = [(_cka(a, b), i) for i, (a, b) in enumerate(zip(cka_prev, cka_post))
-                    if a is not None and b is not None]
+            sims = [
+                (_cka(a, b), i)
+                for i, (a, b) in enumerate(zip(cka_prev, cka_post))
+                if a is not None and b is not None
+            ]
             if sims:
                 worst = sorted(sims)[:3]
-                print(f"[alis-dwq][cka] round {r + 1}: min "
-                      + ", ".join(f"L{i}={c:.4f}" for c, i in worst)
-                      + f"  (mean {sum(c for c, _ in sims)/len(sims):.4f})"
-                      " — low CKA on a round valid-KL accepts = the "
-                      "inversion signature", file=sys.stderr)
+                print(
+                    f"[alis-dwq][cka] round {r + 1}: min "
+                    + ", ".join(f"L{i}={c:.4f}" for c, i in worst)
+                    + f"  (mean {sum(c for c, _ in sims) / len(sims):.4f})"
+                    " — low CKA on a round valid-KL accepts = the "
+                    "inversion signature",
+                    file=sys.stderr,
+                )
+            check_round_memory("after-cka")
 
-        rv = validate(f"round {r + 1}")
+        rv = validate(f"round {r + 1}", check_round_memory)
+        check_round_memory("after-round-validation")
         if gate_entries is None:
             # legacy keep-best: revert only when strictly worse (tie accepts)
             if not gate.legacy_accept(rv, best):
@@ -447,12 +581,15 @@ def layerwise_dwq_quantize(
               f"{best_metrics['overall']:.6f} (EN {init_metrics['EN']:.6f} -> "
               f"{best_metrics['EN']:.6f})", file=sys.stderr)
     if lora_cfg is not None:
-        _save_adapters(model, lora_cfg,
-                       os.environ.get("ALIS_DWQ_ADAPTER_DIR", "alis_adapters"))
+        _save_adapters(
+            model, lora_cfg, os.environ.get("ALIS_DWQ_ADAPTER_DIR", "alis_adapters")
+        )
         n = _unwrap_lora(model)
-        print(f"[alis-dwq] {n} LoRA wrappers removed — the checkpoint mlx-lm "
-              "saves next is stock; pair it with the adapter dir above",
-              file=sys.stderr)
+        print(
+            f"[alis-dwq] {n} LoRA wrappers removed — the checkpoint mlx-lm "
+            "saves next is stock; pair it with the adapter dir above",
+            file=sys.stderr,
+        )
 
 
 def install():

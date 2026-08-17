@@ -27,15 +27,142 @@ any dynamic per-layer recipe is preserved exactly. The source must be an
 to a NEW directory — never save over a lazily-loaded model (see README).
 """
 import argparse
+import json
+import os
 import shutil
 import sys
 from collections import defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
 
+from .io_utils import directory_digest, move_no_replace, sha256_file
+
 VALID_BITS = (2, 3, 4, 5, 6, 8)
 _FFN_FAMILIES = (("gate_proj", "up_proj", "down_proj"), ("fc1", "fc2"))
+_LINEAGE_FIELDS = (
+    "schema_version",
+    "source_repo",
+    "source_revision",
+    "source_shard_manifest_sha256",
+    "mlx_lm_base_revision",
+)
+
+
+def _object_without_duplicates(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON key in conversion plan: {key}")
+        value[key] = item
+    return value
+
+
+def _load_conversion_plan(
+    root: Path, *, role: str
+) -> tuple[dict | None, Path | None]:
+    root = Path(root).expanduser()
+    if root.is_symlink() or not root.is_dir():
+        raise ValueError(f"{role} input must be a regular directory")
+    status = root / "alis-dwq-run-status.json"
+    if status.exists() or status.is_symlink():
+        raise ValueError(f"{role} input is already an ALIS-DWQ artifact")
+    path = root / "conversion_plan.json"
+    if path.is_symlink():
+        raise ValueError(f"{role} conversion_plan.json must not be a symlink")
+    if not path.exists():
+        return None, None
+    if not path.is_file():
+        raise ValueError(f"{role} conversion_plan.json is not a regular file")
+    try:
+        plan = json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=_object_without_duplicates,
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError(f"{role} conversion plan is invalid: {exc}") from exc
+    if not isinstance(plan, dict):
+        raise ValueError(f"{role} conversion plan must be an object")
+    return plan, path
+
+
+def _clip_input_binding(source_root: Path, student_root: Path) -> dict:
+    """Bind exact immutable clip inputs and their shared conversion lineage."""
+    source_plan, source_plan_path = _load_conversion_plan(source_root, role="source")
+    student_plan, student_plan_path = _load_conversion_plan(
+        student_root, role="student"
+    )
+    source_is_laguna = (
+        source_plan is not None
+        and source_plan.get("schema_version") == "laguna.conversion/v2"
+    )
+    student_is_laguna = (
+        student_plan is not None
+        and student_plan.get("schema_version") == "laguna.conversion/v2"
+    )
+    if source_is_laguna != student_is_laguna:
+        raise ValueError("Laguna clip inputs require two pinned conversion plans")
+    lineage_mode = "generic-digest-only"
+    if source_is_laguna:
+        lineage_mode = "laguna-pinned"
+        if (
+            source_plan.get("recipe") != "bf16-mlx-layout"
+            or source_plan.get("quantized") is not False
+            or source_plan.get("dwq_applied") is not False
+        ):
+            raise ValueError("clip source must be an unquantized pre-DWQ BF16 layout")
+        if (
+            student_plan.get("recipe") == "bf16-mlx-layout"
+            or student_plan.get("quantized") is not True
+            or student_plan.get("dwq_applied") is not False
+            or student_plan.get("clip_applied") is not False
+            or student_plan.get("release_complete") is not False
+        ):
+            raise ValueError(
+                "clip student must be an unclipped quantized pre-DWQ artifact"
+            )
+        for field in _LINEAGE_FIELDS:
+            source_value = source_plan.get(field)
+            if source_value is None or student_plan.get(field) != source_value:
+                raise ValueError(
+                    f"clip source/student conversion lineage mismatch: {field}"
+                )
+    elif student_plan is not None and (
+        student_plan.get("dwq_applied") is True
+        or student_plan.get("clip_applied") is True
+        or student_plan.get("release_complete") is True
+    ):
+        raise ValueError("clip student plan describes a completed or clipped artifact")
+
+    def evidence(
+        root: Path, plan: dict | None, plan_path: Path | None
+    ) -> dict:
+        plan = plan or {}
+        return {
+            "directory_digest": directory_digest(root),
+            "conversion_plan_sha256": (
+                sha256_file(plan_path) if plan_path is not None else None
+            ),
+            "recipe": plan.get("recipe"),
+            "artifact_label": plan.get("artifact_label"),
+            **{field: plan.get(field) for field in _LINEAGE_FIELDS},
+        }
+
+    return {
+        "schema": "alis-dwq.clip-inputs/v1",
+        "lineage_mode": lineage_mode,
+        "source": evidence(source_root, source_plan, source_plan_path),
+        "student": evidence(student_root, student_plan, student_plan_path),
+    }
+
+
+def _verify_clip_inputs_unchanged(
+    source_root: Path, student_root: Path, expected: dict
+) -> None:
+    observed = _clip_input_binding(source_root, student_root)
+    if observed != expected:
+        raise RuntimeError("clip source/student bytes changed during requantization")
 
 
 def snake_perm(mag, group_size):
@@ -98,12 +225,24 @@ def clip_requantize(w, group_size, bits, ratios, scale_dtype, chunk_elems=1 << 2
         best_sum = base_sum = 0.0
         clip_cnt = grp_cnt = 0.0
         for i in range(0, rows, step):
-            q, s, b, stats = _clip_chunk(w[i:i + step], group_size, bits, ratios, scale_dtype,
-                                         max_err_slack)
-            qs.append(q); ss.append(s); bs.append(b)
-            best_sum += stats[0]; base_sum += stats[1]
-            clip_cnt += stats[2]; grp_cnt += stats[3]
-        q = mx.concatenate(qs, axis=0); s = mx.concatenate(ss, axis=0); b = mx.concatenate(bs, axis=0)
+            q, s, b, stats = _clip_chunk(
+                w[i : i + step],
+                group_size,
+                bits,
+                ratios,
+                scale_dtype,
+                max_err_slack,
+            )
+            qs.append(q)
+            ss.append(s)
+            bs.append(b)
+            best_sum += stats[0]
+            base_sum += stats[1]
+            clip_cnt += stats[2]
+            grp_cnt += stats[3]
+        q = mx.concatenate(qs, axis=0)
+        s = mx.concatenate(ss, axis=0)
+        b = mx.concatenate(bs, axis=0)
         mx.eval(q, s, b)
         drop = 1 - best_sum / max(base_sum, 1e-30)
         return q, s, b, float(drop), float(clip_cnt / max(grp_cnt, 1.0))
@@ -178,7 +317,7 @@ def _plan_ffn_perms(student, source, bases, sc_of, mx):
         if fam is None:
             continue
         down = f"{parent}.{fam[-1]}"
-        ups = [f"{parent}.{l}" for l in fam[:-1]]
+        ups = [f"{parent}.{leaf}" for leaf in fam[:-1]]
         members = ups + [down]
         ok = all(m + ".weight" in source and m + ".scales" not in source
                  for m in members)
@@ -224,9 +363,39 @@ def _apply_perm(sw, perm, axis, mx):
     return mx.take_along_axis(sw, idx.astype(mx.uint32), axis=axis)
 
 
+def _clip_evidence(drops, skipped, perms, *, permutation_requested):
+    """Return evidence about work actually applied, not merely requested."""
+    clipped = [row for row in drops if row[1] > 0]
+    permutation_blocks = sorted({parent for _perm, _axis, parent in perms.values()})
+    return {
+        "clip_search_completed": bool(drops),
+        "clip_applied": bool(clipped),
+        "clip_requantized_module_count": len(drops),
+        "clip_clipped_module_count": len(clipped),
+        "clip_passthrough_module_count": len(skipped),
+        "clip_skips": [
+            {"module": module, "reason": reason} for module, reason in skipped
+        ],
+        "clip_mean_clipped_group_fraction": (
+            sum(fraction for _drop, fraction, *_ in drops) / len(drops)
+            if drops
+            else 0.0
+        ),
+        "ffn_permutation_requested": bool(permutation_requested),
+        "ffn_permutation_applied": bool(permutation_blocks),
+        "ffn_permutation_block_count": len(permutation_blocks),
+    }
+
+
 def main():
     import mlx.core as mx
     from tqdm import tqdm
+
+    from .memory_guard import (
+        MemoryGuard,
+        MemoryLimits,
+        configure_recommended_wired_limit,
+    )
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--source", required=True, help="unquantized MLX-layout dump")
@@ -250,20 +419,59 @@ def main():
                     help="outlier-scattering permutation of each FFN hidden "
                          "axis before quantization (value-preserving, zero "
                          "runtime cost; float sources only)")
+    ap.add_argument(
+        "--require-no-skips",
+        action="store_true",
+        help="fail closed if any quantized module cannot be requantized",
+    )
     a = ap.parse_args()
 
-    out = Path(a.out)
-    if out.resolve() in (Path(a.model).resolve(), Path(a.source).resolve()):
+    source_root = Path(a.source).expanduser()
+    student_root = Path(a.model).expanduser()
+    final_out = Path(a.out).expanduser()
+    if final_out.resolve() in (student_root.resolve(), source_root.resolve()):
         raise SystemExit("[clip] --out must be a new directory (lazy-mmap save trap)")
-    out.mkdir(parents=True, exist_ok=True)
+    if final_out.exists():
+        raise SystemExit(f"[clip] --out already exists (no-clobber): {final_out}")
+    try:
+        input_binding = _clip_input_binding(source_root, student_root)
+    except ValueError as exc:
+        raise SystemExit(f"[clip] invalid input provenance: {exc}") from exc
+    created_at = datetime.now(timezone.utc)
+    out = final_out.with_name(
+        f"{final_out.name}.partial-{created_at.strftime('%Y%m%dT%H%M%SZ')}-{os.getpid()}"
+    )
+    if out.exists():
+        raise SystemExit(f"[clip] staging output already exists (no-clobber): {out}")
+    out.mkdir(parents=True, exist_ok=False)
 
     extra = {float(r) for r in a.ratios.split(",")} - {1.0}
     if any(not 0 < r < 1 for r in extra):
         raise SystemExit("[clip] ratios must be in (0, 1]")
     ratios = [1.0] + sorted(extra, reverse=True)  # baseline first
 
-    student, shard_of = _load_dir(a.model)
-    source, _ = _load_dir(a.source)
+    strict_laguna = input_binding["lineage_mode"] == "laguna-pinned"
+    memory_phase = "clip-requantization"
+    recommended = configure_recommended_wired_limit(memory_phase, mx_module=mx)
+    memory_guard = MemoryGuard(
+        memory_phase,
+        recommended,
+        limits=(
+            MemoryLimits.guarded_laguna()
+            if strict_laguna
+            else MemoryLimits.from_env()
+        ),
+        mx_module=mx,
+        require_recommended_working_set=strict_laguna,
+        require_swap_measurement=strict_laguna,
+    )
+    memory_guard.start()
+    memory_guard.check("before-student-load")
+    student, shard_of = _load_dir(student_root)
+    memory_guard.check("after-student-load")
+    memory_guard.check("before-bf16-source-load")
+    source, _ = _load_dir(source_root)
+    memory_guard.check("after-bf16-source-load")
 
     bases = {k[: -len(".scales")] for k in student if k.endswith(".scales")}
     triple_keys = {b + suf for b in bases for suf in (".weight", ".scales", ".biases")}
@@ -287,6 +495,7 @@ def main():
             down_perms = {par: np.asarray(pm) for pm, ax, par in perms.values()
                           if ax == -1}
             np.savez(out / "ffn_perms.npz", **down_perms)
+        memory_guard.check("after-ffn-permutation")
 
     def process(base):
         wq, sc = student[base + ".weight"], student[base + ".scales"]
@@ -411,6 +620,7 @@ def main():
         for k in by_shard[fname]:
             student.pop(k, None)
         mx.clear_cache()
+        memory_guard.check("after-shard-write", shard=fname)
 
     for leftover, arrs in pending.items():  # safety net; unreachable in practice
         # (a base is processed at the FIRST shard holding any of its keys, so
@@ -422,9 +632,11 @@ def main():
         merged.update(arrs)
         mx.save_safetensors(str(out / leftover), merged, metadata={"format": "mlx"})
 
-    for f in Path(a.model).iterdir():  # config, tokenizer, index, ...
+    for f in student_root.iterdir():  # config, tokenizer, index, ...
         if f.is_file() and not f.name.endswith(".safetensors"):
             shutil.copy2(f, out / f.name)
+
+    memory_guard.check("before-input-revalidation")
 
     for base, reason in skipped:
         print(f"[clip] skipped {base}: {reason}", file=sys.stderr)
@@ -441,7 +653,44 @@ def main():
         print("[clip] next: DWQ this output (README §3), then eval_kld A/B vs the "
               "unclipped student")
     else:
-        print("[clip] nothing requantized — check --source layout", file=sys.stderr)
+        raise SystemExit(
+            "[clip] nothing requantized; refusing to publish a false clipped artifact"
+        )
+    if a.require_no_skips and skipped:
+        raise SystemExit(
+            f"[clip] {len(skipped)} module(s) skipped under --require-no-skips; "
+            f"partial retained at {out}"
+        )
+
+    _verify_clip_inputs_unchanged(source_root, student_root, input_binding)
+    memory_guard.check("before-receipt-write")
+
+    receipt_path = out / "conversion_plan.json"
+    receipt = json.loads(receipt_path.read_text()) if receipt_path.is_file() else {}
+    source_label = receipt.get("artifact_label", "quantized-pre-dwq")
+    evidence = _clip_evidence(
+        drops,
+        skipped,
+        perms,
+        permutation_requested=a.permute_ffn,
+    )
+    label_suffix = "clipped" if evidence["clip_applied"] else "clip-search-noop"
+    receipt.update({
+        "artifact_label": f"{source_label}-{label_suffix}",
+        "clip_created_at": created_at.isoformat(),
+        "clip_source": str(source_root.resolve()),
+        "clip_student": str(student_root.resolve()),
+        "clip_input_binding": input_binding,
+        "clip_ratios": ratios,
+        "clip_max_error_slack": a.max_err_slack,
+        "clip_complete": not skipped,
+        "release_complete": False,
+        **evidence,
+    })
+    receipt_path.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
+    memory_guard.check("before-publish")
+    move_no_replace(out, final_out)
+    print(f"[clip] completed transactionally (no-clobber) at {final_out}")
 
 
 if __name__ == "__main__":
