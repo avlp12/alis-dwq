@@ -1,0 +1,15 @@
+# Prefill top-k confidence gating (K3_PF_TOPK_TAU=0.90) — promoted 2026-08-11
+# Mechanism: per-token cumulative router mass tau on prefill (T>8) only; non-kept
+#   slots demoted to dummy row (kernel early-exit); kept weights renormalized.
+#   Decode (T<=8) untouched by construction. E[k]=12.9-13.2 of 16.
+# Speed (same-probe differential, 2244-tok long prefill / chat turn / decode):
+#   tau=0    : 28.6-33.1s · 2.1-2.5s · 8.54-8.71 tok/s
+#   tau=0.90 : 27.3-31.4s · 1.9-2.3s · 8.70-8.77 tok/s   (prefill -5%, decode unchanged)
+# KL 4-window gate vs certified v3 baseline (teacher-anchored):
+#   w000 0.2361 (base 0.2313, +0.005) · w001 0.3669 (0.3637, +0.003)
+#   w024 0.1074 (0.1130, -0.006)      · w025 0.1168 (0.1169, 0.000)
+# PPL: wikitext 1.7442 (+0.2%, noise) · korean 3.249 vs 3.311 (-1.9%)
+# Note: dropping low-mass tail experts (noisy under ternary encoding) acts as mild
+#   denoising — Korean improves while wikitext degrades within noise. Net: free-ish.
+# Rejected in same campaign: PFCHUNK=1024 (full-scale long-prefill scheduler wedge —
+#   mini-harness clearance is necessary but NOT sufficient; 512 is the ceiling).

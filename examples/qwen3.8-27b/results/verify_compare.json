@@ -1,0 +1,19 @@
+{
+  "chat": {
+    "match": "DIVERGED",
+    "first_divergence": 41
+  },
+  "code": {
+    "match": "EXACT",
+    "len": 64
+  },
+  "math": {
+    "match": "EXACT",
+    "len": 64
+  },
+  "ko": {
+    "match": "EXACT",
+    "len": 64
+  },
+  "verdict": "PASS"
+}

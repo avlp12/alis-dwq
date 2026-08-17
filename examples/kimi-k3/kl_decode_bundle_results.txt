@@ -1,0 +1,13 @@
+Decode-mode KL bundle — fused stack (B) vs all-fusions-off reference (A)
+Kimi-K3 2.10bpw, 2x M3 Ultra EP, greedy, 4 domains x 128 steps, 2026-08-05
+
+p1 (EN prose):  common prefix  47/128 · KL mean 8.498e-04 · max 7.159e-03 nats
+p2 (KO prose):  common prefix  87/128 · KL mean 2.546e-03 · max 6.331e-02 nats
+p3 (code):      common prefix 128/128 · KL mean 8.685e-04 · full run, no split
+p4 (math):      common prefix 128/128 · KL mean 4.584e-04 · full run, no split
+overall: 390 comparable steps · KL mean 1.106e-03 · p99 1.008e-02 · max 6.331e-02 nats
+
+Reference scale: the published teacher-KL of this build is 0.2253 nats -> the
+entire fused serving stack contributes ~1/200 of the quantization's own distance.
+Method note: prefill-based KL is vacuous for decode-path fusions (they are all
+T-gated) — dump per-step decode logits instead (K3_LOGIT_DUMP hook in k3_serve).

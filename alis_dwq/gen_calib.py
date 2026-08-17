@@ -25,6 +25,8 @@ from pathlib import Path
 
 import numpy as np
 
+from .slices import lang_slice
+
 DATA = Path(__file__).resolve().parent.parent / "data"
 SLICES = {"EN": "wikitext.txt", "code": "code.txt", "ZH": "zh.txt"}
 
@@ -127,7 +129,11 @@ def main():
         print("[gen] dense model (no MoE hooks): coverage loop disabled, "
               "generating to --samples", file=sys.stderr)
 
-    avail = {k: (DATA / f) for k, f in SLICES.items() if (DATA / f).exists()}
+    slices = dict(SLICES)
+    del slices["ZH"]
+    lbl, lpath = lang_slice()
+    slices[lbl] = lpath
+    avail = {k: (DATA / f) for k, f in slices.items() if (DATA / f).exists()}
     if not avail:
         raise SystemExit(f"[gen] no seed corpora in {DATA}")
     mix = parse_mix(a.mix, set(avail))
@@ -154,6 +160,14 @@ def main():
                     tokenize=False, add_generation_prompt=True)
             text = generate(model, tok, prompt=prompt, max_tokens=a.max_tokens,
                             sampler=sampler)
+            # Flush the lazy _alis_counts chain after every sample: the hook
+            # builds one lazy .at[].add() per layer per generated token, and
+            # they are only a dependency of the coverage check (every --batch
+            # samples) — unflushed they accumulate past Metal's 499k-resource
+            # limit within a few 1024-token samples (Solar: 48 MoE layers).
+            for _, _, m in hooked:
+                if m._alis_counts is not None:
+                    mx.eval(m._alis_counts)
             toks = tok.encode(text)
             distinct, period = loop_stats(toks) if len(toks) > 8 else (1.0, 0)
             if period or distinct < 0.3:

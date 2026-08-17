@@ -16,6 +16,8 @@ from mlx_lm import load
 
 DATA = Path(__file__).resolve().parent.parent / "data"
 
+from .slices import lang_slice  # noqa: E402  (third slice of the EN/code/<lang> trio)
+
 
 def set_wired():
     lim = mx.metal.device_info()["max_recommended_working_set_size"]
@@ -24,11 +26,12 @@ def set_wired():
 
 
 def get_tokens(tokenizer, n=3072):
-    """Deterministic fixed slice: EN + code + ZH thirds (same for every build)."""
+    """Deterministic fixed slice: EN + code + <lang> thirds (same for every build)."""
     third = n // 3
+    _, lpath = lang_slice()
     w = tokenizer.encode((DATA / "wikitext.txt").read_text())[:third]
     c = tokenizer.encode((DATA / "code.txt").read_text())[:third]
-    z = tokenizer.encode((DATA / "zh.txt").read_text())[: n - 2 * third]
+    z = tokenizer.encode(lpath.read_text())[: n - 2 * third]
     return mx.array((w + c + z)[:n])
 
 
@@ -88,8 +91,9 @@ def loop_probe(model, tokenizer, n_gen, n_prompt=64, temp=0.0, top_k=0,
           f"({n_gen} tokens from a {n_prompt}-token prompt per slice). Omit "
           "the flag (or pin branch backup/v0.1-pre-router-kd) for the "
           "previous KL/flip-only behavior.")
-    for name, fname in [("EN", "wikitext.txt"), ("code", "code.txt"), ("ZH", "zh.txt")]:
-        path = DATA / fname
+    lbl, lpath = lang_slice()
+    for name, path in [("EN", DATA / "wikitext.txt"), ("code", DATA / "code.txt"),
+                       (lbl, lpath)]:
         if not path.exists():
             continue
         ids = mx.array(tokenizer.encode(path.read_text())[:n_prompt])
@@ -113,7 +117,12 @@ def logprobs(model, ids, chunk=1024, kv_bits=0, kv_group_size=64):
         conv = []
         for c in cache:
             if hasattr(c, "to_quantized"):
-                conv.append(c.to_quantized(group_size=kv_group_size, bits=kv_bits))
+                try:
+                    conv.append(c.to_quantized(group_size=kv_group_size, bits=kv_bits))
+                except NotImplementedError:
+                    # e.g. RotatingKVCache: has the attr but raises
+                    conv.append(c)
+                    kept += 1
             else:
                 conv.append(c)
                 kept += 1
@@ -145,7 +154,8 @@ def kv_probe(model, ids, lp_fp16, bits, group_size, n):
     mx.eval(kl, flip)
     klv = kl.tolist()
     third = n // 3
-    for name, s, e in [("EN", 0, third), ("code", third, 2 * third), ("ZH", 2 * third, T)]:
+    for name, s, e in [("EN", 0, third), ("code", third, 2 * third),
+                       (lang_slice()[0], 2 * third, T)]:
         seg = klv[s:e]
         if seg:
             fl = flip[s:e]
@@ -211,9 +221,10 @@ def main():
     n = len(klv)
     mean = sum(klv) / n
     se = (sum((v - mean) ** 2 for v in klv) / (n - 1) / n) ** 0.5
-    # per-slice breakdown (EN / code / ZH thirds)
+    # per-slice breakdown (EN / code / <lang> thirds)
     third = a.n // 3
-    for name, s, e in [("EN", 0, third), ("code", third, 2 * third), ("ZH", 2 * third, T)]:
+    for name, s, e in [("EN", 0, third), ("code", third, 2 * third),
+                       (lang_slice()[0], 2 * third, T)]:
         seg = klv[s:e]
         fl = flip[s:e]
         if seg:
