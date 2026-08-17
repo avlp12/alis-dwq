@@ -354,7 +354,14 @@ Promoted configuration, measured from stock defaults after promotion
 |---|---|---|
 | plain | 37.63 | 37.64 |
 | MTP k=2 | 50.36 (1.34×) | 55.71 (1.48×) |
-| **DSpark** | **62.21 (1.65×)** | **71.86 (1.91×)** |
+| **DSpark** | ~~62.21 (1.65×)~~ **retracted** | ~~71.86 (1.91×)~~ **retracted** |
+
+> **These two figures were withdrawn on 2026-08-16.** The harness did not stop at
+> end-of-sequence, so the math prompt's post-EOS self-copy inflated acceptance to 4.53 and
+> carried the headline. Under the corrected protocol (four prompts, EOS-cut, long-form,
+> medians of three) the ordering reverses: gated MTP k=4 leads at **52.8 tok/s (1.40×)** and
+> DSpark trails at **48.3 (1.28×)**. The struck rows stay so the retraction is legible.
+
 
 **Lossless**: all four prompts (chat / code / math / ko) are token-identical to plain
 greedy. **DSpark is now the production recommendation for the 4-bit build**, with MTP k=2
@@ -425,6 +432,24 @@ Small files only — no weights, images or raw logs.
 | [`table2.py`](table2.py) | renders the comparison table from the `m_*.json` files |
 | [`kv_measure.py`](kv_measure.py) | produces the `kv_*.json` sweep |
 | [`DSPARK_FINDINGS.md`](DSPARK_FINDINGS.md) | the campaign's **verdict ledger** (Korean, AIF-structured: information / inference / conflict / decision nodes with IDs). Every number above resolves to a node there — including the overturned ones, which are preserved rather than deleted: `[CA5]`/`[CA6]` are the rejections the split-K work forced, `[I25]` is where the missing DSpark head wiring was found, `[CA7]` is the dead-kernel discovery ("building a feature and not wiring it was the campaign's largest single loss"), and `[PA12]` is the reversal of the production recommendation |
+
+| [`HANDOFF.md`](HANDOFF.md) | the **zero-prior-knowledge handoff** for the whole campaign — read this first if you are picking it up |
+| [`results/kl_*.json`](results/) | exact full-vocab KL to bf16 for ten builds (mine and the community's), 512-token block SEs |
+| [`results/allsum.json`](results/) / [`results/mtp_tp2.json`](results/) / [`results/decode_tp2.json`](results/) | the two-box tensor-parallel spike: RDMA `all_sum` latency, plain TP2, and the TP2 x speculation composite |
+| [`results/out_tp2_*.jsonl`](results/) | the served two-box stack, four prompts x three alternated boots |
+| [`tier_chart.png`](tier_chart.png) | size-vs-fidelity across the ten builds |
+
+## Where the campaign ended up
+
+| axis | first build | now | protocol |
+|---|---|---|---|
+| decode, 4-bit | 37.6 tok/s | **52.8** gated MTP · **74.2** on two boxes | four-prompt EOS-cut, dependency-chained |
+| decode, served | — | **53.1** one box · **62.9** two boxes | HTTP streaming, same protocol |
+| prefill 8K | ~430 tok/s | **733** (layer pipeline) · ~650 (TP2 stack) | bitwise-identical output |
+| quality | — | exact full-vocab KL, ten builds | paired ctx-2048 windows, block SEs |
+
+The full account, including six rejected levers with the diagnosis each one bought, is in
+[`HANDOFF.md`](HANDOFF.md) and the [ledger](DSPARK_FINDINGS.md).
 
 Reproduce the table — this is the exact command, run from this directory:
 
@@ -522,7 +547,8 @@ decode timer **after the first token**, so prefill is not folded into decode.
 10. **Winning the drafter metric is not winning — and the example we first used was
     ourselves being wrong.** We wrote this rule pointing at DSpark (acceptance 4.23, losing
     end-to-end to MTP) and the verdict inverted the moment findings 7–8 were fixed: DSpark
-    now leads at **1.65×/1.91×** against MTP k=2's 1.34×/1.48×. The rule survives its own
+    appeared to lead — until the EOS-cut retraction reversed that too, leaving the gated
+    in-weights path ahead at 1.40× and the block drafter at 1.28×. The rule survives its own
     counter-example — block 9 has **higher** acceptance than block 8 (3.55 vs 3.46) and is
     still slower, because the drafter forward costs more than the extra token returns. Judge
     on tok/s; and when the loser is your own integration, fix the integration before writing
