@@ -451,6 +451,15 @@ stack, and a head retrained against its own quantized activations). The full rec
   flagged three real mismatches — all live files being appended during the copy — which is the
   distinction the exclusion lets you see. **Filter metadata artifacts, then treat what remains as
   signal.**
+- **A shape-windowed optimization is a claim about the runtime distribution, and a compiler
+  release can move that distribution out from under it.** A fused-attention path I added for an
+  unsupported head dimension was adopted on measurement (+3.2% at one prefill shape) and, one
+  upstream release later, measured **12.5% slower** at the chunk size actually used — upstream had
+  widened its own coverage and tuned the path mine competed with. It still won at a chunk size the
+  stack does not use. Retired. The rule this leaves: **re-run the A/B that justified an adoption
+  whenever the layer underneath it ships**, and treat the original verdict as scoped to that
+  version. Check the patch is still engaged before believing either result — mine was, verified by
+  patched and stock builds returning different values for identical input.
 - **Renderers pair single tildes into strikethrough, and a struck-out number reads as a retracted
   one.** Range notation (`2.3~2.5 ... 1.9~2.2`) in ledger prose silently crossed out the values
   between each pair on GitHub and on model cards. En dashes for ranges, `≈` for approximations,
