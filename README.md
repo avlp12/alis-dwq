@@ -451,6 +451,13 @@ stack, and a head retrained against its own quantized activations). The full rec
   flagged three real mismatches — all live files being appended during the copy — which is the
   distinction the exclusion lets you see. **Filter metadata artifacts, then treat what remains as
   signal.**
+- **Pinning a harness to "not the stock library" does not pin it to "not a stale copy".** My
+  benchmarks hard-fail if they import the installed package instead of my fork — a rule bought by
+  an earlier incident. On a second machine that rule passed while the harness silently imported an
+  *old checkout of the fork* sitting at a path the auto-discovery tried first: same project, months
+  behind, missing the API the benchmark called. Identify the build you need **by capability** — does
+  it expose the symbol this run depends on — not by path or by name. A staleness check is a
+  different check from a provenance check, and only one of them was in place.
 - **A shape-windowed optimization is a claim about the runtime distribution, and a compiler
   release can move that distribution out from under it.** A fused-attention path I added for an
   unsupported head dimension was adopted on measurement (+3.2% at one prefill shape) and, one
