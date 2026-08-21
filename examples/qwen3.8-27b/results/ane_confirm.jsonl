@@ -1,0 +1,12 @@
+{"F": 0.3, "G": 0.375, "C": 0.14, "CG": 0.13, "CD": 0.0, "attached": 64, "mlp_ops": 438.0, "gdn_ops": 336.0, "gpu_tps": 451.6, "hyb_tps": 567.9, "gain_pct": 25.75, "kl_mean": 0.00036964, "top1_pct": 99.951}
+{"F": 0.19, "G": 0.45, "C": 0.14, "CG": 0.13, "CD": 0.0, "attached": 64, "mlp_ops": 438.0, "gdn_ops": 336.0, "gpu_tps": 453.7, "hyb_tps": 551.4, "gain_pct": 21.53, "kl_mean": 0.00035607, "top1_pct": 100.0}
+{"F": 0.3, "G": 0.375, "C": 0.14, "CG": 0.13, "CD": 0.1, "attached": 64, "mlp_ops": 438.0, "gdn_ops": 336.0, "gpu_tps": 454.2, "hyb_tps": 570.4, "gain_pct": 25.58, "kl_mean": 0.00040745, "top1_pct": 99.951}
+{"F": 0.3, "G": 0.375, "C": 0.14, "CG": 0.13, "CD": 0.0, "attached": 64, "mlp_ops": 438.0, "gdn_ops": 336.0, "gpu_tps": 454.0, "hyb_tps": 567.5, "gain_pct": 24.98, "kl_mean": 0.00036964, "top1_pct": 99.951}
+{"F": 0.19, "G": 0.45, "C": 0.14, "CG": 0.13, "CD": 0.0, "attached": 64, "mlp_ops": 438.0, "gdn_ops": 336.0, "gpu_tps": 454.1, "hyb_tps": 553.2, "gain_pct": 21.81, "kl_mean": 0.00035607, "top1_pct": 100.0}
+{"F": 0.3, "G": 0.375, "C": 0.14, "CG": 0.13, "CD": 0.1, "attached": 64, "mlp_ops": 438.0, "gdn_ops": 336.0, "gpu_tps": 452.8, "hyb_tps": 572.0, "gain_pct": 26.32, "kl_mean": 0.00040745, "top1_pct": 99.951}
+{"F": 0.3, "G": 0.375, "C": 0.14, "CG": 0.13, "CD": 0.0, "attached": 64, "mlp_ops": 438.0, "gdn_ops": 336.0, "gpu_tps": 454.1, "hyb_tps": 568.0, "gain_pct": 25.07, "kl_mean": 0.00036964, "top1_pct": 99.951}
+{"F": 0.19, "G": 0.45, "C": 0.14, "CG": 0.13, "CD": 0.0, "attached": 64, "mlp_ops": 438.0, "gdn_ops": 336.0, "gpu_tps": 454.3, "hyb_tps": 551.3, "gain_pct": 21.35, "kl_mean": 0.00035607, "top1_pct": 100.0}
+{"F": 0.3, "G": 0.375, "C": 0.14, "CG": 0.13, "CD": 0.1, "attached": 64, "mlp_ops": 438.0, "gdn_ops": 336.0, "gpu_tps": 454.5, "hyb_tps": 571.6, "gain_pct": 25.78, "kl_mean": 0.00040745, "top1_pct": 99.951}
+{"F": 0.3, "G": 0.375, "C": 0.14, "CG": 0.13, "CD": 0.0, "attached": 64, "mlp_ops": 438.0, "gdn_ops": 336.0, "gpu_tps": 454.5, "hyb_tps": 569.4, "gain_pct": 25.29, "kl_mean": 0.00036964, "top1_pct": 99.951}
+{"F": 0.19, "G": 0.45, "C": 0.14, "CG": 0.13, "CD": 0.0, "attached": 64, "mlp_ops": 438.0, "gdn_ops": 336.0, "gpu_tps": 454.4, "hyb_tps": 553.5, "gain_pct": 21.81, "kl_mean": 0.00035607, "top1_pct": 100.0}
+{"F": 0.3, "G": 0.375, "C": 0.14, "CG": 0.13, "CD": 0.1, "attached": 64, "mlp_ops": 438.0, "gdn_ops": 336.0, "gpu_tps": 454.5, "hyb_tps": 573.4, "gain_pct": 26.16, "kl_mean": 0.00040745, "top1_pct": 99.951}

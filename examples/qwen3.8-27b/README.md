@@ -556,3 +556,31 @@ decode timer **after the first token**, so prefill is not folded into decode.
 11. **A drafter's trained block width is a reference value, not a ceiling.** Block 8 beats
     the card's block 7 (71.0 vs 63.6 tok/s over three prompts). Where verify cost is flat in
     width, spend the width.
+12. **Reproduce through the vendor's entry sequence, never around it.** We drove oMLX's
+    ANE hybrid prefill by calling its enable function on a model our own harness had
+    loaded, and measured KL 9.8-10.2 with 1.6% top-1 agreement — then published that the
+    mechanism destroys quality. It does not. The engine warms up all 224 compiled ANE
+    programs at load time; our path skipped that, so every program's *first* execution
+    returned garbage. We had even isolated the defect ("first call 1.61e-01, second call
+    3.47e-04") and filed it as unworkaroundable while the workaround sat in the loader we
+    had stepped around. The tell was a missing log line, `Warmed 224 ANE procedures at
+    load` — an absence, which is exactly what we do not check.
+13. **Some of the gain is in the loader, not in the accelerator.** Nine of our twenty-six
+    points came from `apply_qwen35_q4_mlp_patch()`, which must run *before* the weights
+    load: +15.5% without it, +24.9% with it, same accelerator and same split. It appears in
+    no accelerator counter, and only at chunk 2048 — at chunk 1024 it does nothing at all.
+    When a vendor's numbers beat yours on an identical configuration, look upstream of the
+    feature before re-tuning it.
+14. **Two levers aimed at different bottlenecks compete; they do not multiply.** ANE
+    offload (+17.1% on one box) composed with a 1.90x two-box pipeline gave **+10.6% at a
+    32K prompt and -3.9% at 8K**, not 1.9 x 1.17. Removing compute makes link transfer a
+    larger share of what remains, so the pipeline ratio itself falls (1.90 -> 1.80). Whether
+    the composition pays is a race decided by chunk count, and it has a crossover: ship the
+    branch (>=32K: ANE + chunk 2048, 863.5 tok/s; below: ANE off + chunk 1024, 778.2), not a
+    single number. Measure composition against a control **inside the same run** — the
+    product of two honestly measured gains predicted +17% and was fiction.
+
+Raw records for 12-14: `results/ane_retune.jsonl` (per-factor sweep, four rotations per
+point), `results/ane_confirm.jsonl` (confirmation of the operating point),
+`results/ane_twobox.log` and `results/ane_twobox_*.json` (two-box composition, with and
+without the loader patch, plus the same-run ANE-off control).

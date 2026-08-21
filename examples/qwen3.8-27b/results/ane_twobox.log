@@ -1,0 +1,41 @@
+[20:24:59] ── ANE seq=1024 / chunk=1024 ──
+[runner-ane] 부착 64 · 워밍업 있음
+[q4patch] mlp=True prefill_linear=True lm=True
+[gesicht] 부착 64 · 워밍업 있음 · seq=1024
+연결: 64158 · warmup
+[20:25:42] cooldown 30s 
+  N=8192 1box@1024: 462.1 tok/s
+[20:26:30] cooldown 30s 
+  N=8192 2box@1024: 743.1 tok/s
+[20:27:12] cooldown 30s 
+  N=32768 1box@1024: 419.7 tok/s
+[20:29:01] cooldown 30s 
+  N=32768 2box@1024: 777.3 tok/s
+2BOX-ANE-DONE
+[20:30:15] ── ANE seq=2048 / chunk=2048 ──
+[runner-ane] 부착 64 · 워밍업 있음
+[q4patch] mlp=True prefill_linear=True lm=True
+[gesicht] 부착 64 · 워밍업 있음 · seq=2048
+연결: 64595 · warmup
+[20:31:03] cooldown 30s 
+  N=8192 1box@2048: 507.8 tok/s
+[20:31:50] cooldown 30s 
+  N=8192 2box@2048: 748.2 tok/s
+[20:32:32] cooldown 30s 
+  N=32768 1box@2048: 480.8 tok/s
+[20:34:11] cooldown 30s 
+  N=32768 2box@2048: 863.5 tok/s
+2BOX-ANE-DONE
+[20:35:21] ── 대조: ANE 끔, chunk=1024 ──
+[q4patch] mlp=True prefill_linear=True lm=True
+연결: 64908 · warmup
+[20:35:30] cooldown 30s 
+  N=8192 1box@1024: 455.3 tok/s
+[20:36:19] cooldown 30s 
+  N=8192 2box@1024: 778.2 tok/s
+[20:37:00] cooldown 30s 
+  N=32768 1box@1024: 410.6 tok/s
+[20:38:50] cooldown 30s 
+  N=32768 2box@1024: 780.4 tok/s
+2BOX-ANE-DONE
+[20:40:04] 2BOX-ANE-ALL-DONE

@@ -248,13 +248,64 @@ environment override (ours was `OMLX_BASE_PATH`), point it at a scratch
 directory, and verify the redirect *before* the first run. A separate virtualenv
 is not enough on its own — the configuration tree is the shared state.
 
+## 10. A second lever does not multiply with the first — it competes with it
+
+Once the offload paid, we composed it with a lever we already had: a
+layer-pipelined prefill across two machines over Thunderbolt, worth about 1.9x on
+its own. The expectation was 1.9 x 1.26.
+
+Measured against an offload-off control **inside the same run**, the composition
+was **+10.6% at a 32K prompt and -3.9% at 8K**. The offload improved each single
+machine everywhere (+17.1% / +11.5%), and yet the two-machine ratio *fell*: 1.90
+to 1.80 at 32K, 1.71 to 1.47 at 8K.
+
+The reason generalizes past this hardware. The pipeline ratio is set by the
+balance between compute and link transfer. The offload removes compute only, so
+transfer becomes a larger share of what remains, and the pipeline's *relative*
+gain shrinks. Two levers aimed at different bottlenecks do not stack: relieving
+one promotes the other, and the second lever earns less than it did alone.
+
+Three consequences worth carrying:
+
+- **Measure the composition, never multiply the parts.** Multiplying our two
+  separately measured gains predicted about +17% at 32K. The truth was +10.6%,
+  and at another prompt length it was negative. Both parts were correctly
+  measured; the product was still fiction.
+- **The control must be in the same run.** Ours alternated arms inside one
+  process, so drift, thermal state and page cache could not masquerade as the
+  effect.
+- **Expect a crossover, and find what parameter moves it.** Ours was prompt
+  length, through chunk count: the offload only pays at chunk 2048, the pipeline
+  prefers chunk 1024, and a long prompt has enough chunks to amortise the larger
+  one while a short prompt does not. A composition that is positive somewhere and
+  negative elsewhere is the normal case, not a measurement failure — so ship the
+  branch, not a single number.
+
+## 11. Some of the gain is in the loader, not in the accelerator
+
+Nine of our twenty-six points came from a call that must run *before the weights
+load* — a layout patch on the quantized MLP. Same accelerator, same split, same
+tuning: +15.5% without it, +24.9% with it. It is not an accelerator setting and
+it does not appear in any accelerator counter.
+
+When a vendor's own numbers exceed yours with an identical configuration, look
+upstream of the feature before you re-tune it. The gap is more often in what the
+model looked like when it was handed over than in how it was split. This is the
+same failure as §7b in a smaller key: reproduce their *sequence*, not just their
+settings.
+
 ## What this is worth knowing for
 
-We refused the path: the quality-preserving operating point returned about 1.15x
-on the affected matmul, roughly +5% end to end, against a machine-level
-alternative already delivering +72%. The measurements are in
+We took the path, after first refusing it for the wrong reason. Tuned and
+composed, our prefill went from 733 tok/s to **863.5 tok/s** on two machines at
+long prompts, and a single machine gained 11-17% at every length, at a KL two
+orders of magnitude below the gap between our own quantization tiers. The
+measurements are in
 [qwen38_alis_mlx/docs/ane-hybrid.md](https://github.com/avlp12/qwen38_alis_mlx/blob/main/docs/ane-hybrid.md).
 
-The method survives the verdict. The next accelerator split will be decided by
-the same six numbers: the roofline share, the precision floor from `max/rms`, the
-simulator's fidelity, the cliff location, mean KL, and top-1 agreement.
+The method survives its own worked example reaching the wrong verdict twice — once
+by skipping the vendor's entry sequence, once by assuming two levers multiply. The
+next accelerator split will be decided by the same numbers: the roofline share,
+the precision floor from `max/rms`, the simulator's fidelity, the cliff location,
+mean KL, top-1 agreement — and, if a second lever is already in place, a
+composition measured against a control in the same run.
