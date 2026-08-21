@@ -135,6 +135,46 @@ Test for it explicitly: run the same program twice and compare both results
 against a reference. If only the first differs, you have an ordering bug, not a
 precision one, and no amount of quantization tuning will fix it.
 
+## 8b. Know what "enough" means before you optimize toward it
+
+A partial gain is often worth nothing — if the split only pays at full exposure,
+a configuration that preserves quality at low exposure has not solved anything.
+So before spending effort on error reduction, compute the target.
+
+Sweep the exposure (layers, or share) against quality and find where the model
+stops tolerating the substitution. Ours absorbed six to eight layers out of
+sixty-four. That ratio, run back through how error compounds, said we needed
+roughly **an order of magnitude** less error per layer — not a factor of two.
+
+With that number in hand the candidate techniques sort themselves immediately:
+clip search offered 1.02x, channel selection 2.2x, and only a precision change
+offered 10x. Two of those three were never worth attempting, and we attempted
+them because we had not computed the target first.
+
+**One caution about partial improvements.** Selecting which channels to offload —
+by per-channel quantization sensitivity, which spanned 296x in our weights, and
+exact because output channels permute freely through an elementwise gate — cut
+per-layer error 2.2x and moved end-to-end quality **not at all** (KL 9.94 to
+9.93). Past a threshold the model is in a saturated regime where the output is
+already unrelated, and local improvements do not register. Always confirm a
+per-layer win end to end before building on it.
+
+## 8c. The speed usually *is* the precision
+
+The uncomfortable pattern this ends in: the accelerator was fast because it ran
+INT8, and INT8 was what the model could not absorb. Its accurate mode existed and
+was ten times better, but sustained only a fraction of the work — past a 15%
+share it became the critical path and the split turned negative. There was no
+setting with both.
+
+Before starting, ask what the accelerator's fast path actually does differently.
+Ours applied **one scale per output channel** where the model's own container
+carries **one per group of 64 inputs**. That single structural difference — the
+loss of local scale adaptation — is the whole story, and it was visible in the
+data sheet before any measurement. A model quantized group-wise has already spent
+its error budget on the assumption that scales adapt locally; an accelerator that
+flattens them is not offering a cheaper version of the same thing.
+
 ## 9. Isolation, so the experiment cannot damage a working install
 
 Vendor runtimes usually read a configuration tree and hold a port. Find the
