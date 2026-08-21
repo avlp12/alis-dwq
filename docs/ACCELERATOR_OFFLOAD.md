@@ -1,5 +1,18 @@
 # Offloading part of a quantized model to a second accelerator
 
+> **CORRECTION (2026-08-21).** The campaign behind this document reached the
+> wrong verdict, and the method section that matters most is the reason why.
+> The accelerator path I measured as destroying output quality does not: driven
+> the way the vendor's own engine drives it — pre-load patches, then a load-time
+> warm-up of every compiled program — it delivers **mean KL 0.000264 and 100%
+> top-1 agreement**. My harness bypassed that warm-up, so every program's first
+> execution returned garbage, and I attributed the result to INT8 precision.
+> Sections 7 and 8 below (silent no-ops; first-execution bugs) are the ones that
+> should have caught it, and I wrote them without applying them to my own setup.
+> The precision arithmetic in §4 and the simulator method in §5 stand. The
+> conclusion drawn from them does not.
+
+
 A pattern that keeps reappearing: a machine has a matrix unit sitting idle next
 to the GPU — Apple's Neural Engine, an NPU, a DSP — and someone splits each
 linear layer so both work at once. The wiring is usually the hard part and is
