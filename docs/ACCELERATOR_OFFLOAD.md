@@ -175,6 +175,28 @@ data sheet before any measurement. A model quantized group-wise has already spen
 its error budget on the assumption that scales adapt locally; an accelerator that
 flattens them is not offering a cheaper version of the same thing.
 
+## 8d. An automatic tuner without a quality gate optimizes toward destroying quality
+
+The vendor path we measured ships with a built-in tuner that benchmarks the split
+ratio on the user's own machine and recommends a configuration. We read it: it
+computes `speedup_percent` and selects by minimum time. There is no perplexity,
+no KL, no logit comparison, no accuracy check anywhere in it.
+
+That is not an oversight with a small consequence. The search space is *ordered*
+by how much work moves to the lower-precision unit, so time-only optimization
+walks straight to the configuration that damages the model most. A user who runs
+the tuner and accepts its answer gets exactly that.
+
+**If you build one of these, the gate is the feature.** Score candidates on
+`speedup` *and* a quality measure, and refuse any candidate that fails the quality
+bar regardless of its speed. If quality is expensive to evaluate, evaluate it on
+the finalists rather than dropping it — a tuner that cannot reject is not a tuner,
+it is a stopwatch.
+
+The same applies to reading someone else's numbers. Before trusting a published
+speedup, find out what their tuning loop optimized. If quality never entered the
+objective, the number is real and the configuration is still unusable.
+
 ## 9. Isolation, so the experiment cannot damage a working install
 
 Vendor runtimes usually read a configuration tree and hold a port. Find the
