@@ -606,3 +606,38 @@ without the loader patch, plus the same-run ANE-off control).
 Raw records for 15-17: `results/ane_xover.json` + `results/ane_xover_fine.json`
 (offload attached, both schedules alternated in one process),
 `results/ane_xover_ctl.json` (offload detached), `results/ane_xover.log`.
+
+18. **A competitor's quant is readable without downloading it.** GGUF puts its
+    full tensor table at the front of the file, so a few HTTP range requests over a
+    14 GB quant return the entire bit assignment. Pull several budget points and
+    diff them: how a scheme *degrades* under a shrinking budget is its priority
+    order, published. Their imatrix is a 13.6 MB GGUF of per-channel Σx² — ours was
+    calibrated on 65,536 tokens, theirs on 10,248,192.
+19. **Separate the sensitivity half from the arithmetic half.** Their FFN
+    allocation tracks their own imatrix (r = 0.65-0.78); their attention allocation
+    tracks nothing — `attn_v` is high at every budget because under GQA it is 0.33%
+    of the parameters, not because it is precious. The first half is a measurement,
+    the second is division. Only the second transferred, and it did not need the
+    10M-token calibration to find.
+20. **The bytes are not the point — the tensors are.** Promoting five cheap
+    tensors bought −17.5% KL for +1.7% size. Spending the *identical* 248 MiB on
+    arbitrary mid-depth FFN tensors bought −1.2%. Byte-matched to 0.02%, the two
+    differ by 19%. Any "we spent more and got more" result needs this control.
+21. **Check the size of the thing you compared against.** We published
+    "redistribution does not pay" from a comparison between builds differing by
+    0.97% in bytes, while a byte-identical pair in the same results directory said
+    the opposite. And our allocator had never been allowed to consider the one move
+    that mattered — the imatrix has no entry for the output head, so the search
+    pinned it at the baseline width. A negative result about a search is worthless
+    until you check what the search was allowed to try.
+22. **An error in the output head has nothing downstream to absorb it.** Two
+    thirds of our gain was `lm_head` alone, and our relative-error criterion
+    *demotes* it — per-tensor error-over-signal cannot see that the head's error
+    lands directly on the logits while every other tensor's is renormalized by the
+    blocks that follow. Same reason absolute activation energy fails: RMSNorm
+    erases scale at every block, so late layers look important merely because the
+    residual stream has accumulated.
+
+Raw records for 18-22: `results/ane_*`, and in
+[qwen38_alis_mlx/results/exp16_unsloth](https://github.com/avlp12/qwen38_alis_mlx/tree/main/results/exp16_unsloth)
+— allocation maps, per-tensor sensitivity, and every paired KL run.
