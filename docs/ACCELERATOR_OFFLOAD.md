@@ -273,13 +273,36 @@ Three consequences worth carrying:
   measured; the product was still fiction.
 - **The control must be in the same run.** Ours alternated arms inside one
   process, so drift, thermal state and page cache could not masquerade as the
-  effect.
-- **Expect a crossover, and find what parameter moves it.** Ours was prompt
-  length, through chunk count: the offload only pays at chunk 2048, the pipeline
-  prefers chunk 1024, and a long prompt has enough chunks to amortise the larger
-  one while a short prompt does not. A composition that is positive somewhere and
-  negative elsewhere is the normal case, not a measurement failure — so ship the
-  branch, not a single number.
+  effect. The one control we could not run in-process — the accelerator detached
+  entirely — needed its own pass, and it is the one that overturned our
+  explanation.
+- **Expect a crossover, and decompose it before you explain it.** Ours moved with
+  prompt length, and our first explanation was half wrong. We said the wide chunk
+  wins at long prompts because it has enough chunks to amortise its pipeline
+  bubble. Sweeping eight lengths with an offload-off control showed that **the
+  wide chunk never wins without the offload, anywhere in the range**. Two curves
+  move in opposite directions and the crossover is where they meet:
+
+  | prompt | wide-chunk bubble cost | offload gain at wide chunk |
+  |---:|---:|---:|
+  | 8192 | -9.8% | +4.7% |
+  | 10240 | -7.5% | +7.8% |
+  | 12288 | -5.4% | +8.0% |
+  | 16384 | -4.7% | +11.2% |
+  | 32768 | -1.9% | +13.4% |
+
+  The bubble does amortise, but it never becomes a gain by itself; the offload is
+  what carries the wide schedule over the line. Two effects moving together is the
+  usual case, and only the control separates them — a crossover you have not
+  decomposed is a number, not an explanation.
+- **Set the threshold where the gain clears the noise, not where the sign flips.**
+  Our curves cross near 9216 tokens, but 9216-10240 measured as a tie. Switching
+  inside a tie earns nothing and risks landing on the wrong side, so we shipped
+  the first length with a real gain (11264): zero opportunity cost, minimum risk.
+- **Ship the branch as opt-in when the effect belongs to the accelerator.** The
+  threshold is a measured default, but *enabling* the branch is not: on a stock
+  configuration without the offload it is a pure loss at every length we measured.
+  Bake the measured value, leave the switch with the user.
 
 ## 11. Some of the gain is in the loader, not in the accelerator
 

@@ -1,0 +1,87 @@
+[21:09:10] ── 러너 재기동: ANE seq=2048 ──
+started
+[runner-ane] 부착 64 · 워밍업 있음
+[21:09:38] ── 교차점 스윕 ──
+[q4patch] mlp=True prefill_linear=True lm=True
+[gesicht] 부착 64 · 워밍업 있음 · seq=2048
+연결: 66724
+[21:10:00] cooldown 30s 
+  N=8192 2box@1024: 765.0 tok/s
+[21:10:41] cooldown 30s 
+  N=8192 2box@2048: 725.8 tok/s
+  → N=8192: 2048/1024 = 0.9487
+[21:11:24] cooldown 30s 
+  N=12288 2box@1024: 788.4 tok/s
+[21:12:11] cooldown 30s 
+  N=12288 2box@2048: 808.5 tok/s
+  → N=12288: 2048/1024 = 1.0255
+[21:12:57] cooldown 30s 
+  N=16384 2box@1024: 791.2 tok/s
+[21:13:49] cooldown 30s 
+  N=16384 2box@2048: 850.0 tok/s
+  → N=16384: 2048/1024 = 1.0743
+[21:14:39] cooldown 30s 
+  N=24576 2box@1024: 791.3 tok/s
+[21:15:42] cooldown 30s 
+  N=24576 2box@2048: 868.6 tok/s
+  → N=24576: 2048/1024 = 1.0977
+[21:16:42] cooldown 30s 
+  N=32768 2box@1024: 773.0 tok/s
+[21:17:56] cooldown 30s 
+  N=32768 2box@2048: 854.9 tok/s
+  → N=32768: 2048/1024 = 1.1060
+XOVER-DONE
+[21:19:06] XOVER-ALL-DONE
+[21:19:24] ── 경계 세분: 9216,10240,11264 (ANE seq=2048 유지) ──
+[q4patch] mlp=True prefill_linear=True lm=True
+[gesicht] 부착 64 · 워밍업 있음 · seq=2048
+연결: 66724
+[21:19:46] cooldown 30s 
+  N=9216 2box@1024: 763.7 tok/s
+[21:20:29] cooldown 30s 
+  N=9216 2box@2048: 765.7 tok/s
+  → N=9216: 2048/1024 = 1.0026
+[21:21:12] cooldown 30s 
+  N=10240 2box@1024: 776.9 tok/s
+[21:21:57] cooldown 30s 
+  N=10240 2box@2048: 777.5 tok/s
+  → N=10240: 2048/1024 = 1.0008
+[21:22:41] cooldown 30s 
+  N=11264 2box@1024: 776.8 tok/s
+[21:23:27] cooldown 30s 
+  N=11264 2box@2048: 799.2 tok/s
+  → N=11264: 2048/1024 = 1.0289
+XOVER-DONE
+[21:24:12] ── 대조 러너 재기동: ANE 없음 ──
+started
+[21:24:21] ── 대조 스윕 (ANE 미부착) ──
+[q4patch] mlp=True prefill_linear=True lm=True
+[gesicht] ANE 미부착 (대조)
+연결: 67882
+[21:24:23] cooldown 30s 
+  CTL N=8192 2box@1024: 769.0 tok/s
+[21:25:04] cooldown 30s 
+  CTL N=8192 2box@2048: 693.4 tok/s
+  → CTL N=8192: 2048/1024 = 0.9018
+[21:25:47] cooldown 30s 
+  CTL N=10240 2box@1024: 779.9 tok/s
+[21:26:31] cooldown 30s 
+  CTL N=10240 2box@2048: 721.2 tok/s
+  → CTL N=10240: 2048/1024 = 0.9247
+[21:27:16] cooldown 30s 
+  CTL N=12288 2box@1024: 791.5 tok/s
+[21:28:02] cooldown 30s 
+  CTL N=12288 2box@2048: 748.5 tok/s
+  → CTL N=12288: 2048/1024 = 0.9457
+[21:28:49] cooldown 30s 
+  CTL N=16384 2box@1024: 802.3 tok/s
+[21:29:41] cooldown 30s 
+  CTL N=16384 2box@2048: 764.4 tok/s
+  → CTL N=16384: 2048/1024 = 0.9528
+[21:30:33] cooldown 30s 
+  CTL N=32768 2box@1024: 768.4 tok/s
+[21:31:47] cooldown 30s 
+  CTL N=32768 2box@2048: 753.8 tok/s
+  → CTL N=32768: 2048/1024 = 0.9810
+XOVER-CTL-DONE
+[21:33:02] XOVER2-ALL-DONE

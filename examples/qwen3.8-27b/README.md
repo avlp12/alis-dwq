@@ -584,3 +584,25 @@ Raw records for 12-14: `results/ane_retune.jsonl` (per-factor sweep, four rotati
 point), `results/ane_confirm.jsonl` (confirmation of the operating point),
 `results/ane_twobox.log` and `results/ane_twobox_*.json` (two-box composition, with and
 without the loader patch, plus the same-run ANE-off control).
+
+15. **Decompose a crossover before you explain it, with a control the in-process
+    alternation cannot give you.** We credited our composition crossover to chunk
+    count amortising the pipeline bubble. Sweeping eight prompt lengths with the
+    accelerator *detached* showed the wide chunk never wins without it, anywhere in
+    8K-32K. Two curves move oppositely — bubble cost shrinks with length (-9.8% →
+    -1.9%) while the offload gain grows (+4.7% → +13.4%) — and the crossover is
+    simply where the second passes the first. The decomposition reproduces every
+    measured ratio, including the tie at 10240 where 7.8% meets 7.5%.
+16. **A threshold belongs where the gain clears the noise, not where the sign
+    flips.** Our curves cross near 9216 tokens, but 9216-10240 measured as a tie
+    (ratios 1.003 and 1.001). Switching inside a tie earns nothing and risks
+    landing on the wrong side of the real crossover, so the shipped threshold is
+    the first length with a gain outside the noise: 11264. Zero opportunity cost.
+17. **Bake the measured value; leave the switch with the user.** The threshold is
+    a default worth hard-coding. *Enabling* the branch is not: without the
+    accelerator attached it is a pure loss at every length we measured, so the
+    flag that turns it on stays opt-in while the number it uses is measured.
+
+Raw records for 15-17: `results/ane_xover.json` + `results/ane_xover_fine.json`
+(offload attached, both schedules alternated in one process),
+`results/ane_xover_ctl.json` (offload detached), `results/ane_xover.log`.
