@@ -1,16 +1,16 @@
 # Offloading part of a quantized model to a second accelerator
 
-> **CORRECTION (2026-08-21).** The campaign behind this document reached the
-> wrong verdict, and the method section that matters most is the reason why.
-> The accelerator path I measured as destroying output quality does not: driven
-> the way the vendor's own engine drives it — pre-load patches, then a load-time
-> warm-up of every compiled program — it delivers **mean KL 0.000264 and 100%
-> top-1 agreement**. My harness bypassed that warm-up, so every program's first
-> execution returned garbage, and I attributed the result to INT8 precision.
-> Sections 7 and 8 below (silent no-ops; first-execution bugs) are the ones that
-> should have caught it, and I wrote them without applying them to my own setup.
-> The precision arithmetic in §4 and the simulator method in §5 stand. The
-> conclusion drawn from them does not.
+> **CORRECTED (2026-08-21).** This document was written to explain why an
+> accelerator offload was not worth taking. It was worth taking: driven through
+> the vendor's own entry sequence — pre-load patches, then a load-time warm-up of
+> every compiled program — the path delivers **+19% prefill at mean KL 0.000264
+> and 100% top-1 agreement**. My harness called the enable function directly and
+> skipped the warm-up, so every program's first execution returned garbage, and I
+> read that as precision loss compounding over sixty-four layers.
+>
+> The method below stands and has been extended with the check that would have
+> caught it (§7b). The worked example it was drawn from reached the wrong verdict,
+> and that is exactly why §7 and §8 are in it.
 
 
 A pattern that keeps reappearing: a machine has a matrix unit sitting idle next
@@ -147,6 +147,37 @@ acting as an accidental barrier.
 Test for it explicitly: run the same program twice and compare both results
 against a reference. If only the first differs, you have an ordering bug, not a
 precision one, and no amount of quantization tuning will fix it.
+
+## 7b. Reproduce through the vendor's entry sequence, never around it
+
+The single most expensive mistake in the campaign behind this document: I called
+the vendor's `enable_*` function directly on a model I had loaded myself, rather
+than driving their engine's own initialisation path. The function worked — the
+accelerator ran, and the runtime's profiler confirmed it with a positive
+operation count. What it skipped was a load-time warm-up of every compiled
+program, without which each program's *first* execution returns garbage.
+
+Every engagement check I had came back positive, so I spent days explaining a
+numerical catastrophe that was an initialisation bug I had introduced.
+
+**Two rules follow.**
+
+*Drive the vendor's path, not the vendor's function.* Find where their engine or
+server initialises the feature and reproduce that whole sequence, in order.
+A public function reachable from outside that sequence is not a supported entry
+point just because it is importable.
+
+*A positive engagement signal is not a positive correctness signal.* §7 says to
+confirm a change ran before concluding it was harmless, and I applied it — the
+accelerator was running. The question I did not ask was whether it had been
+brought up correctly. Find the initialisation the vendor logs (ours printed
+`Warmed N procedures at load`) and confirm **that** line appears, not merely that
+work happened.
+
+The corollary for reading logs: absence of a log line proves nothing until you
+have checked that the module's logs reach your sink at all. Ours did not — the
+patch package's log lines never reached the server's log file, so their absence
+was uninformative in both directions.
 
 ## 8b. Know what "enough" means before you optimize toward it
 
