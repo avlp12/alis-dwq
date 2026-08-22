@@ -603,6 +603,7 @@ without the loader patch, plus the same-run ANE-off control).
     accelerator attached it is a pure loss at every length we measured, so the
     flag that turns it on stays opt-in while the number it uses is measured.
 
+
 Raw records for 15-17: `results/ane_xover.json` + `results/ane_xover_fine.json`
 (offload attached, both schedules alternated in one process),
 `results/ane_xover_ctl.json` (offload detached), `results/ane_xover.log`.
@@ -618,7 +619,10 @@ Raw records for 15-17: `results/ane_xover.json` + `results/ane_xover_fine.json`
     tracks nothing — `attn_v` is high at every budget because under GQA it is 0.33%
     of the parameters, not because it is precious. The first half is a measurement,
     the second is division. Only the second transferred, and it did not need the
-    10M-token calibration to find.
+    10M-token calibration to find. Shipping the first half anyway is what
+    proved it: a raw `in_sum2`-weighted knapsack improved **its own objective by 60.7%**
+    and made full-vocab KL **16-37% worse** than plain uniform 4-bit, and the
+    relative-error variant was still 2-3.6% worse.
 20. **The bytes are not the point — the tensors are.** Promoting five cheap
     tensors bought −17.5% KL for +1.7% size. Spending the *identical* 248 MiB on
     arbitrary mid-depth FFN tensors bought −1.2%. Byte-matched to 0.02%, the two
@@ -641,3 +645,43 @@ Raw records for 15-17: `results/ane_xover.json` + `results/ane_xover_fine.json`
 Raw records for 18-22: `results/ane_*`, and in
 [qwen38_alis_mlx/results/exp16_unsloth](https://github.com/avlp12/qwen38_alis_mlx/tree/main/results/exp16_unsloth)
 — allocation maps, per-tensor sensitivity, and every paired KL run.
+
+23. **When gradients are blocked, measure damage directly — quantize one group, leave the rest
+    bf16, read the KL.** This model's GatedDeltaNet layers have no VJP, so every gradient and DWQ
+    path died in `nan` or OOM. The forward-only probe — 106 groups over 506 quantizable tensors,
+    under an hour — ranked value per byte with no proxy in the chain at all, and its top five were
+    the ones worth shipping. It is the transferable replacement for the imatrix half that did not
+    port.
+24. **Isolated damages are strongly sub-additive — rank with them, never sum them.** Our per-group
+    damages summed to **0.18974**; the build that quantized all of them measured **0.09052**. The
+    sum overstates by 2.1×. Use the ranking to choose, then measure the build you chose; a
+    predicted KL built by addition is not a prediction.
+25. **A predicate that matches nothing completes successfully.** Our first `--bit-map` run matched
+    **9 of 506** tensors, because the map's keys were full tensor paths while the predicate was
+    handed module suffixes. An hour of AWQ produced a silently uniform build, which we briefly
+    read as evidence that promotion "does not compose with AWQ." Read the shipped weights back and
+    assert the packed shapes (8-bit g64 packs `[1024, N]` to `[1024, N/4]`, 4-bit to `[1024, N/8]`);
+    index the map by every path suffix so predicate and map cannot disagree.
+26. **Diff against the bytes you published, by hash, not by filename.** We first reported the
+    6-bit gain as "English not significant, t = −1.4". Against the artifact actually on the Hub it
+    is **t = −10.1**. The baseline had been a local directory whose name matched a variant the
+    model card *mentioned* but had never shipped, and two of three tiers' size conclusions
+    inverted with the correction. Same species, same week: our paired-KL harness treats its
+    **first argument as the reference for all the others**, so four builds on one command line
+    silently compared three of them to the wrong base — visible only in the output labels.
+27. **Bit allocation stops being the dominant error term before you run out of bits.** One recipe,
+    three tiers: **−18.9%** pooled KL at 6-bit, **−8.7%** at 4-bit, and **−2.3% at t = −1.6** — not
+    significant — at 8-bit, the same tier that already tied every other reasonable 8-bit recipe
+    from three different authors. The top build ships graded because it costs nothing (+0.04%
+    size, −0.2% decode), not because it helps.
+
+Raw records for 23-27: `results/grad_probe_smoke.log` and `results/grad_damage_smoke.json`
+(per-group measured damage, 106 groups), `results/grad_marginal*.json` (marginal and group-size
+promotion modes), `results/grad_alloc_*.json` (shipped allocation per tier plus the byte-matched
+control arm), `results/grad_paired_redo.json` and `results/grad_paired_final4.json` (paired KL
+with per-block values, so any pair can be recomputed offline without re-running),
+`results/grad_speed_*.json` (alternating A/B decode and prefill),
+`results/grad_orca_proto2.json` (a competitor's published protocol replicated).
+Scripts: `probe_damage.py`, `build_graded.py`, `kl_paired.py`, `pairwise.py`, `kl_orca.py`,
+`speed_ab.py`. Model-agnostic write-up: [docs/BIT_ALLOCATION.md](../../docs/BIT_ALLOCATION.md).
+
