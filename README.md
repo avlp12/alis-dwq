@@ -526,3 +526,5 @@ The 2026-07-13 batch (LoRA compensators, CKA monitor, `code_entropy`, `gen_calib
 ## License
 
 MIT
+
+- [examples/deepseek-v4-flash](examples/deepseek-v4-flash/README.md) — port-fidelity audit: 3 stacked numerical deviations (rope assignment / pool-mask causality / pool-row rope) triangulated against 3 references, adversarially verified, fixed & validated ([docs §11](docs/PORTING_INTEGRITY.md))

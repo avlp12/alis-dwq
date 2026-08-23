@@ -461,3 +461,42 @@ was +43%.
 A build that clears A–F has cleared the failure modes that load cleanly, pass every
 structural check, and still ship the wrong thing. It does not check quality — measure that
 separately.
+
+## 11. Audit a port's numerics against *multiple* references before trusting any single deviation story (DeepSeek-V4-Flash case)
+
+**Why.** A port can be "coherent at short context, broken at long context" for several
+stacked reasons at once, and fixing the loudest one makes the output *look* healed while
+quieter deviations keep degrading quality in ways you stop noticing. Measured case:
+mlx-lm PR #1189's DeepSeek-V4-Flash port carried **three independent deviations** —
+(a) per-layer rope/YaRN assignment collapsed to one global rope (the layer-conditional
+`compress_rope_theta` instance was created but never called — dead code is the tell),
+(b) the compressed-pool prefill mask was all-zeros where the reference clamps per query
+`i < (p+1)//ratio` (future leakage → optimistic teacher-forced evals + prefill/decode
+inconsistency), and (c) pool rows were never rotated (the reference applies
+compress-theta rope at each row's block-start position, `i·ratio`). Fixing (a) alone made
+4.9K-token generation coherent; the residual "occasional CJK token slips at 19K" — easy
+to shrug off as quantization noise — was (c).
+
+**Fix — triangulate with ≥3 references, then adversarially verify.** The procedure that
+held up: pull the official reference, the transformers implementation, and one
+independent port (FreeToken); derive the disputed rule from each *separately*; only claims
+where all three agree go into the bug report. Then run two adversarial passes — one agent
+briefed to *refute* each claim, one blank-slate agent that re-derives the rules without
+seeing the claims — before publishing. The red team caught a real error in our own
+follow-up (a "semantically identical" alternative that silently dropped a √D factor)
+that the maintainer would have found in minutes.
+
+**Oracles.**
+- *Differential coherence:* same long-document prompt through the port and through an
+  independent runtime (llama.cpp) — localizes breakage to the port without needing logits.
+- *CJK-slip count:* for an English-output task, `len(re.findall(r'[一-鿿぀-ヿ가-힯]', out))`
+  is a cheap long-range-degradation counter. Before the pool-rope fix: slips present at
+  19K on every run; after: 0/250 tokens on the same task. A metric this crude still
+  cleanly separated fixed from unfixed.
+- *Attribution humility:* if a threshold coincides with a config constant
+  (`index_topk × ratio = 2048` ≈ the observed ~2K breakage onset), report the
+  differential measurement and *decline* to name a single cause. The upstream comment
+  survives review; the confident version would not have.
+
+Receipts: [examples/deepseek-v4-flash](../examples/deepseek-v4-flash/README.md) —
+verified fix, validation harness, and the published upstream comments.
