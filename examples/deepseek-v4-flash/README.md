@@ -22,3 +22,14 @@ Published upstream:
 
 Note: a pack with restored MTP shards is rejected by the stock loader ("unexpected
 weights"); validate through a premtp-index symlink view of the pack.
+
+## On-policy chain-alignment of the MTP head (2026-08-24)
+
+`train_align.py` — teacher-forced chain SFT of the head's non-expert weights (74M params,
+bf16), routing around four VJP blockers along the way (routed-expert gather, custom fused
+kernels, residual quantized weights, fused attention kernel). Live result: depth-1 conditional
+accept 81.5% → 95.6%, depth-2 43.2% → 66.7%, depth-3 9.8% → 34.5%. A follow-up LoRA extension
+onto the quantized shared-expert layers trained cleanly (gradient verified nonzero) but
+regressed every live metric despite an *improved* self-reported eval score — see
+[PORTING_INTEGRITY.md §12](../../docs/PORTING_INTEGRITY.md#12-fine-tuning-through-a-quantized-moe-forward-four-vjp-blockers-in-the-order-you-hit-them-and-why-a-working-gradient-still-isnt-a-working-result)
+for the full failure-mode writeup and the reusable VJP-blocker patterns.

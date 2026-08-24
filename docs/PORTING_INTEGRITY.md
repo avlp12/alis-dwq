@@ -500,3 +500,117 @@ that the maintainer would have found in minutes.
 
 Receipts: [examples/deepseek-v4-flash](../examples/deepseek-v4-flash/README.md) —
 verified fix, validation harness, and the published upstream comments.
+
+## 12. Fine-tuning through a quantized MoE forward: four VJP blockers, in the order you hit them, and why a working gradient still isn't a working result
+
+**Why.** A draft/speculative-decoding head sitting on top of a quantized MoE backbone is a
+common shape now (DeepSeek-family MTP, most speculative-decoding retrofits). If its acceptance
+rate is disappointing, the fix looks like "fine-tune the head" — except every layer in the path
+is some mix of frozen quantized weights and custom fused Metal kernels, none of which expose a
+gradient. The blockers don't announce themselves as a group; they surface one at a time, each
+looking like a different bug, in a fixed order dictated by how far the backward pass gets before
+it hits the next wall. Measured case: aligning a DeepSeek-V4-style MTP head's non-expert weights
+(attention, projections, norms — 74M params, bf16) via teacher-forced chain SFT, backbone
+producing hidden states as a frozen teacher (`stop_gradient` on the hidden, never on the loss
+graph downstream of the trainable block).
+
+**The four blockers, in the order they appear:**
+
+1. **Routed-expert gather has no VJP.** `RuntimeError: [Primitive::vjp] Not implemented for
+   <QuantizedMxfp4GatherBlocks-style primitive>`. The MoE forward's routed path (`switch_mlp` /
+   equivalent) selects a handful of experts per token via a gather over the packed quantized
+   weight table — differentiating through that gather isn't implemented, full stop, regardless
+   of what's frozen. Fix: `stop_gradient` on exactly the routed-expert output, computed inline
+   inside a reimplementation of the MoE forward — **not** the whole MoE output, because the next
+   term (below) needs gradient. Reference implementation:
+   ```python
+   def moe_forward_grad_safe(self, x, input_ids):
+       inds, scores = self.gate(x, input_ids)
+       y = self.switch_mlp(x, inds, scores=scores)
+       if y.ndim == scores.ndim + 1:
+           y = (y * scores[..., None].astype(y.dtype)).sum(-2)
+       y = mx.stop_gradient(y)              # routed path: gather VJP doesn't exist
+       y = y + self.shared_experts(x)       # shared path: ordinary matmul, differentiable
+       return y
+   ```
+   The naive fix — monkey-patching `MoE.__call__` to `stop_gradient` its *entire* return value —
+   compiles, trains, and silently produces zero gradient anywhere downstream of any MoE call.
+   It takes a second bug (below, item 4 in the failure sequence you'll actually hit) to notice.
+
+2. **Custom fused kernels (hyper-connection mixers, gating collapses, anything written as
+   `mx.fast.metal_kernel`) have no VJP either**, but for a different reason than #1 — these
+   aren't quantized, they're just forward-only kernels with no registered backward. Many such
+   modules already carry a `self.training` branch that falls back to a plain-ops implementation
+   for numerical-stability or CPU reasons — that fallback is differentiable even though the fast
+   path isn't. Fix: call `.train()` on exactly the sub-module you're fine-tuning before the
+   forward pass. Cheap and often already there for a different reason, easy to miss.
+
+3. **Residual quantized weights the class instantiates on the side (output projections, packed
+   grouped-projection layers) raise on the actual weight, not on a gather.**
+   `RuntimeError: [QuantizedMatmul::vjp] no gradient wrt the quantized weights.` This is a
+   distinct failure from #1 — it fires only if something (typically a blanket `.unfreeze()` on a
+   parent module) leaves a quantized `Linear` unfrozen. `unfreeze()` on a container recursively
+   unfreezes every leaf underneath it, including quantized ones you meant to leave alone, so a
+   single `block.unfreeze()` followed by "refreeze what should stay frozen" needs an explicit
+   sweep, not a name-based exclude list — new quantized submodules the exclude list didn't
+   anticipate will surface this same error one at a time as the model architecture evolves:
+   ```python
+   def freeze_quantized(module):
+       stack = [module]
+       while stack:
+           cur = stack.pop()
+           for child in (cur.children().values() if isinstance(cur.children(), dict)
+                        else cur.children()):
+               if isinstance(child, nn.Module):
+                   (child.freeze() if hasattr(child, "scales") else stack.append(child))
+   ```
+
+4. **A model-specific fused attention kernel, if one exists in the serving stack, will also lack
+   a VJP** — same category as #2, but often not gated behind `self.training` because it was never
+   meant to run under gradient tracking. Fix is blunter: monkey-patch the kernel entry point to
+   `None`/no-op for the duration of training, so the call site's own stock-attention fallback
+   takes over (most serving stacks have one, since the fused kernel usually has a coverage gate
+   already — training just needs to force the "kernel unavailable" branch).
+
+**Whether the resulting gradient is worth anything is a separate question from whether it
+compiles.** With all four blockers routed around, the *trainable* surface is small — norms,
+attention projections, embedding-adjacent linears — 74M parameters here. That's cheap to extend
+further: wrap a quantized shared-expert `Linear` in a parallel low-rank adapter (dequantize
+nothing, just add a differentiable side path) —
+
+```python
+class LoRALinear(nn.Module):
+    def __init__(self, base, r=16, alpha=16.0):
+        super().__init__()
+        self.base = base                                    # frozen quantized layer
+        out_dim, in_dim = base.weight.shape[0], base.scales.shape[1] * base.group_size
+        self.lora_a = mx.random.normal((in_dim, r)).astype(mx.bfloat16) / (r ** 0.5)
+        self.lora_b = mx.zeros((r, out_dim)).astype(mx.bfloat16)  # zero-init: starts == base
+        self.alpha_over_r = alpha / r
+        self.base.freeze()
+
+    def __call__(self, x):
+        y = mx.stop_gradient(self.base(x))
+        return y + self.alpha_over_r * ((x.astype(mx.bfloat16) @ self.lora_a) @ self.lora_b)
+```
+
+This attaches cleanly, the gradient measurably flows into `lora_a`/`lora_b` (verified: nonzero
+per-parameter grad norm), teacher-forced held-out accuracy improves after training. **Live
+acceptance regressed across every metric anyway** — depth-1 conditional accept 95.6% → 85.7%,
+depth-2 66.7% → 58.9%, depth-3 34.5% → 11.3%, tokens/cycle 2.81 → 2.44, on the *same* fixed-depth
+chained-decode harness the pre-LoRA checkpoint was measured on. The self-reported eval set (model's
+own greedy continuations, teacher-forced) went the other way — 95.9% → 96.5% — which is precisely
+the failure mode item 6 of the on-policy port-fidelity work already flagged: an on-policy
+*evaluation* set is still an evaluation the model is scored on by itself, and self-evaluation
+optimism is not bounded by "on-policy" the way self-evaluation optimism from an *off*-policy
+corpus is. The suspected mechanism here: the LoRA delta had nothing new to fit (same corpus,
+continued from the checkpoint already converged on it), so 1500 more steps pushed the shared-expert
+output slightly off whatever narrow operating point the frozen expert weights and the head had
+already found together — a regression a held-out *live* chained-decode measurement caught
+immediately and a same-corpus self-eval could not.
+
+**Oracle.** Never trust a fine-tune of a speculative-decode head on self-graded metrics alone —
+teacher-forced accuracy on the model's own generations, even nominally "held out," can move
+opposite to the number that actually matters (live chained acceptance rate on fresh prompts,
+measured through the real serving harness with the actual sampler). Gate every checkpoint
+promotion on the live number, not the training log.
