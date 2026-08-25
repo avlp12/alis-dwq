@@ -614,3 +614,199 @@ teacher-forced accuracy on the model's own generations, even nominally "held out
 opposite to the number that actually matters (live chained acceptance rate on fresh prompts,
 measured through the real serving harness with the actual sampler). Gate every checkpoint
 promotion on the live number, not the training log.
+
+## 13. Train on the measured residual, not on a model of it — and verify in the regime you actually serve
+
+**Why.** §12 ends with a draft head that fine-tunes cleanly and regresses live. This is the
+sequel — same head, same stack, seven more rounds — and what decided it was not the optimizer or
+the adapter but two things neither the training log nor the eval log can show you: *which
+distribution the head is trained on*, and *which regime the offline eval runs in*. Measured case:
+the same DeepSeek-V4-style MTP head, chain-aligned on single-box hidden states, serving under
+2-box tensor parallelism.
+
+**The gap being closed.** The backbone does not produce the same hidden states on one box and on
+two. Measured single-box↔TP2 hidden-state drift: **≈0.4% relative std, kurtosis 414** — decidedly not
+Gaussian, concentrated in a few positions and channels. Promoting every `all_sum` to fp32 changed
+the hidden states *not at all* (bit-identical output), which is itself the diagnosis: the
+divergence lives in the K-split partial sums of the row-parallel GEMMs, not in the reduction's
+precision — summing already-diverged partials exactly is still exact, and still different. The
+phenomenon is independently established (arXiv 2511.17826 on deterministic inference across TP
+sizes; DeepSpeed #7500; vLLM's batch-invariant kernel work; NVIDIA NeMo-RL's TP notes), and none
+of those fixes reach a speculative-decoding path — which is why this had to be trained around
+rather than engineered away.
+
+**Three rounds that never showed the head a single real TP2 hidden state.** Rounds 3–5 each
+continued from the same round-2 checkpoint on the same on-policy corpus, and each tried to close
+the gap without leaving the single box: a LoRA side path on the quantized shared experts adding
+capacity (§12), then Gaussian noise at 1% and at 0.3% of `h.std()` meant to *imitate* the drift.
+Live, on a fixed-depth chained-decode harness under TP2 (single prompt, `d1/d2/d3` = conditional
+accept at chain depth 1/2/3):
+
+| round | what it trained on | d1 | d2 | d3 | tok/cycle |
+|---|---|---|---|---|---|
+| 2 (baseline) | single-box hidden, on-policy chain alignment | 81.9% | 61.6% | 18.9% | 2.44 |
+| 3 | + LoRA on quantized shared experts | regressed on every metric (§12) | | | |
+| 4 | + Gaussian noise, 1% of `h.std()` | 71.8% | 53.6% | 17.8% | 2.19 |
+| 5 | + Gaussian noise, 0.3% | 68.9% | 48.8% | 19.5% | 2.10 |
+| 6a | **measured TP2 hidden**, 60 windows | 79.1% | 54.0% | 21.3% | 2.33 |
+| 6b | measured TP2 hidden, 297 windows (4.9× corpus) | 78.3% | 59.0% | 34.7% | 2.42 |
+
+Each of those rounds moved the *offline* teacher-forced score the wrong way relative to live:
+round 4 read d1 98.8% / d2 97.0% offline while live d1 fell ten points. Three losses on three
+mechanistically different attempts is the tell that the idea is wrong, not its hyperparameter —
+and four independent literatures name the same replacement. Sim-to-real budget allocation
+(arXiv 2606.22062) says buy real samples rather than wider randomization; Draft-OPD
+(arXiv 2605.29343) trains draft heads on the deployment distribution; structured-perturbation
+work (TeKAP, ICLR 2025) says the perturbation's *structure* is the thing that matters; and
+residual bootstrap is the century-old statistical form of all three — resample the residual you
+measured, don't assume its shape.
+
+**The fix is boring: capture the real hidden states and train on those.** A forward-only TP2 pass
+(ring backend, no gradients — the safe kind of distributed run) over exactly the training windows,
+hidden states cached to disk, and a `--real-hidden` flag that substitutes the cache where the
+trainer would otherwise have run — and noised — a single-box forward. That is not even a
+bootstrap; it is paired data. Round 6a (60 windows) pulled d1 back from 68.9% to 79.1% and still
+lost overall. **Corpus size was the second lever, and a bigger one than expected**: 4.9× the
+corpus (497 KB, 297 windows) took depth-3 acceptance from the baseline's 18.9% to 34.7%, and 11×
+(1.16 MB, 697 windows of 384 tokens; 663 train / 34 eval) held the win with clearly diminishing
+returns. Both ends of that are cheap: the corpus is the model's own greedy self-continuations from
+seed topics, generated on one box (400 more of them in 79 minutes), and capture runs at 0.8 s per
+window — the 297-window corpus in 4 minutes.
+
+**A single-prompt live measurement will lie to you about which checkpoint won.** On one topic,
+round 6b read 2.42 tok/cycle against the baseline's 2.44 — a loss, and nearly the end of the
+line. Pooled over 8 topics with both arms run on the same prompts, 6b **won at +1.1%**. Nothing
+changed but the sample size.
+
+**And the regime you verify in has to be the regime you ship.** An audit of that promotion caught
+the next fault: the 8-topic comparison had to set `OMLX_MTP_ROWWISE_BATCH=1` to force MTP on at
+batch size 8 (the stack auto-disables it there, because plain batched decode is faster) — and
+that override exists nowhere in the launcher, so production runs MTP at **batch size 1 only**.
+The promotion evidence had been collected in a regime production never enters. Re-run at bs1 over
+24 topics (16 deliberately outside the training corpus's CS-heavy seed topics), paired per topic:
+
+| bs1 × 24 topics, pooled | d1 | d2 | d3 | tok/cycle | sign test |
+|---|---|---|---|---|---|
+| round 2 (baseline) | 78.1% | 59.5% | 24.7% | 2.371 | — |
+| **round 6c (promoted)** | **79.3%** | **61.3%** | **34.3%** | **2.459 (+3.68%)** | 19W / 4L / 1T, **p = 0.0026** |
+
+The depth-1 deficit seen at bs8 (74.1% vs 76.5%) *inverted* at bs1, and non-CS topics gained
+**more** than CS topics (mean Δtok/cycle +0.106 vs +0.064) — which answers "did the training
+corpus just contaminate the eval topics" with the opposite of the feared sign. **Paired
+per-prompt, sign test, domain split** is the minimum bar; a single pooled ratio would have thrown
+away round 6b and shipped round 6c on a regime nobody runs.
+
+### 13a. The offline eval was scoring a distribution the server never produces
+
+Through every round above, the offline teacher-forced depth-1 score sat between **0.985 and
+0.990** while live depth-1 acceptance sat at **76–79%**. §12 attributes that kind of gap to
+self-evaluation optimism and prescribes gating on the live number — correct, and not the whole
+story. Underneath it were two stacked measurement faults, and only the first is fixable.
+
+**Layer 1 — capture-regime mismatch.** The training data was captured as one 384-token prefill
+with `cache=None`. Serving never does that: it bulk-prefills the prompt *through a cache object*
+and then decodes new tokens one at a time on top of it. Three measurements, all in one process on
+identical token windows, decompose the difference:
+
+- **The cache object itself dominates.** Same model, same 320 tokens, cache-mediated vs
+  `cache=None`: raw-hidden relative distance **0.742**. Same tokens, same code, different kernel
+  dispatch — the rotating-KV and pooling-cache machinery changes the prefill hidden states, so the
+  training data was unfaithful *in the prompt region too*, not only in the decode region.
+- **Sequence length changes the prefill.** Comparing the first 320 positions of a 384-token
+  prefill against a 320-token prefill (both `cache=None`): rel **0.232**, where pure causal
+  attention would give 0 — the sparse indexer and pooling paths are whole-length dependent.
+- **Self-comparison 0.000**, as the sanity control that keeps the two numbers above honest.
+
+A serving-faithful probe (320-token bulk prefill through the cache, then 64 teacher-forced
+single-token decode steps on that cache) put the prefill-vs-decode hidden distance at median rel
+**0.819** — about **205×** the 0.4% TP2 drift the whole campaign was chasing. That number alone
+over-alarms: the backbone's own `lm_head` still agreed on **91.7%** of argmaxes across the two
+regimes and produced fluent text, because the head's norm absorbs most of the raw distance. The
+number that mattered came from feeding both regimes into the *actual promoted draft head*:
+depth-1 cross-agreement **78.6%**, teacher-forced accuracy **97.4% on prefill hidden vs 77.6% on
+decode hidden (−19.8 pp)**, depth-2 −31.8 pp. And **77.6% ≈ the live depth-1 acceptance of
+79.3%** — the five-round mystery explained by one measurement. The backbone is robust to the
+regime change; the draft head, trained only on cache-free prefill states, is not.
+
+Recapturing the corpus serving-faithfully restored the offline eval's usefulness immediately: the
+*unchanged* baseline head, scored on cache-mediated hidden states, reads d1 **0.807** / d2
+**0.570** — the first offline number in the campaign of the same order as live acceptance, against
+**0.989 / 0.906** for the same head on the old capture.
+
+**Layer 2 — fixing the capture still does not recover the gap.** Round 6e recaptured all 697
+windows serving-faithfully and retrained with the loss restricted to the decode positions
+(`--loss-start-pos 320`, attention context still full-sequence). Offline it did exactly what the
+probe predicted: **d1 0.807 → 0.846, d2 0.570 → 0.744**. Live, bs1 × 24 paired: **tok/cycle 2.436
+vs 6c's 2.459 — −0.91%, 8W / 13L / 3T, p = 0.38**, indistinguishable. The "up to 18 pp of
+headroom" the probe appeared to promise did not exist.
+
+**The transferable lesson: offline-eval sensitivity is not recoverable headroom.** The probe
+measured how much the head's predictions move when the hidden-state regime changes. That is a
+real, useful number — it correctly proved the training data unfaithful and correctly predicted
+the offline gain. It says nothing about how much *live* acceptance is winnable, because the
+remaining gap is not in the hidden states at all: it is in the live loop's conditional structure.
+The positions the drafter is asked about are acceptance-dependent; the chain's depth-2/3 inputs
+are its own depth-1 outputs, not teacher-forced tokens; the prompt-priming history differs.
+Nothing captured from a dump reproduces that at any fidelity — closing it needs training *through
+the live loop* (gradients co-resident with collective communication, the high-risk combination
+this campaign crashed on repeatedly), not a better dump. Park it honestly instead of buying a
+fourth round of the same idea.
+
+**And the adapter still loses when it rides on correct data.** Round 6d is round 6c's exact recipe
+plus the shared-expert LoRA (r=16, α=16), so the adapter is the only variable. Offline it landed
+slightly *below* 6c (d2 0.961 vs 0.968); live (8-topic pooled) it fell back to baseline shape —
+d1 76.6% / d2 56.4% / d3 24.9% / **tok/cycle 2.317**, against 6c's 2.346 and the baseline's 2.312.
+The adapter erases the gain the measured-residual data bought. Two mechanics are worth keeping
+even though that round closed the line for good:
+
+- **A path-based sharder will slice your adapter.** The serving stack's in-place sharder walks
+  parameter paths and splits everything under the module it is handed — `lora_a` (4096→2048) and
+  `lora_b` (16→8) both got cut, a double corruption whose crash was first (wrongly) blamed on the
+  model sharder. Fold the adapter into the base weight instead of attaching it, and it shards like
+  any ordinary layer.
+- **Merge in fp32, cast once at the end.** `W' = W + (α/r)·(A@B)ᵀ`, computed against the fp32
+  dequantized base and cast to bf16 only after the addition — accumulating a small delta directly
+  in bf16 rounds part of it away. Persist `α` and `r` in a sidecar written at checkpoint time
+  rather than inferring them at merge time, and check the merged path against the attached path
+  before trusting it (measured: rel 4.8e-3, ≈ 1 bf16 ULP). Wire the merge into *both* the bench
+  harness and the server: a `load_weights(..., strict=False)` accepts a checkpoint full of
+  `lora_*` keys and silently serves the base weights.
+
+### 13b. Two distributed-capture pitfalls, cheap to avoid and expensive to debug
+
+- **When a distributed script crashes, first check that both ranks see the same input.** A corpus
+  manifest holding hard-coded `/Users/<box-a-user>/…` paths meant the second box's corpus builder
+  hit a swallowed exception and returned **zero windows**; that rank died indexing `windows[0]`,
+  its partner hung waiting for a forward that would never come, and the whole thing surfaced as a
+  ring EPIPE cascade with no traceback. Three hours went into GPU-timeout, long-context,
+  double-patching and resource-accumulation hypotheses first. Every single-shot isolation test had
+  passed because they all called `os.path.expanduser("~/…")` directly and never went through the
+  manifest. Make manifests `~`-relative and expand on read.
+- **A resumable capture must broadcast its skip decision.** Skipping a window because its file
+  already exists is a *collective* decision — the forward does send/recv/all-gather, so a rank
+  that skips alone hangs its partner forever. Decide on rank 0, then `all_sum` a 0/1 flag to keep
+  the ranks in lockstep. (Adjacent trap: `mx.save_safetensors` appends `.safetensors` when the
+  path does not already end in it, so the obvious `x.safetensors.tmp` atomic-write temp name is
+  written as `x.safetensors.tmp.safetensors` and the following `os.replace` raises
+  `FileNotFoundError` — name the temp file so it ends in `.safetensors`.) With both in place, 697
+  windows captured in 82.4 minutes, zero crashes, correct resume across an interruption.
+
+**Oracles.**
+- *Regime parity before trusting any offline eval.* Run the eval's capture path and the serving
+  path over the same tokens, and compare what the *consumer* does with the result, not the tensors
+  themselves. Here the raw-tensor distance (rel 0.82) over-alarmed by two orders of magnitude, the
+  backbone's argmax agreement (91.7%) under-alarmed, and only the draft head's own cross-agreement
+  (78.6%) predicted live behavior.
+- *Promotion gate.* Paired on identical prompts, ≥ 20 prompts, sign test, a domain split that
+  deliberately includes prompts unlike the training corpus — and an explicit check that the batch
+  size and feature flags you measured under are ones the launcher actually sets.
+- *Stop rule.* When the third mechanistically different attempt at the same idea fails, the idea
+  is what is wrong. Three rounds of closing the gap without leaving the single box all lost; the
+  first round trained on captured hidden states recovered most of it, and the second won.
+- *Sensitivity ≠ headroom.* A probe showing that an offline metric is sensitive to some regime
+  bounds nothing about live gain. Treat it as a reason to fix the measurement, and forecast the
+  live win only from a live paired run.
+
+Receipts: [examples/deepseek-v4-flash](../examples/deepseek-v4-flash/README.md) — capture scripts,
+the trainer with `--real-hidden` / `--loss-start-pos` / LoRA merge, the paired analyzer, and the
+verified command for every round above.

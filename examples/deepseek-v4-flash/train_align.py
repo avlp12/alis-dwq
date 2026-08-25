@@ -79,6 +79,81 @@ def attach_lora_shared_experts(block, r=16, alpha=16.0):
     return n
 
 
+def merge_lora_into_shared_experts(block, ckpt_weights, alpha_over_r=None,
+                                   ckpt_path=None):
+    """ckpt의 lora_{a,b} 키를 base(affine 4bit)에 병합해 bf16 Linear로 교체.
+    반환: 병합한 proj 수. lora 키가 없으면 0 반환하고 아무것도 안 함.
+
+    관례: y = x @ Wᵀ, LoRA 순전파 y = base(x) + (alpha/r)·(x@lora_a)@lora_b
+          → W' = W + (alpha/r)·(lora_a @ lora_b)ᵀ
+
+    부착(LoRALinear) 대신 병합하는 이유: 라이브 TP2의 shard_inplace는 경로 기반
+    전수 분할이라 lora_a/lora_b까지 잘라 크래시한다. 평범한 bf16 Linear로 접어
+    두면 promote_nonexpert 전례대로 정상 샤딩된다.
+    델타는 fp32로 계산해 dequant(fp32)와 합산한 뒤 마지막에만 bf16 캐스트 —
+    bf16 직접 누적은 작은 델타가 반올림으로 소실될 수 있다.
+
+    ckpt_path: alpha/r 사이드카(lora_meta.json) 탐색용 체크포인트 파일 경로.
+    """
+    prefix = "block.ffn.shared_experts."
+    if not any(k.startswith(prefix) and k.endswith(".lora_a") for k in ckpt_weights):
+        return 0
+
+    if alpha_over_r is not None:
+        src = "호출 인자"
+    else:
+        meta, meta_path = None, ""
+        if ckpt_path:
+            meta_path = os.path.join(os.path.dirname(os.path.abspath(ckpt_path)),
+                                     "lora_meta.json")
+            if os.path.exists(meta_path):
+                try:
+                    with open(meta_path) as f:
+                        meta = json.load(f)
+                except Exception as e:
+                    print(f"[merge] lora_meta.json 읽기 실패({e}) — 기본값으로", flush=True)
+                    meta = None
+        if meta and "alpha_over_r" in meta:
+            alpha_over_r = float(meta["alpha_over_r"]); src = f"사이드카 {meta_path}"
+        elif meta and "alpha" in meta and "r" in meta:
+            alpha_over_r = float(meta["alpha"]) / float(meta["r"])
+            src = f"사이드카 {meta_path}"
+        else:
+            alpha_over_r = 1.0; src = "기본값(r16/alpha16)"
+    print(f"[merge] alpha/r = {alpha_over_r:.6g} (출처: {src})", flush=True)
+
+    se = block.block.ffn.shared_experts
+    n = 0
+    for attr in ("gate_proj", "up_proj", "down_proj"):
+        ka, kb = prefix + attr + ".lora_a", prefix + attr + ".lora_b"
+        if ka not in ckpt_weights or kb not in ckpt_weights:
+            continue
+        m = getattr(se, attr, None)
+        if m is None:
+            continue
+        base = getattr(m, "base", m)  # 이미 LoRALinear가 붙어 있어도 안전
+        if hasattr(base, "scales"):
+            w = mx.dequantize(base.weight, base.scales, getattr(base, "biases", None),
+                              base.group_size, base.bits,
+                              mode=getattr(base, "mode", "affine")).astype(mx.float32)
+        else:
+            w = base.weight.astype(mx.float32)
+        a = ckpt_weights[ka].astype(mx.float32)
+        b = ckpt_weights[kb].astype(mx.float32)
+        delta = (a @ b).T * alpha_over_r          # [in,r]@[r,out] → [in,out] → [out,in]
+        if delta.shape != w.shape:
+            raise ValueError(f"{attr} LoRA 형상 불일치: delta {delta.shape} vs W {w.shape}")
+        w = w + delta
+        lin = nn.Linear(w.shape[1], w.shape[0], bias=hasattr(base, "bias"))
+        lin.weight = w.astype(mx.bfloat16)
+        if hasattr(base, "bias"):
+            lin.bias = base.bias.astype(mx.bfloat16)
+        setattr(se, attr, lin)
+        mx.eval(lin.parameters())   # fp32 임시항 즉시 해제
+        n += 1
+    return n
+
+
 def build_corpus(tok, seq_len, files):
     windows = []
     for f in files:
@@ -91,6 +166,44 @@ def build_corpus(tok, seq_len, files):
             windows.append(ids[i:i + seq_len + 3])  # +3: t+1/t+2/t+3 시프트 여유
     random.shuffle(windows)
     return windows
+
+
+def load_real_hidden(path):
+    """--real-hidden 로더 — 두 형태 모두 지원:
+    1) 단일 파일 쌍(base): <base>.safetensors(키 h_0..h_{N-1}) + <base>_ids.json(윈도우 리스트).
+       기존 r6/r6b/r6c 캐시 형태 — 전량을 한 번에 메모리에 로드.
+    2) [Round6e] 디렉터리(r6e_h류): h_{i}.safetensors(키 "h") + ids_{i}.json 개별 파일.
+       ids_{i}.json을 모아 인덱스 오름차순으로 windows를 재구성하고, h는 스텝마다
+       mx.load로 lazy 로드(윈도우당 ~24MB라 IO 무시 가능 — 전량을 미리 올리지 않아
+       메모리 절약 + 재캡처 도중에도(재개 로직으로 일부만 존재해도) 안전).
+
+    반환: (windows, get_h, file_idx) — file_idx[j]는 windows[j]에 대응하는 실제 파일
+    인덱스(디렉터리 모드는 위치==파일인덱스라고 가정하지 않음 — 재캡처 중간에 빈틈이
+    있어도 안전하도록 분리). get_h(idx)는 파일 인덱스를 받아 [1,S,4,D] mx.array 반환.
+    """
+    if os.path.isdir(path):
+        ids_files = glob.glob(os.path.join(path, "ids_*.json"))
+        idxs = sorted(
+            int(os.path.basename(f)[len("ids_"):-len(".json")]) for f in ids_files
+        )
+        windows = []
+        for i in idxs:
+            with open(os.path.join(path, f"ids_{i}.json")) as f:
+                windows.append(json.load(f))
+
+        def get_h(i):
+            return mx.load(os.path.join(path, f"h_{i}.safetensors"))["h"]
+
+        return windows, get_h, idxs
+    else:
+        with open(path + "_ids.json") as f:
+            windows = json.load(f)
+        h_all = mx.load(path + ".safetensors")
+
+        def get_h(i):
+            return h_all[f"h_{i}"]
+
+        return windows, get_h, list(range(len(windows)))
 
 
 def main():
@@ -110,6 +223,19 @@ def main():
                     help="mtp.0의 shared_experts에 LoRA 부착(전문가 표현력 확장)")
     ap.add_argument("--lora-r", type=int, default=16)
     ap.add_argument("--lora-alpha", type=float, default=16.0)
+    ap.add_argument("--noise-std", type=float, default=0.0,
+                    help="[I305] TP2 hidden 분포 강건화용 훈련-시-노이즈 (h.std() 대비 배율, 실측 ~0.004)")
+    ap.add_argument("--real-hidden", default="",
+                    help="[Round6] 실측 TP2 hidden 캐시 base path (합성 노이즈 대신 진짜 "
+                         "TP2 forward-only 캡처 사용 — <base>.safetensors + <base>_ids.json). "
+                         "디렉터리를 주면 [Round6e] r6e_h류 개별 파일 형태(h_{i}.safetensors + "
+                         "ids_{i}.json)로 lazy 로드한다.")
+    ap.add_argument("--loss-start-pos", type=int, default=0,
+                    help="[Round6e] CE 손실(d1·d2 둘 다)을 이 위치 이상의 시퀀스 위치에서만 "
+                         "계산 — chain_logits 자체는 전체 시퀀스로 돌려 어텐션 문맥은 유지하고, "
+                         "cross_entropy 직전에 z1/z2·타깃을 [:, N:]로 슬라이스한다. 서빙-충실 "
+                         "디코드 구간(예: 320)만 놓고 훈련/평가하고 싶을 때 사용. eval_match도 "
+                         "동일 인자로 슬라이스해 훈련-평가 정합을 유지한다.")
     args = ap.parse_args()
 
     model, tok = load(args.model, lazy=True)
@@ -131,8 +257,6 @@ def main():
     # 양자화 잔존 모듈(wo_a/wo_b 등)은 grad 불가 — 일괄 재동결 스윕
     def _freeze_quantized(m):
         n = 0
-        for _, child in m.children().items() if isinstance(m.children(), dict) else []:
-            pass
         stack = [m]
         while stack:
             cur = stack.pop()
@@ -186,11 +310,23 @@ def main():
     n_train = sum(v.size for _, v in tree_flatten(block.trainable_parameters()))
     print(f"[init] 학습 파라미터 {n_train/1e6:.1f}M", flush=True)
 
-    files = [l.strip() for l in open(args.corpus_list) if l.strip()]
-    windows = build_corpus(tok, args.seq_len, files)
-    n_eval = max(8, len(windows) // 20)
+    real_h_get = None
+    file_idx = None
+    if args.real_hidden:
+        windows, real_h_get, file_idx = load_real_hidden(args.real_hidden)
+        kind = "디렉터리(lazy)" if os.path.isdir(args.real_hidden) else "단일파일"
+        print(f"[data] 실측 TP2 hidden 캐시 로드[{kind}]: {len(windows)}개 윈도우 "
+              f"({args.real_hidden})", flush=True)
+    else:
+        files = [l.strip() for l in open(args.corpus_list) if l.strip()]
+        windows = build_corpus(tok, args.seq_len, files)
+        file_idx = list(range(len(windows)))
+    # 소규모 스모크에서 eval이 전량을 삼켜 train이 비는 것 방지(3윈도우 ZeroDivision 전례)
+    n_eval = min(max(8, len(windows) // 20), max(1, len(windows) // 2))
     eval_set, train_set = windows[:n_eval], windows[n_eval:]
-    print(f"[data] train {len(train_set)} · eval {n_eval} 윈도우", flush=True)
+    eval_idx, train_idx = file_idx[:n_eval], file_idx[n_eval:]
+    print(f"[data] train {len(train_set)} · eval {n_eval} 윈도우 · "
+          f"loss-start-pos={args.loss_start_pos}", flush=True)
 
     embed = model.model.embed_tokens
 
@@ -211,25 +347,41 @@ def main():
         S = h.shape[1]
         t2 = ids[:, 2:S + 2]
         t3 = ids[:, 3:S + 3]
-        ce1 = nn.losses.cross_entropy(z1, t2, reduction="mean")
-        ce2 = nn.losses.cross_entropy(z2, t3, reduction="mean")
+        n = args.loss_start_pos
+        ce1 = nn.losses.cross_entropy(z1[:, n:], t2[:, n:], reduction="mean")
+        ce2 = nn.losses.cross_entropy(z2[:, n:], t3[:, n:], reduction="mean")
         return ce2 + args.d1_retain * ce1
 
-    def backbone_hidden(ids_in):
+    def backbone_hidden(ids_in, noise_std=0.0):
         h_logits, h_raw = model.model(ids_in, None, return_raw_hidden=True)
-        return mx.stop_gradient(h_raw)
+        h_raw = mx.stop_gradient(h_raw)
+        if noise_std > 0:
+            # [I305] TP2 백본 hidden은 싱글박스 대비 실측 상대표준편차 ~0.4%
+            # (K분할 부분합의 부동소수점 결합법칙 위반 — all_sum 정밀도로는
+            # 제거 불가, arXiv 2511.17826과 일치). 싱글박스 훈련만으로는
+            # 드래프터가 이 분포를 못 보므로, 배포 시 수용률이 급락한다
+            # (train-serve mismatch). 안전한 싱글박스 환경에서 그 통계적
+            # 특성(크기 비례 노이즈)을 흉내내 훈련시켜 강건화한다.
+            h_raw = h_raw + mx.random.normal(h_raw.shape).astype(h_raw.dtype) * (
+                h_raw.std() * noise_std
+            )
+        return h_raw
 
     def eval_match():
         m1 = m2 = tot = 0
-        for w in eval_set[:8]:
+        n = args.loss_start_pos
+        for j, w in enumerate(eval_set[:8]):
             ids = mx.array([w])
-            h = backbone_hidden(ids[:, :args.seq_len])
+            if real_h_get is not None:
+                h = real_h_get(eval_idx[j]).astype(mx.bfloat16)
+            else:
+                h = backbone_hidden(ids[:, :args.seq_len])
             z1, z2 = chain_logits(h, ids)
             S = args.seq_len
             p1 = mx.argmax(z1, axis=-1); p2 = mx.argmax(z2, axis=-1)
-            m1 += (p1 == ids[:, 2:S + 2]).sum().item()
-            m2 += (p2 == ids[:, 3:S + 3]).sum().item()
-            tot += S
+            m1 += (p1[:, n:] == ids[:, 2:S + 2][:, n:]).sum().item()
+            m2 += (p2[:, n:] == ids[:, 3:S + 3][:, n:]).sum().item()
+            tot += (S - n)
         return m1 / tot, m2 / tot
 
     lvg = nn.value_and_grad(block, loss_fn)
@@ -248,9 +400,13 @@ def main():
 
     t0 = time.time()
     for step in range(1, args.steps + 1):
-        w = train_set[(step - 1) % len(train_set)]
+        j = (step - 1) % len(train_set)
+        w = train_set[j]
         ids = mx.array([w])
-        h = backbone_hidden(ids[:, :args.seq_len])
+        if real_h_get is not None:
+            h = real_h_get(train_idx[j]).astype(mx.bfloat16)
+        else:
+            h = backbone_hidden(ids[:, :args.seq_len], noise_std=args.noise_std)
         l, grads = lvg(block, h, ids)
         opt.update(block, grads)
         mx.eval(block.parameters(), opt.state, l)
@@ -264,6 +420,12 @@ def main():
             flat = dict(tree_flatten(block.trainable_parameters()))
             mx.save_safetensors(os.path.join(args.out, f"step{step}.safetensors"),
                                 {k: v for k, v in flat.items()})
+            if args.lora_shared:
+                # 병합 시 alpha/r 를 추정하지 않도록 사이드카로 명시 저장
+                # (r/alpha 를 바꾼 뒤 조용한 오-병합 방지)
+                with open(os.path.join(args.out, "lora_meta.json"), "w") as f:
+                    json.dump({"r": args.lora_r, "alpha": args.lora_alpha,
+                               "alpha_over_r": args.lora_alpha / args.lora_r}, f)
             print(f"[ckpt] step{step} 저장", flush=True)
 
 
