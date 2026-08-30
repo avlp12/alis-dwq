@@ -1,0 +1,60 @@
+{
+  "when": "2026-08-29T22:10:00+0900",
+  "host": "gesicht M3 Ultra 512 GiB",
+  "omlx": "0.6.3",
+  "copy": {
+    "rsync_exit": 0,
+    "src": "/Volumes/Crucial X10/glm53flash/builds/mlx-6bit",
+    "dst": "/Users/gesicht/glm53flash/serve/GLM-5.3-Flash-affine6",
+    "files": 1152,
+    "safetensors": 354,
+    "size_gib": 249.69,
+    "config": true,
+    "deleted_at": "2026-08-29T22:07:07+0900",
+    "deleted_by": "prep/publish rm_affine_trees (WITHDRAWN stock affine)"
+  },
+  "align_on_load": {
+    "dense_routers": 42,
+    "self_attn_q8_scales": 405,
+    "actual_gb": 240.4
+  },
+  "fair_omlx_stream": {
+    "model": "GLM-5.3-Flash-affine6",
+    "prompt_tokens": 573,
+    "completion_tokens": 128,
+    "run1_decode_tps": 8.46,
+    "run2_decode_tps": 8.4,
+    "run1_prefill_tps": 139.15,
+    "run2_prefill_tps": 147.24,
+    "baseline_unaligned_q4": 5.69,
+    "baseline_oq4e": [28.69, 29.85, 27.87]
+  },
+  "unfair_generate_step": {
+    "decode_tps_excl_first": 0.417,
+    "first_token_s": 4.626,
+    "note": "same 1-tok ~= 256-tok prefill wall as raw language_model loop; not the engine gap"
+  },
+  "gather_qmm_microbench": {
+    "shape": "E=288 H=4096 I=2048 topk=8 layers=42",
+    "eager_ms": {"2": 0.37, "3": 0.43, "4": 0.47, "6": 0.55, "8": 0.67},
+    "compiled_similar": true,
+    "native_block_kind": null,
+    "note": "6-bit vs 4-bit is ~1.2x, not 3.3x. Expert bitwidth is not the remaining gap."
+  },
+  "verdict": {
+    "align_is_the_5x_fix": false,
+    "align_delta": "5.69 -> 8.4 tok/s (~1.5x)",
+    "remaining": "8.4 vs 28-30 (~3.3x) inside oMLX engine vs oQ checkpoint",
+    "next": [
+      "compile_ffn nested mx.compile of 42 MoE layers (generate_step 0.42 vs oMLX 8.4); A/B needs a restored checkpoint",
+      "rebuild aligned 4-bit with oQ recipe (dense router, 8-bit KDA, 4-bit experts) — 6-bit proxy is gone",
+      "oQ QuantizedMultiLinear (22) vs affine runtime fuse_in; glm5_next is not in moe_gate_up fusion family"
+    ]
+  },
+  "left_state": {
+    "omlx": "stopped",
+    "model_dirs": ["/Users/gesicht/glm53flash/serve"],
+    "oq4e_on_disk": true,
+    "affine6_on_disk": false
+  }
+}

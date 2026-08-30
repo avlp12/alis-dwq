@@ -1,0 +1,127 @@
+{
+  "model": "GLM-5.3-Flash-oQ4e",
+  "started": "2026-08-30T01:04:11+0900",
+  "finished": "2026-08-30T01:22:08+0900",
+  "host": "gesicht",
+  "metric": "generation_tokens_per_second",
+  "flags_logged": [
+    "fuse_in=True compile_ffn=True",
+    "fuse_in=False compile_ffn=True",
+    "fuse_in=True compile_ffn=False",
+    "fuse_in=False compile_ffn=False"
+  ],
+  "note": "oQ4e checkpoint unchanged. Ablate VLM fuse_in / compile_ffn. qwen35 moe_gate_up fusion does not attach to glm5_next. Flags confirmed in oq4e_graph_ablate_server.log.",
+  "arms": {
+    "baseline": {
+      "fuse_in": true,
+      "compile_ffn": true,
+      "runs": {
+        "p512": {
+          "decode_tps": 28.48,
+          "prompt_tps": 330.28,
+          "prompt_tokens": 504,
+          "completion_tokens": 128
+        },
+        "p2048": {
+          "decode_tps": 27.25,
+          "prompt_tps": 454.62,
+          "prompt_tokens": 1979,
+          "completion_tokens": 128
+        },
+        "p4096": {
+          "decode_tps": 26.43,
+          "prompt_tps": 907.08,
+          "prompt_tokens": 3945,
+          "completion_tokens": 128
+        }
+      }
+    },
+    "no_fuse_in": {
+      "fuse_in": false,
+      "compile_ffn": true,
+      "runs": {
+        "p512": {
+          "decode_tps": 27.9,
+          "prompt_tps": 328.55,
+          "prompt_tokens": 504,
+          "completion_tokens": 128
+        },
+        "p2048": {
+          "decode_tps": 26.75,
+          "prompt_tps": 455.12,
+          "prompt_tokens": 1979,
+          "completion_tokens": 128
+        },
+        "p4096": {
+          "decode_tps": 26.03,
+          "prompt_tps": 905.44,
+          "prompt_tokens": 3945,
+          "completion_tokens": 128
+        }
+      }
+    },
+    "no_compile_ffn": {
+      "fuse_in": true,
+      "compile_ffn": false,
+      "runs": {
+        "p512": {
+          "decode_tps": 26.84,
+          "prompt_tps": 328.25,
+          "prompt_tokens": 504,
+          "completion_tokens": 128
+        },
+        "p2048": {
+          "decode_tps": 25.85,
+          "prompt_tps": 453.18,
+          "prompt_tokens": 1979,
+          "completion_tokens": 128
+        },
+        "p4096": {
+          "decode_tps": 25.21,
+          "prompt_tps": 906.26,
+          "prompt_tokens": 3945,
+          "completion_tokens": 128
+        }
+      }
+    },
+    "neither": {
+      "fuse_in": false,
+      "compile_ffn": false,
+      "runs": {
+        "p512": {
+          "decode_tps": 26.39,
+          "prompt_tps": 326.36,
+          "prompt_tokens": 504,
+          "completion_tokens": 128
+        },
+        "p2048": {
+          "decode_tps": 25.37,
+          "prompt_tps": 452.35,
+          "prompt_tokens": 1979,
+          "completion_tokens": 128
+        },
+        "p4096": {
+          "decode_tps": 24.74,
+          "prompt_tps": 899.85,
+          "prompt_tokens": 3945,
+          "completion_tokens": 128
+        }
+      }
+    }
+  },
+  "p512": {
+    "baseline": 28.48,
+    "no_fuse_in": 27.9,
+    "no_compile_ffn": 26.84,
+    "neither": 26.39
+  },
+  "p512_vs_baseline": {
+    "baseline": 1.0,
+    "no_fuse_in": 0.98,
+    "no_compile_ffn": 0.942,
+    "neither": 0.927
+  },
+  "affine6_aligned_p512_class": 8.4,
+  "neither_vs_affine": 3.14,
+  "verdict": "fuse_in is ~2% and compile_ffn is ~6% on the oQ tree. Both off is still 26.4 tok/s (3.1x affine 8.4). These two flags are not the leftover 3.3x. Remapped affine already ran with both flags on and stayed at 8.4."
+}

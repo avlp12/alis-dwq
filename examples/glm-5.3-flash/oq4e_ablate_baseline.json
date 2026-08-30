@@ -1,0 +1,111 @@
+{
+  "model": "GLM-5.3-Flash-oQ4e",
+  "started": "2026-08-30T01:04:42+0900",
+  "runs": {
+    "p512": {
+      "wall_s": 6.022990499972366,
+      "ttft_s": 0.0023292499827221036,
+      "chunks": 37,
+      "usage": {
+        "prompt_tokens": 504,
+        "completion_tokens": 128,
+        "total_tokens": 632,
+        "input_tokens": 504,
+        "output_tokens": 128,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "time_to_first_token": 1.53,
+        "total_time": 6.02,
+        "prompt_eval_duration": 1.53,
+        "generation_duration": 4.49,
+        "prompt_tokens_per_second": 330.28,
+        "generation_tokens_per_second": 28.48
+      },
+      "prompt_tokens": 504,
+      "completion_tokens": 128,
+      "prompt_tps": 330.28,
+      "decode_tps": 28.48,
+      "text_preview": "\nThe user has sent a message that is essentially a repeated phrase: \"A short factual paragraph about Paris, the capital of France, used only as a length pad for a local serving benchmark.\" repeated many times, cut off at the end.\n\nThis look"
+    },
+    "p2048": {
+      "wall_s": 9.055383499944583,
+      "ttft_s": 0.004958457953762263,
+      "chunks": 37,
+      "usage": {
+        "prompt_tokens": 1979,
+        "completion_tokens": 128,
+        "total_tokens": 2107,
+        "input_tokens": 1979,
+        "output_tokens": 128,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        },
+        "time_to_first_token": 4.35,
+        "total_time": 9.05,
+        "prompt_eval_duration": 4.35,
+        "generation_duration": 4.7,
+        "prompt_tokens_per_second": 454.62,
+        "generation_tokens_per_second": 27.25
+      },
+      "prompt_tokens": 1979,
+      "completion_tokens": 128,
+      "prompt_tps": 454.62,
+      "decode_tps": 27.25,
+      "text_preview": "\nThe user has sent a message that is just a repeated sentence many times: \"A short factual paragraph about Paris, the capital of France, used only as a length pad for a local serving benchmark.\"\n\nThis looks like a test/benchmark prompt \u2014 po"
+    },
+    "p4096": {
+      "wall_s": 9.200422584020998,
+      "ttft_s": 0.00841866701375693,
+      "chunks": 37,
+      "usage": {
+        "prompt_tokens": 3945,
+        "completion_tokens": 128,
+        "total_tokens": 4073,
+        "input_tokens": 3945,
+        "output_tokens": 128,
+        "prompt_tokens_details": {
+          "cached_tokens": 2048
+        },
+        "time_to_first_token": 4.35,
+        "total_time": 9.19,
+        "prompt_eval_duration": 4.35,
+        "generation_duration": 4.84,
+        "prompt_tokens_per_second": 907.08,
+        "generation_tokens_per_second": 26.43
+      },
+      "prompt_tokens": 3945,
+      "completion_tokens": 128,
+      "prompt_tps": 907.08,
+      "decode_tps": 26.43,
+      "text_preview": "\nThe user has sent a message that is mostly a repeated sentence about Paris used as a \"length pad for a local serving benchmark.\" The message appears to be cut off mid-sentence at the end (\"used only as a local\").\n\nThis looks like a test/be"
+    }
+  },
+  "warmup": {
+    "wall_s": 2.378084417025093,
+    "ttft_s": 0.36034491698956117,
+    "chunks": 7,
+    "usage": {
+      "prompt_tokens": 19,
+      "completion_tokens": 8,
+      "total_tokens": 27,
+      "input_tokens": 19,
+      "output_tokens": 8,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      },
+      "time_to_first_token": 1.86,
+      "total_time": 2.02,
+      "prompt_eval_duration": 1.86,
+      "generation_duration": 0.15,
+      "prompt_tokens_per_second": 10.19,
+      "generation_tokens_per_second": 52.68
+    },
+    "prompt_tokens": 19,
+    "completion_tokens": 8,
+    "prompt_tps": 10.19,
+    "decode_tps": 52.68,
+    "text_preview": "\nThe user wants me to reply with exactly"
+  },
+  "finished": "2026-08-30T01:05:09+0900"
+}

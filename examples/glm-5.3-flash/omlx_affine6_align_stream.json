@@ -1,0 +1,22 @@
+{
+  "model": "GLM-5.3-Flash-affine6",
+  "ttft_s": 0.41205341601744294,
+  "wall_s": 19.66276904102415,
+  "usage": {
+    "prompt_tokens": 573,
+    "completion_tokens": 128,
+    "total_tokens": 701,
+    "input_tokens": 573,
+    "output_tokens": 128,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    },
+    "time_to_first_token": 4.12,
+    "total_time": 19.25,
+    "prompt_eval_duration": 4.12,
+    "generation_duration": 15.13,
+    "prompt_tokens_per_second": 139.15,
+    "generation_tokens_per_second": 8.46
+  },
+  "text": "\nThe user has sent me a message that repeats \"Paris is the capital of France\" many times (looks like around 80 times). There's no actual question or request here. This could be:\n1. A test of some kind\n2. An accidental paste\n3. Someone trying to see how I respond to repetition\n4. Someone testing if I'll get confused or repeat the pattern\n\nThe appropriate response is to acknowledge what they sent an"
+}

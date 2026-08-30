@@ -810,3 +810,46 @@ even though that round closed the line for good:
 Receipts: [examples/deepseek-v4-flash](../examples/deepseek-v4-flash/README.md) — capture scripts,
 the trainer with `--real-hidden` / `--loss-start-pos` / LoRA merge, the paired analyzer, and the
 verified command for every round above.
+
+---
+
+## 14. A convert that writes the wrong module tree cannot be rescued by bits or DWQ
+
+**Why.** Serving stacks attach compiled / fused kernels to a *checkpoint graph*,
+not to a bit-width. Two affine g64 files of the same GLM-5.3-Flash FP8 source,
+same oMLX 0.6.3, same HTTP stream metric, decoded at **8.4 tok/s** (mlx-lm
+tree remapped at load) and **28 tok/s** (native oQ/VLM file). Affine q4/q6/q8
+sat on the slow shelf. Isolated `gather_qmm` 4 vs 6 bit is ~1.2×. Load-time
+“fix the predicate” (dense routers, leftover KDA → 8-bit) bought 5.69 → 8.4
+and stopped. Turning `fuse_in` / `compile_ffn` off on the *fast* file costs
+only 2% / 6% / 7% together — both-off is still 26.4 tok/s. Remapped affine
+already had those flags on. DWQ tunes scales; it cannot rewrite the file
+layout the kernels attach to.
+
+**Why it is worse than a slow baseline.** The slow file is internally consistent.
+It loads, generates, and looks like a finished quant. The temptation is to DWQ
+it, or to spend bits on KDA/experts hoping tok/s will follow. Both spend days
+on the 8 tok/s shelf.
+
+**Fix — name the serve artifact before the first convert.** The student is the
+file the server will load. If the server’s fast path is a VLM tree with fused
+members, emit that tree (or use the converter that already does). Treat an
+mlx-lm affine export as a diagnostic dump, not a `baseline`. Measure decode
+on the serve stream (`generation_tokens_per_second`), never a raw
+`language_model` loop (0.42 tok/s on this model — both trees).
+
+**The rule behind the rule:** *bits allocate quality and size; the checkpoint
+graph decides which kernels exist.* Fused concat members must share
+`(bits, group_size, mode)` or load/fuse fails. That is a contract, not a
+quality recipe — mixed 6/8 KDA on a native oQ6e tree still decoded at 26–28
+tok/s.
+
+**Oracle:** same host, same server, two converts, one stream metric. If tok/s
+matches across 4/6/8 on convert A and jumps 3× on convert B, you are looking
+at the graph. A `gather_qmm` microbench on the expert shape tells you whether
+bit-width can possibly be the leftover. Transfer test: writing the VLM tree
+without the oQ wrapper recovered the 28 tok/s shelf (GLM-5.3-Flash VLM q4
+29.46 / 28.24 / 27.50 vs oQ4e 29.26 / 27.94 / 27.30).
+
+Full write-up + receipts: [docs/CHECKPOINT_GRAPH_NOT_BITS.md](CHECKPOINT_GRAPH_NOT_BITS.md),
+[examples/glm-5.3-flash](../examples/glm-5.3-flash/README.md).
