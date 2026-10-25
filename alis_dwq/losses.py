@@ -21,6 +21,16 @@ three times in this repo.
                             top-K logits (e.g. kl_top_1000). Dense targets
                             only: a top-k target dump is already this loss
                             (with K = the dump's k), so it refuses tuples.
+  ALIS_DWQ_LOSS=kl_fixed    forward KL with Barron's "Softmax Cancellation"
+                            fix (arXiv 2610.31642): same loss value, but the
+                            logit gradient q - p is formed as p*expm1(log q/p)
+                            and re-centered to sum to zero (the stock kernel
+                            forms q - p directly). Near student == teacher
+                            this is ~100x more accurate in f32; with bf16
+                            logits the cast of the gradient back to bf16
+                            (~2e-3 relative) dominates both, so expect little
+                            change there. Not from AngelSlim. Works with dense
+                            targets and top-k dumps.
 
 python -m alis_dwq.losses   runs the numpy-reference selftest (no model).
 """
@@ -32,25 +42,27 @@ import mlx.core as mx
 def parse(spec):
     """'kl' | 'rkl' | 'cakld' | 'kl_top_K' -> (kind, topk|None); raises on junk."""
     s = (spec or "kl").strip().lower()
-    if s in ("kl", "rkl", "cakld"):
+    if s in ("kl", "rkl", "cakld", "kl_fixed"):
         return s, None
     if s.startswith("kl_top_"):
         try:
             k = int(s[len("kl_top_"):])
         except ValueError:
             raise ValueError(
-                f"ALIS_DWQ_LOSS={spec!r} not supported (kl | rkl | cakld | kl_top_K)")
+                f"ALIS_DWQ_LOSS={spec!r} not supported (kl | rkl | cakld | kl_fixed | kl_top_K)")
         if k <= 0:
             raise ValueError(f"ALIS_DWQ_LOSS top-k must be positive: {spec}")
         return "kl_top", k
     raise ValueError(
-        f"ALIS_DWQ_LOSS={spec!r} not supported (kl | rkl | cakld | kl_top_K)")
+        f"ALIS_DWQ_LOSS={spec!r} not supported (kl | rkl | cakld | kl_fixed | kl_top_K)")
 
 
 def banner(kind, topk):
     print(f"[alis-dwq][EXPERIMENTAL] ALIS_DWQ_LOSS={kind}"
           + (f" (K={topk})" if topk else "")
-          + ": non-default distillation loss (AngelSlim port). Unset the env "
+          + ": non-default distillation loss"
+          + (" (Barron softmax-cancellation fix)" if kind == "kl_fixed"
+             else " (AngelSlim port)") + ". Unset the env "
           "var (or pin branch backup/v0.1-pre-router-kd) for the stock "
           "forward-KL loss. Judge on held-out slice PPL/KL, not train/valid.",
           file=sys.stderr)
@@ -63,6 +75,35 @@ def _kl(logp_q, logp_p):
 
 def _logsm(x):
     return x - mx.logsumexp(x, axis=-1, keepdims=True)
+
+
+def _logsm_fixed(z):
+    """log_softmax with an exact 0 at the argmax and the margin taken over
+    the other logits only (Barron, arXiv 2610.31642, "Softmax Collapse")."""
+    is_max = mx.arange(z.shape[-1]) == mx.argmax(z, axis=-1, keepdims=True)
+    z_max = mx.max(z, axis=-1, keepdims=True)
+    shifted = mx.where(is_max, 0.0, z - z_max)
+    others = mx.where(is_max, -mx.inf, shifted)
+    m = -mx.logsumexp(others, axis=-1, keepdims=True)
+    return shifted - mx.logaddexp(0.0, -m)  # softplus(-m)
+
+
+def _kl_fixed(zs, zt):
+    """Per-token KL(p || q) for p = softmax(zt), q = softmax(zs), with the
+    custom zs-gradient g = q - p of Barron's soft_target_cross_entropy
+    ("Softmax Cancellation"): q - p is computed as p*expm1(log q/p) where
+    |log q/p| < 1, then re-centered so sum(g) = 0 holds per row."""
+    sg = mx.stop_gradient
+    zs_c, zt = sg(zs), sg(zt)
+    log_q = _logsm_fixed(zs_c)
+    q, p = mx.exp(log_q), mx.exp(_logsm_fixed(zt))
+    delta = zs_c - zt
+    d = delta - (p * delta).sum(axis=-1, keepdims=True)
+    s = d - mx.log1p((p * mx.expm1(d)).sum(axis=-1, keepdims=True))  # log(q/p)
+    u = mx.where(mx.abs(s) < 1, p * mx.expm1(s), q - p)
+    g = u - q * u.sum(axis=-1, keepdims=True)
+    kl = -(p * s).sum(axis=-1)  # sum p*(log p - log q), exactly 0 at q == p
+    return kl + (g * (zs - zs_c)).sum(axis=-1)
 
 
 def per_token_loss(kind, topk, logits, targets, scale, labels=None, ids=None):
@@ -90,6 +131,8 @@ def per_token_loss(kind, topk, logits, targets, scale, labels=None, ids=None):
         logits = mx.take_along_axis(logits, kidx, axis=-1)
         return _kl(_logsm(scale * logits), _logsm(scale * targets))
 
+    if kind == "kl_fixed":
+        return _kl_fixed(scale * logits, scale * targets)
     s_logp = _logsm(scale * logits)
     t_logp = _logsm(scale * targets)
     fkl = _kl(s_logp, t_logp)          # KL(teacher || student)
@@ -172,7 +215,36 @@ def _selftest():
     ref_f_d = np_kl(sl_d, tl_d)
     assert np.allclose(got[~in_dump], ref_f_d[~in_dump], atol=1e-5)
 
+    # kl_fixed: same value as kl, on dense targets and on a top-k dump
+    got = np.array(per_token_loss("kl_fixed", None, ms, mt, scale))
+    assert np.allclose(got, ref_fkl, atol=1e-5), np.abs(got - ref_fkl).max()
+    got = np.array(per_token_loss("kl_fixed", None, mx.array(ds),
+                                  mx.array(dt), scale, ids=mx.array(dump_ids)))
+    assert np.allclose(got, ref_f_d, atol=1e-5)
+
+    # kl_fixed gradient == scale * (q - p) (what stock kl differentiates to)
+    def grad_of(kind, s_, t_):
+        return mx.grad(lambda x: per_token_loss(kind, None, x, t_, scale).sum())(s_)
+    q_ref = np.exp(sl)
+    g_ref = scale * (q_ref - np.exp(tl))
+    g = np.array(grad_of("kl_fixed", ms, mt))
+    assert np.allclose(g, g_ref, atol=1e-6), np.abs(g - g_ref).max()
+
+    # the point of kl_fixed ("Softmax Cancellation", Barron 2610.31642):
+    # DWQ starts at student ~= teacher, where the true gradient is exactly 0.
+    # Its rows must sum to 0 and vanish at student == teacher, also for
+    # bf16 logits with a peaked (large-margin) distribution
+    zp = mx.array(8.0 * rng.normal(size=(B, T, 4096)).astype(np.float32))
+    for dt_ in (mx.float32, mx.bfloat16):
+        z = zp.astype(dt_)
+        g0 = np.array(grad_of("kl_fixed", z, z).astype(mx.float32))
+        assert np.abs(g0).max() == 0.0, (dt_, np.abs(g0).max())
+    zs = zp + mx.array(0.01 * rng.normal(size=zp.shape).astype(np.float32))
+    rs = np.array(grad_of("kl_fixed", zs, zp).sum(axis=-1))
+    assert np.abs(rs).max() < 1e-7, np.abs(rs).max()
+
     # parse/refuse behavior
+    assert parse("kl_fixed") == ("kl_fixed", None)
     assert parse("kl_top_1000") == ("kl_top", 1000)
     for bad in ("kl_top_0", "banana"):
         try:
@@ -187,8 +259,9 @@ def _selftest():
     except ValueError:
         pass
 
-    print("[losses] selftest OK (kl / rkl / cakld / kl_top vs numpy reference; "
-          "stock-kl equivalence; dump-edge cases)")
+    print("[losses] selftest OK (kl / rkl / cakld / kl_top / kl_fixed vs numpy "
+          "reference; stock-kl equivalence; dump-edge cases; kl_fixed zero-sum "
+          "and zero-at-teacher gradient)")
 
 
 if __name__ == "__main__":
