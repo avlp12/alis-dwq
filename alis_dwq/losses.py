@@ -95,11 +95,16 @@ def _kl_fixed(zs, zt):
     |log q/p| < 1, then re-centered so sum(g) = 0 holds per row."""
     sg = mx.stop_gradient
     zs_c, zt = sg(zs), sg(zt)
-    log_q = _logsm_fixed(zs_c)
-    q, p = mx.exp(log_q), mx.exp(_logsm_fixed(zt))
+    log_q, log_p = _logsm_fixed(zs_c), _logsm_fixed(zt)
+    q, p = mx.exp(log_q), mx.exp(log_p)
     delta = zs_c - zt
     d = delta - (p * delta).sum(axis=-1, keepdims=True)
-    s = d - mx.log1p((p * mx.expm1(d)).sum(axis=-1, keepdims=True))  # log(q/p)
+    # log(q/p) = d - log(sum p*e^d): log1p/expm1 keeps precision near the
+    # teacher; rows far from it take logsumexp instead (expm1 overflows)
+    near = mx.abs(d).max(axis=-1, keepdims=True) < 1
+    c_near = mx.log1p((p * mx.expm1(mx.where(near, d, 0.0))).sum(axis=-1, keepdims=True))
+    c_far = mx.logsumexp(log_p + d, axis=-1, keepdims=True)
+    s = d - mx.where(near, c_near, c_far)  # log(q/p)
     u = mx.where(mx.abs(s) < 1, p * mx.expm1(s), q - p)
     g = u - q * u.sum(axis=-1, keepdims=True)
     kl = -(p * s).sum(axis=-1)  # sum p*(log p - log q), exactly 0 at q == p
@@ -242,6 +247,18 @@ def _selftest():
     zs = zp + mx.array(0.01 * rng.normal(size=zp.shape).astype(np.float32))
     rs = np.array(grad_of("kl_fixed", zs, zp).sum(axis=-1))
     assert np.abs(rs).max() < 1e-7, np.abs(rs).max()
+
+    # far from the teacher (centered logit gap > ~88) expm1 would overflow:
+    # kl_fixed must stay finite and match the reference there too
+    far_s = mx.array([[0.0, 0.0], [5.0, -60.0]])
+    far_t = mx.array([[0.0, -100.0], [-90.0, 30.0]])
+    got = np.array(per_token_loss("kl_fixed", None, far_s, far_t, 1.0))
+    ref = np_kl(np_logsm(np.array(far_s)), np_logsm(np.array(far_t)))
+    assert np.isfinite(got).all() and np.allclose(got, ref, atol=1e-5), (got, ref)
+    g = np.array(mx.grad(lambda x: per_token_loss(
+        "kl_fixed", None, x, far_t, 1.0).sum())(far_s))
+    g_ref = np.exp(np_logsm(np.array(far_s))) - np.exp(np_logsm(np.array(far_t)))
+    assert np.allclose(g, g_ref, atol=1e-6), (g, g_ref)
 
     # parse/refuse behavior
     assert parse("kl_fixed") == ("kl_fixed", None)
